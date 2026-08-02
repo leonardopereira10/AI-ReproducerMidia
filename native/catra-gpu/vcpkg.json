@@ -6,7 +6,6 @@
   "supports": "windows & x64",
   "dependencies": [
     "directx-headers",
-    "dxguid",
     "onnxruntime-gpu"
   ]
 }

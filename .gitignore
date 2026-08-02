@@ -83,3 +83,4 @@ lib/fsr-sdk/
 # by this repo. The AMF runtime (amfrt64.dll) ships with the AMD driver. Without
 # the headers the encode backend compiles to a CATRA_ERR_NOT_IMPL stub.
 lib/amf/
+native/catra-gpu/vcpkg_installed/

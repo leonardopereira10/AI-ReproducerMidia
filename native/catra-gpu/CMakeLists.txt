@@ -28,10 +28,9 @@ endif()
 
 # --- Dependencies (vcpkg) ---------------------------------------------------
 # The vcpkg toolchain file (-DCMAKE_TOOLCHAIN_FILE) is passed by
-# scripts/build-native.ps1. directx-headers provides the modern D3D12 headers;
-# dxguid supplies the legacy GUID import lib.
+# scripts/build-native.ps1. directx-headers provides the modern D3D12 headers.
+# dxguid.lib comes from the Windows SDK (linked below as a system lib).
 find_package(directx-headers CONFIG QUIET)
-find_package(dxguid CONFIG QUIET)
 
 # --- ONNX Runtime (RIFE frame interpolation, ST-13) -------------------------
 # Resolved from vcpkg (onnxruntime-gpu) by default. A manual install can be
@@ -148,9 +147,6 @@ target_link_libraries(catra-gpu PRIVATE
 # Optional vcpkg-provided packages (linked when the toolchain resolved them).
 if(TARGET Microsoft::DirectX-Headers)
     target_link_libraries(catra-gpu PRIVATE Microsoft::DirectX-Headers)
-endif()
-if(TARGET Microsoft::DXGUID)
-    target_link_libraries(catra-gpu PRIVATE Microsoft::DXGUID)
 endif()
 
 # ONNX Runtime (RIFE). The define switches interp_rife.cpp from its stub to the
