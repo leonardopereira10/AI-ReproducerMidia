@@ -240,7 +240,8 @@ public sealed class ProcessingPipeline : IProcessingPipeline
         catch (Exception ex)
         {
             // NativeBridgeException / ffmpeg / IO / timeout → abort with a failed result.
-            return new ProcessResult(false, null, 0, timer.Elapsed, ex.Message);
+            Trace.WriteLine($"[ProcessingPipeline] Episode {episode.Id} EXCEPTION: {ex}");
+            return new ProcessResult(false, null, 0, timer.Elapsed, ex.ToString());
         }
         finally
         {

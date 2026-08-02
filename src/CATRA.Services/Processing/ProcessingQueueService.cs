@@ -369,7 +369,8 @@ public sealed class ProcessingQueueService : IProcessingQueueService, IDisposabl
         }
         catch (Exception ex)
         {
-            FailJob(job, ex.Message);
+            System.Diagnostics.Trace.WriteLine($"[ProcessingQueue] Job {job.Id} EXCEPTION: {ex}");
+            FailJob(job, ex.ToString());
         }
         finally
         {
@@ -404,6 +405,7 @@ public sealed class ProcessingQueueService : IProcessingQueueService, IDisposabl
 
     private void FailJob(ProcessJob job, string errorMessage)
     {
+        System.Diagnostics.Trace.WriteLine($"[ProcessingQueue] Job {job.Id} FAILED: {errorMessage}");
         job.Status = JobStatus.Failed;
         job.ErrorMessage = errorMessage;
         job.CompletedAt = DateTime.UtcNow;

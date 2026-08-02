@@ -45,6 +45,9 @@ public partial class App : Application
     {
         base.OnStartup(e);
 
+        // TEMP: route Trace.WriteLine to stderr for diagnostics.
+        System.Diagnostics.Trace.Listeners.Add(new System.Diagnostics.ConsoleTraceListener { TraceOutputOptions = System.Diagnostics.TraceOptions.None });
+
         ConfigureFfmpeg();
 
         _host = Host.CreateDefaultBuilder()
@@ -264,6 +267,28 @@ public partial class App : Application
         if (Directory.Exists(ffmpegDir))
         {
             FFmpeg.AutoGen.ffmpeg.RootPath = ffmpegDir;
+
+            // FFmpeg.AutoGen 7.x DynamicallyLoadedBindings uses NativeLibrary.Load
+            // which searches AppContext.BaseDirectory and PATH — NOT ffmpeg.RootPath.
+            // Prepend lib/ffmpeg/ to PATH so the dynamic loader finds the DLLs.
+            string currentPath = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+            if (!currentPath.Contains(ffmpegDir, StringComparison.OrdinalIgnoreCase))
+            {
+                Environment.SetEnvironmentVariable("PATH", ffmpegDir + Path.PathSeparator + currentPath);
+            }
+        }
+
+        // FFmpeg.AutoGen 7.x uses DynamicallyLoadedBindings: all function pointers
+        // are stubs that throw NotSupportedException until Initialize() resolves them
+        // from the native DLLs.
+        try
+        {
+            FFmpeg.AutoGen.DynamicallyLoadedBindings.Initialize();
+            System.Diagnostics.Trace.WriteLine("[App] FFmpeg DynamicallyLoadedBindings initialized.");
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.WriteLine($"[App] FFmpeg bindings init failed: {ex.Message}");
         }
     }
 
