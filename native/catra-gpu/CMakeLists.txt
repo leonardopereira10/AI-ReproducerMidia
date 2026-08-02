@@ -46,12 +46,32 @@ if(CATRA_WITH_RIFE)
         set(CATRA_ONNXRUNTIME_TARGET onnxruntime::onnxruntime)
     elseif(DEFINED CATRA_ONNXRUNTIME_ROOT)
         get_filename_component(CATRA_ONNXRUNTIME_ROOT "${CATRA_ONNXRUNTIME_ROOT}" ABSOLUTE)
-        add_library(catra_onnxruntime_import SHARED IMPORTED)
-        set_target_properties(catra_onnxruntime_import PROPERTIES
-            INTERFACE_INCLUDE_DIRECTORIES "${CATRA_ONNXRUNTIME_ROOT}/include"
-            IMPORTED_IMPLIB "${CATRA_ONNXRUNTIME_ROOT}/lib/onnxruntime.lib"
-            IMPORTED_LOCATION "${CATRA_ONNXRUNTIME_ROOT}/bin/onnxruntime.dll")
-        set(CATRA_ONNXRUNTIME_TARGET catra_onnxruntime_import)
+
+        # Support two layouts:
+        #   A) Flat: <root>/include/ + <root>/lib/ + <root>/bin/
+        #   B) NuGet: <root>/build/native/include/ + <root>/runtimes/win-x64/native/
+        if(EXISTS "${CATRA_ONNXRUNTIME_ROOT}/build/native/include/onnxruntime_cxx_api.h")
+            set(_ort_inc "${CATRA_ONNXRUNTIME_ROOT}/build/native/include")
+            set(_ort_lib "${CATRA_ONNXRUNTIME_ROOT}/runtimes/win-x64/native/onnxruntime.lib")
+            set(_ort_dll "${CATRA_ONNXRUNTIME_ROOT}/runtimes/win-x64/native/onnxruntime.dll")
+        else()
+            set(_ort_inc "${CATRA_ONNXRUNTIME_ROOT}/include")
+            set(_ort_lib "${CATRA_ONNXRUNTIME_ROOT}/lib/onnxruntime.lib")
+            set(_ort_dll "${CATRA_ONNXRUNTIME_ROOT}/bin/onnxruntime.dll")
+        endif()
+
+        if(NOT EXISTS "${_ort_lib}")
+            message(WARNING "catra-gpu: ONNX Runtime lib not found at ${_ort_lib} -> RIFE disabled")
+        elseif(NOT EXISTS "${_ort_dll}")
+            message(WARNING "catra-gpu: ONNX Runtime DLL not found at ${_ort_dll} -> RIFE disabled")
+        else()
+            add_library(catra_onnxruntime_import SHARED IMPORTED)
+            set_target_properties(catra_onnxruntime_import PROPERTIES
+                INTERFACE_INCLUDE_DIRECTORIES "${_ort_inc}"
+                IMPORTED_IMPLIB "${_ort_lib}"
+                IMPORTED_LOCATION "${_ort_dll}")
+            set(CATRA_ONNXRUNTIME_TARGET catra_onnxruntime_import)
+        endif()
     endif()
 
     if(CATRA_ONNXRUNTIME_TARGET)
