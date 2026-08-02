@@ -14,6 +14,7 @@
 #define CATRA_GPU_BUILDING // export the CATRA_API symbols from this TU
 #include "catra_gpu.h"
 #include "d3d_interop.h"
+#include "encode_amf.h"
 #include "interp_rife.h"
 #include "upscale_fsr1.h"
 #include "upscale_fsr4.h"
@@ -245,6 +246,54 @@ int UpscalePassthrough(UpscaleContext* ctx, ID3D11Texture2D* src,
     return CATRA_OK;
 }
 
+// --- Encode context registry (ST-16) ---------------------------------------
+//
+// Mirrors the upscale/RIFE registries: dense non-negative int handles,
+// mutex-guarded map, heavy work outside the lock. A context owns exactly one
+// catra::AmfEncoder (the AMF factory/context/component + staging buffer).
+
+struct EncodeContext
+{
+    int width = 0;
+    int height = 0;
+    int bitrateKbps = 0;
+    double fps = 0.0;
+    std::unique_ptr<catra::AmfEncoder> encoder;
+};
+
+std::mutex g_encodeMutex;
+std::unordered_map<int, std::unique_ptr<EncodeContext>> g_encodeContexts;
+int g_nextEncodeHandle = 0;
+
+int RegisterEncode(std::unique_ptr<EncodeContext> ctx)
+{
+    std::lock_guard<std::mutex> lock(g_encodeMutex);
+    int handle = g_nextEncodeHandle++;
+    g_encodeContexts.emplace(handle, std::move(ctx));
+    return handle;
+}
+
+EncodeContext* LookupEncode(int handle)
+{
+    std::lock_guard<std::mutex> lock(g_encodeMutex);
+    auto it = g_encodeContexts.find(handle);
+    return it == g_encodeContexts.end() ? nullptr : it->second.get();
+}
+
+void DestroyEncode(int handle)
+{
+    std::lock_guard<std::mutex> lock(g_encodeMutex);
+    g_encodeContexts.erase(handle); // unique_ptr frees the AMF encoder (RAII)
+}
+
+// Called from catra_shutdown BEFORE the bridge releases its D3D12 device, which
+// the AMF contexts borrow (AMFContext::InitDX12 AddRef'd it).
+void DestroyAllEncode()
+{
+    std::lock_guard<std::mutex> lock(g_encodeMutex);
+    g_encodeContexts.clear();
+}
+
 } // namespace
 
 // ===========================================================================
@@ -311,6 +360,7 @@ void catra_shutdown(void)
         // borrow, then let go of the device/context.
         catra::InterpRifeDestroyAll();
         DestroyAllUpscale();
+        DestroyAllEncode(); // ST-16: AMF contexts borrow the D3D12 device
 
         // ST-15: tear down the interop (pool textures reference BOTH devices)
         // before releasing the bridge's device refs. Idempotent.
@@ -555,49 +605,134 @@ void catra_upscale_destroy(int ctx)
 }
 
 // ===========================================================================
-// Encode — stubs (ST-16)
+// Encode — AMF H.265 (HEVC) backend (ST-16)
 // ===========================================================================
+//
+// The AMF backend (encode_amf.cpp) lights up when the bridge is built against
+// the GPUOpen AMF headers (CATRA_HAS_AMF via -DCATRA_AMF_ROOT); without them it
+// compiles to a stub and these entry points surface CATRA_ERR_NOT_IMPL
+// gracefully. The encoder runs on the bridge's shared D3D12 device (ST-15
+// interop), so a create with no D3D12 device fails at the backend with
+// CATRA_ERR_DEVICE. Encoded packets are context-owned (valid until the next
+// encode/flush on the same context) — the frozen C ABI has no free call.
 
 int catra_encode_create(int width, int height,
                         int bitrate_kbps, double fps, int* out_ctx)
 {
-    (void)width; (void)height; (void)bitrate_kbps; (void)fps;
-    if (out_ctx != nullptr)
-    {
-        *out_ctx = -1;
-    }
-    return CATRA_ERR_NOT_IMPL;
+    return GuardCabi([&]() -> int {
+        if (out_ctx != nullptr)
+        {
+            *out_ctx = -1;
+        }
+        if (!g_initialized.load())
+        {
+            log_msg(CATRA_LOG_ERROR, "catra_encode_create: bridge not initialized");
+            return CATRA_ERR_INIT;
+        }
+        if (width <= 0 || height <= 0 || bitrate_kbps <= 0 || fps <= 0.0 ||
+            out_ctx == nullptr)
+        {
+            log_msg(CATRA_LOG_ERROR,
+                    "catra_encode_create: invalid args (%dx%d, %d kbps, %.3f fps)",
+                    width, height, bitrate_kbps, fps);
+            return CATRA_ERR_INVALID_ARG;
+        }
+
+        auto ctx = std::make_unique<EncodeContext>();
+        ctx->width = width;
+        ctx->height = height;
+        ctx->bitrateKbps = bitrate_kbps;
+        ctx->fps = fps;
+
+        // The backend validates the D3D12 device: with CATRA_HAS_AMF it returns
+        // CATRA_ERR_DEVICE when g_d3d12Device is null (interop unavailable);
+        // without CATRA_HAS_AMF it returns CATRA_ERR_NOT_IMPL regardless. The
+        // device is passed through (not pre-checked) so a no-headers build always
+        // degrades to NOT_IMPL, per the ST-16 graceful-degradation requirement.
+        const int rc = catra::AmfEncoder::Create(g_d3d12Device.Get(), width, height,
+                                                 bitrate_kbps, fps, ctx->encoder);
+        if (rc != CATRA_OK)
+        {
+            // Backend construction failed; nothing was registered, so the
+            // unique_ptr drops any partial state on scope exit (RAII).
+            log_msg(CATRA_LOG_ERROR,
+                    "catra_encode_create: backend create failed rc=%d (amf_compiled=%d)",
+                    rc, catra::AmfIsCompiled() ? 1 : 0);
+            return rc;
+        }
+
+        log_msg(CATRA_LOG_INFO,
+                "catra_encode_create: HEVC %dx%d @ %.3f fps, %d kbps",
+                width, height, fps, bitrate_kbps);
+
+        const int handle = RegisterEncode(std::move(ctx));
+        *out_ctx = handle;
+        return CATRA_OK;
+    });
 }
 
-int catra_encode_frame(int ctx, void* texture, uint8_t** out_buf, int* out_size)
+int catra_encode_frame(int ctx, void* texture,
+                       uint8_t** out_buf, int* out_size)
 {
-    (void)ctx; (void)texture;
-    if (out_buf != nullptr)
-    {
-        *out_buf = nullptr;
-    }
-    if (out_size != nullptr)
-    {
-        *out_size = 0;
-    }
-    return CATRA_ERR_NOT_IMPL;
+    // Every failure path leaves *out_buf null / *out_size 0; the backend releases
+    // no caller resource (it only reads the texture) and the C ABI guard converts
+    // a stray exception (e.g. std::bad_alloc from the staging buffer) into
+    // CATRA_ERR_UNKNOWN so nothing unwinds into the P/Invoke frame.
+    return GuardCabi([&]() -> int {
+        if (out_buf != nullptr)
+        {
+            *out_buf = nullptr;
+        }
+        if (out_size != nullptr)
+        {
+            *out_size = 0;
+        }
+
+        EncodeContext* c = LookupEncode(ctx);
+        if (c == nullptr)
+        {
+            log_msg(CATRA_LOG_ERROR, "catra_encode_frame: unknown context %d", ctx);
+            return CATRA_ERR_CONTEXT;
+        }
+        if (texture == nullptr || out_buf == nullptr || out_size == nullptr)
+        {
+            return CATRA_ERR_INVALID_ARG;
+        }
+
+        return c->encoder->Encode(static_cast<ID3D12Resource*>(texture), out_buf, out_size);
+    });
 }
 
 int catra_encode_flush(int ctx, uint8_t** out_buf, int* out_size)
 {
-    (void)ctx;
-    if (out_buf != nullptr)
-    {
-        *out_buf = nullptr;
-    }
-    if (out_size != nullptr)
-    {
-        *out_size = 0;
-    }
-    return CATRA_ERR_NOT_IMPL;
+    return GuardCabi([&]() -> int {
+        if (out_buf != nullptr)
+        {
+            *out_buf = nullptr;
+        }
+        if (out_size != nullptr)
+        {
+            *out_size = 0;
+        }
+
+        EncodeContext* c = LookupEncode(ctx);
+        if (c == nullptr)
+        {
+            log_msg(CATRA_LOG_ERROR, "catra_encode_flush: unknown context %d", ctx);
+            return CATRA_ERR_CONTEXT;
+        }
+        if (out_buf == nullptr || out_size == nullptr)
+        {
+            return CATRA_ERR_INVALID_ARG;
+        }
+
+        return c->encoder->Flush(out_buf, out_size);
+    });
 }
 
 void catra_encode_destroy(int ctx)
 {
-    (void)ctx;
+    GuardCabiVoid([&]() {
+        DestroyEncode(ctx); // no-op for an unknown handle
+    });
 }

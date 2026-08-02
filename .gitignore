@@ -76,3 +76,10 @@ lib/onnxruntime/
 # never vendored or downloaded by this repo. FSR 1 (EASU) is the self-contained
 # fallback when the SDK is absent.
 lib/fsr-sdk/
+
+# ---- AMF SDK headers (ST-16) ----
+# Headers-only GPUOpen SDK (https://github.com/GPUOpen-LibrariesAndSDKs/AMF)
+# supplied by the integrator via -DCATRA_AMF_ROOT; never vendored or downloaded
+# by this repo. The AMF runtime (amfrt64.dll) ships with the AMD driver. Without
+# the headers the encode backend compiles to a CATRA_ERR_NOT_IMPL stub.
+lib/amf/

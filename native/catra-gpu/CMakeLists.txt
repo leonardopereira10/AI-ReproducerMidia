@@ -120,6 +120,7 @@ endif()
 add_library(catra-gpu SHARED
     catra_gpu.cpp
     d3d_interop.cpp
+    encode_amf.cpp
     interp_rife.cpp
     upscale_fsr1.cpp
     upscale_fsr4.cpp)
@@ -216,6 +217,47 @@ elseif(CATRA_WITH_FSR4)
     message(STATUS
         "catra-gpu: CATRA_FSR_SDK_ROOT not set -> FSR 4 disabled "
         "(FSR 1 EASU fallback carries upscale; pass -DCATRA_FSR_SDK_ROOT to enable FSR 4)")
+endif()
+
+# --- AMF H.265 encode (ST-16) ----------------------------------------------
+# AMF (AMD Media Framework) is HEADERS-ONLY on GPUOpen and is NEVER vendored or
+# downloaded by this repo (lib/amf/ is gitignored). encode_amf.cpp only lights
+# up when the integrator supplies the SDK via -DCATRA_AMF_ROOT=<AMF repo root>
+# (the directory containing AMF/public/include/...; clone
+# https://github.com/GPUOpen-LibrariesAndSDKs/AMF). The AMF *runtime*
+# (amfrt64.dll) ships with the AMD Adrenalin driver and is loaded dynamically at
+# runtime, so there is NO AMF import lib to link.
+#
+# Expected layout (see scripts/build-native.ps1):
+#   <CATRA_AMF_ROOT>/AMF/public/include/core/Factory.h
+#   <CATRA_AMF_ROOT>/AMF/public/include/core/Context.h
+#   <CATRA_AMF_ROOT>/AMF/public/include/components/VideoEncoderHEVC.h
+#
+# When the headers are absent, CATRA_HAS_AMF stays undefined: encode_amf.cpp
+# compiles to an inert stub and catra_encode_* return CATRA_ERR_NOT_IMPL
+# gracefully (no crash). The repo root is added to the include path so the
+# backend can use the canonical <AMF/public/include/...> include form.
+option(CATRA_WITH_AMF "Build the AMF H.265 encode backend (needs CATRA_AMF_ROOT)" ON)
+
+set(CATRA_HAS_AMF FALSE)
+if(CATRA_WITH_AMF AND DEFINED CATRA_AMF_ROOT)
+    set(_amf_factory_hdr "${CATRA_AMF_ROOT}/AMF/public/include/core/Factory.h")
+    if(EXISTS "${_amf_factory_hdr}")
+        set(CATRA_HAS_AMF TRUE)
+        target_include_directories(catra-gpu PRIVATE "${CATRA_AMF_ROOT}")
+        target_compile_definitions(catra-gpu PRIVATE CATRA_HAS_AMF=1)
+        message(STATUS "catra-gpu: AMF SDK found at ${CATRA_AMF_ROOT} -> AMF H.265 encode enabled")
+    else()
+        message(WARNING
+            "catra-gpu: CATRA_AMF_ROOT='${CATRA_AMF_ROOT}' but ${_amf_factory_hdr} "
+            "not found -> AMF encode disabled (CATRA_ERR_NOT_IMPL). Point -DCATRA_AMF_ROOT "
+            "at the AMF repo root (the dir containing AMF/public/include/).")
+    endif()
+elseif(CATRA_WITH_AMF)
+    message(STATUS
+        "catra-gpu: CATRA_AMF_ROOT not set -> AMF H.265 encode disabled "
+        "(headers-only GPUOpen SDK; runtime comes from the AMD driver). "
+        "Pass -DCATRA_AMF_ROOT=<AMF repo root> to enable.")
 endif()
 
 # --- Install ----------------------------------------------------------------

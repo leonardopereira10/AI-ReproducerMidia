@@ -27,7 +27,10 @@
 // on the D3D11 adapter via the D3D11<->DX12 interop (ST-15: NT shared
 // handles + keyed mutex + a pooled GPU-GPU copy fallback); when D3D12 is
 // unavailable the bridge soft-fails and the D3D11-only paths keep working.
-// Encode (AMF H.265, ST-16) remains a CATRA_ERR_NOT_IMPL stub.
+// Encode (ST-16) runs AMF H.265 (HEVC) when the bridge is built against the
+// GPUOpen AMF headers (CATRA_HAS_AMF via -DCATRA_AMF_ROOT; the AMF runtime
+// amfrt64.dll is loaded from the AMD driver at runtime). Without the headers
+// the encode entry points degrade gracefully to CATRA_ERR_NOT_IMPL.
 //
 // EXCEPTION SAFETY: every fallible entry point is guarded at the C ABI
 // boundary; no C++ exception escapes this DLL. Stray exceptions (e.g.
@@ -168,23 +171,41 @@ CATRA_API int  catra_upscale_process(int ctx,
 CATRA_API void catra_upscale_destroy(int ctx);
 
 // ===========================================================================
-// Encode (AMF H.265) — stubs
+// Encode (AMF H.265 / HEVC) — ST-16
 // ===========================================================================
+//
+// Hardware H.265 encode via AMD Media Framework on the bridge's shared D3D12
+// device (ST-15 interop). Live when the bridge is built with the GPUOpen AMF
+// headers (CATRA_HAS_AMF); otherwise every entry point returns
+// CATRA_ERR_NOT_IMPL. Output is an Annex B NAL-unit stream (VPS/SPS/PPS at GOP
+// boundaries); MP4 muxing / Annex B -> length-prefix conversion is ST-17 (C#).
 
+// Creates an encoder. `width`/`height` are the frame size, `bitrate_kbps` the
+// target bitrate in kbit/s (CBR), `fps` the frame rate. On success writes a
+// handle to *out_ctx. Returns CATRA_ERR_INIT before catra_init,
+// CATRA_ERR_INVALID_ARG for non-positive args, CATRA_ERR_DEVICE when the D3D12
+// device / AMF runtime / encoder init fails, CATRA_ERR_NOT_IMPL when built
+// without the AMF SDK.
 CATRA_API int  catra_encode_create(int width, int height,
                                    int bitrate_kbps, double fps,
                                    int* out_ctx);
 
-// Encodes one texture. On success writes the packet bytes to *out_buf and
-// their size to *out_size and returns CATRA_OK. The buffer is owned by the
-// context and valid until the next encode call on the same context.
+// Encodes one DX12 texture (ID3D12Resource*, NV12, width x height). On success
+// writes the packet bytes to *out_buf and their size to *out_size and returns
+// CATRA_OK. The buffer is OWNED BY THE CONTEXT and valid until the next encode
+// call on the SAME context (the ABI has no free function). A size of 0 is NOT an
+// error: the async encoder may still be buffering, in which case the caller
+// keeps feeding frames. *out_buf stays null on every failure path.
 CATRA_API int  catra_encode_frame(int ctx, void* texture,
                                   uint8_t** out_buf, int* out_size);
 
-// Drains buffered packets. Same buffer contract as catra_encode_frame.
+// Drains buffered packets (Drain + collect the remainder), concatenating them
+// into the context-owned buffer. Same buffer contract as catra_encode_frame.
+// Called once at the end of the stream; idempotent thereafter.
 CATRA_API int  catra_encode_flush(int ctx,
                                   uint8_t** out_buf, int* out_size);
 
+// Destroys an encoder. No-op for an unknown handle.
 CATRA_API void catra_encode_destroy(int ctx);
 
 #ifdef __cplusplus

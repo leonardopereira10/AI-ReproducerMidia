@@ -67,7 +67,18 @@ internal sealed class FakeNativeLibrary : INativeLibrary
     public int UpscaleProcessCallCount { get; private set; }
     public int LastUpscaleProcessContext { get; private set; }
     public IntPtr LastUpscaleProcessSrc { get; private set; }
+    public int EncodeCreateCallCount { get; private set; }
+    public int LastEncodeCreateWidth { get; private set; }
+    public int LastEncodeCreateHeight { get; private set; }
+    public int LastEncodeCreateBitrateKbps { get; private set; }
+    public double LastEncodeCreateFps { get; private set; }
+    public int EncodeFrameCallCount { get; private set; }
+    public int LastEncodeFrameContext { get; private set; }
+    public IntPtr LastEncodeFrameTexture { get; private set; }
+    public int EncodeFlushCallCount { get; private set; }
+    public int LastEncodeFlushContext { get; private set; }
     public int EncodeDestroyCallCount { get; private set; }
+    public int LastEncodeDestroyContext { get; private set; }
     public int SetLogCallbackCallCount { get; private set; }
     public NativeLogCallback? LastLogCallback { get; private set; }
 
@@ -150,12 +161,20 @@ internal sealed class FakeNativeLibrary : INativeLibrary
 
     public int EncodeCreate(int width, int height, int bitrateKbps, double fps, out int context)
     {
+        EncodeCreateCallCount++;
+        LastEncodeCreateWidth = width;
+        LastEncodeCreateHeight = height;
+        LastEncodeCreateBitrateKbps = bitrateKbps;
+        LastEncodeCreateFps = fps;
         context = EncodeCreateContext;
         return EncodeCreateResult;
     }
 
     public int EncodeFrame(int context, IntPtr texture, out IntPtr packetBuffer, out int packetSize)
     {
+        EncodeFrameCallCount++;
+        LastEncodeFrameContext = context;
+        LastEncodeFrameTexture = texture;
         packetBuffer = EncodeBuffer;
         packetSize = EncodeSize;
         return EncodeFrameResult;
@@ -163,12 +182,18 @@ internal sealed class FakeNativeLibrary : INativeLibrary
 
     public int EncodeFlush(int context, out IntPtr packetBuffer, out int packetSize)
     {
+        EncodeFlushCallCount++;
+        LastEncodeFlushContext = context;
         packetBuffer = EncodeBuffer;
         packetSize = EncodeSize;
         return EncodeFlushResult;
     }
 
-    public void EncodeDestroy(int context) => EncodeDestroyCallCount++;
+    public void EncodeDestroy(int context)
+    {
+        EncodeDestroyCallCount++;
+        LastEncodeDestroyContext = context;
+    }
 }
 
 /// <summary>
@@ -754,6 +779,226 @@ public class NativeBridgeUpscaleTests
         bridge.Dispose();
 
         var act = () => bridge.CreateUpscaler(1920, 1080, 3840, 2160, 2);
+
+        act.Should().Throw<ObjectDisposedException>();
+    }
+}
+
+/// <summary>
+/// ST-16 AMF encode coverage for <see cref="NativeBridge"/>: argument forwarding,
+/// native error-code mapping, the async-encoder buffering contract (a 0-byte
+/// packet is NOT an error — the caller keeps feeding frames), flush draining the
+/// final NALs, destroy forwarding and disposal guard rails. All driven through
+/// <see cref="FakeNativeLibrary"/> — no DLL.
+/// </summary>
+public class NativeBridgeEncodeTests
+{
+    [Fact]
+    public void CreateEncoder_ForwardsAllArgumentsToNative()
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = true, EncodeCreateResult = 0, EncodeCreateContext = 31 };
+        var bridge = new NativeBridge(lib);
+
+        IntPtr handle = bridge.CreateEncoder(3840, 2160, 20_000, 60.0);
+
+        handle.Should().Be((IntPtr)31);
+        lib.EncodeCreateCallCount.Should().Be(1);
+        lib.LastEncodeCreateWidth.Should().Be(3840);
+        lib.LastEncodeCreateHeight.Should().Be(2160);
+        lib.LastEncodeCreateBitrateKbps.Should().Be(20_000);
+        lib.LastEncodeCreateFps.Should().Be(60.0);
+    }
+
+    [Theory]
+    [InlineData(-2)] // CATRA_ERR_NOT_IMPL (AMF SDK absent)
+    [InlineData(-4)]
+    [InlineData(-5)]
+    public void CreateEncoder_NativeError_ThrowsWithCode(int code)
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = true, EncodeCreateResult = code };
+        var bridge = new NativeBridge(lib);
+
+        var act = () => bridge.CreateEncoder(3840, 2160, 20_000, 60);
+
+        act.Should().Throw<NativeBridgeException>().Which.ErrorCode.Should().Be(code);
+    }
+
+    [Fact]
+    public void EncodeFrame_ForwardsContextAndTexture()
+    {
+        var buf = new IntPtr(0xEE01);
+        var texture = new IntPtr(0x7E57);
+        var lib = new FakeNativeLibrary
+        {
+            IsAvailable = true,
+            EncodeFrameResult = 0,
+            EncodeBuffer = buf,
+            EncodeSize = 4096,
+        };
+        var bridge = new NativeBridge(lib);
+
+        bridge.EncodeFrame(new IntPtr(31), texture, out IntPtr packet, out int size);
+
+        packet.Should().Be(buf);
+        size.Should().Be(4096);
+        lib.EncodeFrameCallCount.Should().Be(1);
+        lib.LastEncodeFrameContext.Should().Be(31);
+        lib.LastEncodeFrameTexture.Should().Be(texture);
+    }
+
+    [Fact]
+    public void EncodeFrame_ZeroBytes_IsBuffering_NotAnError()
+    {
+        // The async AMF encoder may still be buffering: packetSize == 0 with a
+        // CATRA_OK return must surface cleanly (caller keeps feeding frames),
+        // never as an exception.
+        var lib = new FakeNativeLibrary
+        {
+            IsAvailable = true,
+            EncodeFrameResult = 0,
+            EncodeBuffer = IntPtr.Zero,
+            EncodeSize = 0,
+        };
+        var bridge = new NativeBridge(lib);
+
+        IntPtr packet = IntPtr.Zero;
+        int size = -1;
+        var act = () => bridge.EncodeFrame(new IntPtr(31), new IntPtr(1), out packet, out size);
+
+        act.Should().NotThrow();
+        packet.Should().Be(IntPtr.Zero);
+        size.Should().Be(0);
+    }
+
+    [Theory]
+    [InlineData(-3)]
+    [InlineData(-4)]
+    [InlineData(-6)]
+    public void EncodeFrame_NativeError_ThrowsWithCode(int code)
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = true, EncodeFrameResult = code };
+        var bridge = new NativeBridge(lib);
+
+        var act = () => bridge.EncodeFrame(new IntPtr(31), new IntPtr(1), out _, out _);
+
+        act.Should().Throw<NativeBridgeException>().Which.ErrorCode.Should().Be(code);
+    }
+
+    [Fact]
+    public void FlushEncoder_ReturnsFinalNals_AndForwardsContext()
+    {
+        var buf = new IntPtr(0xF105);
+        var lib = new FakeNativeLibrary
+        {
+            IsAvailable = true,
+            EncodeFlushResult = 0,
+            EncodeBuffer = buf,
+            EncodeSize = 8192,
+        };
+        var bridge = new NativeBridge(lib);
+
+        bridge.FlushEncoder(new IntPtr(31), out IntPtr packet, out int size);
+
+        packet.Should().Be(buf);
+        size.Should().Be(8192);
+        lib.EncodeFlushCallCount.Should().Be(1);
+        lib.LastEncodeFlushContext.Should().Be(31);
+    }
+
+    [Fact]
+    public void FlushEncoder_NoBufferedPackets_ReturnsZeroWithoutError()
+    {
+        // Idempotent flush / nothing left buffered: size 0 is a valid outcome.
+        var lib = new FakeNativeLibrary
+        {
+            IsAvailable = true,
+            EncodeFlushResult = 0,
+            EncodeBuffer = IntPtr.Zero,
+            EncodeSize = 0,
+        };
+        var bridge = new NativeBridge(lib);
+
+        IntPtr packet = IntPtr.Zero;
+        int size = -1;
+        var act = () => bridge.FlushEncoder(new IntPtr(31), out packet, out size);
+
+        act.Should().NotThrow();
+        packet.Should().Be(IntPtr.Zero);
+        size.Should().Be(0);
+    }
+
+    [Theory]
+    [InlineData(-2)]
+    [InlineData(-5)]
+    public void FlushEncoder_NativeError_ThrowsWithCode(int code)
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = true, EncodeFlushResult = code };
+        var bridge = new NativeBridge(lib);
+
+        var act = () => bridge.FlushEncoder(new IntPtr(31), out _, out _);
+
+        act.Should().Throw<NativeBridgeException>().Which.ErrorCode.Should().Be(code);
+    }
+
+    [Fact]
+    public void DestroyEncoder_ForwardsHandleAsInt()
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = true };
+        var bridge = new NativeBridge(lib);
+
+        bridge.DestroyEncoder(new IntPtr(99));
+
+        lib.EncodeDestroyCallCount.Should().Be(1);
+        lib.LastEncodeDestroyContext.Should().Be(99);
+    }
+
+    [Fact]
+    public void Unavailable_EncodeFrame_ThrowsNativeBridgeException()
+    {
+        var bridge = new NativeBridge(new FakeNativeLibrary { IsAvailable = false });
+
+        var act = () => bridge.EncodeFrame(new IntPtr(1), new IntPtr(2), out _, out _);
+
+        act.Should().Throw<NativeBridgeException>().WithMessage("*not available*");
+    }
+
+    [Fact]
+    public void Unavailable_FlushEncoder_ThrowsNativeBridgeException()
+    {
+        var bridge = new NativeBridge(new FakeNativeLibrary { IsAvailable = false });
+
+        var act = () => bridge.FlushEncoder(new IntPtr(1), out _, out _);
+
+        act.Should().Throw<NativeBridgeException>().WithMessage("*not available*");
+    }
+
+    [Fact]
+    public void Unavailable_DestroyEncoder_IsNoOp()
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = false };
+        var bridge = new NativeBridge(lib);
+
+        var act = () => bridge.DestroyEncoder(new IntPtr(3));
+
+        act.Should().NotThrow();
+        lib.EncodeDestroyCallCount.Should().Be(0);
+    }
+
+    [Theory]
+    [InlineData("create")]
+    [InlineData("frame")]
+    [InlineData("flush")]
+    public void AfterDispose_EncodeOperations_ThrowObjectDisposed(string operation)
+    {
+        var bridge = new NativeBridge(new FakeNativeLibrary { IsAvailable = true });
+        bridge.Dispose();
+
+        Action act = operation switch
+        {
+            "create" => () => bridge.CreateEncoder(3840, 2160, 20_000, 60),
+            "frame" => () => bridge.EncodeFrame(new IntPtr(1), new IntPtr(2), out _, out _),
+            _ => () => bridge.FlushEncoder(new IntPtr(1), out _, out _),
+        };
 
         act.Should().Throw<ObjectDisposedException>();
     }

@@ -103,15 +103,40 @@ public interface INativeBridge : IDisposable
     /// <summary>Destroys an upscaler. No-op when unavailable.</summary>
     void DestroyUpscaler(IntPtr context);
 
-    // --- Encode (stubs until ST-16) ----------------------------------------
+    // --- Encode (AMF H.265 / HEVC, ST-16) ----------------------------------
 
-    /// <summary>Creates an H.265 encoder; returns an opaque context handle.</summary>
+    /// <summary>Creates an H.265 (HEVC) encoder; returns an opaque context handle.</summary>
+    /// <remarks>
+    /// Runs on the bridge's shared D3D12 device via AMD Media Framework (AMF).
+    /// <paramref name="bitrateKbps"/> is the CBR target bitrate in kbit/s and
+    /// <paramref name="fps"/> the frame rate; the HEVC tier is chosen natively
+    /// (Main for &lt;= 4K30, High above). Throws a native-bridge exception on a
+    /// negative native return code &mdash; including <c>CATRA_ERR_NOT_IMPL</c>
+    /// when the bridge was built without the (headers-only, GPUOpen) AMF SDK.
+    /// </remarks>
     IntPtr CreateEncoder(int width, int height, int bitrateKbps, double fps);
 
-    /// <summary>Encodes one texture, writing the packet bytes/size to the out parameters.</summary>
+    /// <summary>Encodes one DX12 texture, writing the packet bytes/size to the out parameters.</summary>
+    /// <remarks>
+    /// <paramref name="texture"/> is an <c>ID3D12Resource*</c> (NV12, context
+    /// width x height). The returned <paramref name="packetBuffer"/> points into
+    /// a CONTEXT-OWNED buffer valid until the next <see cref="EncodeFrame"/> /
+    /// <see cref="FlushEncoder"/> on the same context (the caller must NOT free
+    /// it). A <paramref name="packetSize"/> of <c>0</c> is not an error: the
+    /// asynchronous encoder may still be buffering, in which case the caller
+    /// keeps feeding frames. Output is an Annex B NAL-unit stream (MP4 muxing is
+    /// a later pipeline step). Throws a native-bridge exception on a negative
+    /// native return code.
+    /// </remarks>
     void EncodeFrame(IntPtr context, IntPtr texture, out IntPtr packetBuffer, out int packetSize);
 
     /// <summary>Drains buffered packets, writing the packet bytes/size to the out parameters.</summary>
+    /// <remarks>
+    /// Called once at the end of the stream; concatenates every remaining packet
+    /// into the context-owned buffer (same ownership/validity contract as
+    /// <see cref="EncodeFrame"/>). Idempotent thereafter. Throws a native-bridge
+    /// exception on a negative native return code.
+    /// </remarks>
     void FlushEncoder(IntPtr context, out IntPtr packetBuffer, out int packetSize);
 
     /// <summary>Destroys an encoder. No-op when unavailable.</summary>

@@ -42,6 +42,17 @@ param(
     [string]$FsrSdkRoot = $env:CATRA_FSR_SDK_ROOT,
     [string]$FsrSdkLib  = $env:CATRA_FSR_SDK_LIB,
 
+    # AMF H.265 encode SDK root (ST-16). OPTIONAL and headers-only: this script
+    # NEVER downloads it. When omitted, AMF encode is disabled and the bridge's
+    # catra_encode_* return CATRA_ERR_NOT_IMPL gracefully. To enable AMF encode:
+    #   1. Clone the GPUOpen AMF SDK (headers only; the runtime amfrt64.dll ships
+    #      with the AMD Adrenalin driver — nothing to build or link):
+    #        git clone https://github.com/GPUOpen-LibrariesAndSDKs/AMF lib/amf
+    #      (lib/amf/ is gitignored.)
+    #   2. Pass -AmfRoot lib/amf  (the repo root containing AMF/public/include/).
+    # CMake then defines CATRA_HAS_AMF and lights up the AMF H.265 backend.
+    [string]$AmfRoot = $env:CATRA_AMF_ROOT,
+
     [switch]$SkipModelDownload
 )
 
@@ -149,11 +160,25 @@ else {
     Write-Host "build-native: FSR 4 SDK not supplied -> FSR 1 (EASU) fallback active."
 }
 
+# AMF H.265 encode (ST-16): forward the optional AMF SDK (headers-only) location.
+# When -AmfRoot is empty CMake leaves CATRA_HAS_AMF undefined and catra_encode_*
+# return CATRA_ERR_NOT_IMPL gracefully. The SDK is headers-only on GPUOpen and is
+# NEVER downloaded here; the AMF runtime (amfrt64.dll) comes from the AMD driver.
+$amfArgs = @()
+if (-not [string]::IsNullOrWhiteSpace($AmfRoot)) {
+    Write-Host "build-native: AMF SDK root = $AmfRoot"
+    $amfArgs += "-DCATRA_AMF_ROOT=$AmfRoot"
+}
+else {
+    Write-Host "build-native: AMF SDK not supplied -> H.265 encode disabled (CATRA_ERR_NOT_IMPL)."
+}
+
 & cmake -B $buildDir -S $nativeDir `
     -DCMAKE_TOOLCHAIN_FILE="$toolchainFile" `
     -DVCPKG_TARGET_TRIPLET=x64-windows `
     -DCMAKE_BUILD_TYPE=$Configuration `
-    @fsrArgs
+    @fsrArgs `
+    @amfArgs
 if ($LASTEXITCODE -ne 0) { Fail "CMake configure failed (exit $LASTEXITCODE)." }
 
 # --- Build ------------------------------------------------------------------
