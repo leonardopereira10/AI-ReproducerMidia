@@ -183,9 +183,25 @@ public sealed class ProcessingPipeline : IProcessingPipeline
             // 3. Init native contexts (only the active stages).
             if (needInterp)
             {
-                interpContext = _bridge.CreateInterpolation(
-                    meta.Width, meta.Height, meta.Fps, config.TargetFps, MapInterpMethod(config.InterpMethod));
-                haveInterp = true;
+                try
+                {
+                    interpContext = _bridge.CreateInterpolation(
+                        meta.Width, meta.Height, meta.Fps, config.TargetFps, MapInterpMethod(config.InterpMethod));
+                    haveInterp = true;
+                }
+                catch (NativeBridgeException ex)
+                {
+                    // Graceful degradation: RIFE model missing, ORT version mismatch,
+                    // or GPU init failure. Skip interpolation and continue with
+                    // upscale + encode only. The output will have the source fps
+                    // (no frame interpolation) but still be upscaled + re-encoded.
+                    Trace.WriteLine(
+                        $"[ProcessingPipeline] Interpolation unavailable ({ex.Message}); " +
+                        "continuing without frame interpolation.");
+                    needInterp = false;
+                    weights = ComputeWeights(needInterp, needUpscale);
+                    loopStep = SelectLoopStep(needInterp, needUpscale);
+                }
             }
 
             if (needUpscale)
