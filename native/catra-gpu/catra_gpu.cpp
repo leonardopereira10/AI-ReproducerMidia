@@ -1,9 +1,10 @@
 // catra_gpu.cpp — CATRA GPU native bridge implementation.
 //
 // Lifecycle + capability queries are wired; the RIFE interpolation backend is
-// implemented (ST-13, see interp_rife.cpp); upscale (ST-14) and encode (ST-16)
-// still return CATRA_ERR_NOT_IMPL. The log callback is stored and used to
-// surface diagnostics to the C# layer.
+// implemented (ST-13, see interp_rife.cpp); upscale (ST-14) runs on the shared
+// D3D12 device created at init by the D3D11<->DX12 interop (ST-15, see
+// d3d_interop.cpp); encode (ST-16) still returns CATRA_ERR_NOT_IMPL. The log
+// callback is stored and used to surface diagnostics to the C# layer.
 //
 // EXCEPTION BARRIER: every entry point that reaches a backend is wrapped in
 // GuardCabi/GuardCabiVoid so no C++ exception can unwind across the extern "C"
@@ -12,6 +13,7 @@
 
 #define CATRA_GPU_BUILDING // export the CATRA_API symbols from this TU
 #include "catra_gpu.h"
+#include "d3d_interop.h"
 #include "interp_rife.h"
 #include "upscale_fsr1.h"
 #include "upscale_fsr4.h"
@@ -67,6 +69,15 @@ void log_msg(int level, const char* fmt, ...)
 // these are released.
 Microsoft::WRL::ComPtr<ID3D11Device> g_device;
 Microsoft::WRL::ComPtr<ID3D11DeviceContext> g_deviceContext;
+
+// ST-15: the D3D12 side of the bridge, created by catra::interop_init on the
+// SAME adapter as g_device (a hard requirement for NT shared-handle interop).
+// The DX12 backends (FSR 1 / FSR 4) receive this very device through
+// catra::CreateD3D12Device, so every dispatch and every shared texture lives
+// on one device/LUID. Released in catra_shutdown AFTER catra::interop_shutdown
+// (the pool textures reference both devices).
+Microsoft::WRL::ComPtr<ID3D12Device> g_d3d12Device;
+Microsoft::WRL::ComPtr<ID3D12CommandQueue> g_d3d12Queue;
 
 // Effective method (CATRA_UPSCALE_*) of the most recently created upscale
 // context; surfaced by catra_get_upscale_mode. OFF until the first create.
@@ -261,8 +272,28 @@ int catra_init(void* d3d11_device)
         g_device = device;
         g_device->GetImmediateContext(g_deviceContext.GetAddressOf());
 
-        // ST-15: derive the DXGI adapter from d3d11_device and create the
-        // D3D12 device + command queue / allocator lists here.
+        // ST-15: bring up the D3D12 side on the same adapter — shared device,
+        // DIRECT command queue, command allocator/list + fence (d3d_interop).
+        // Soft-fail by design: when D3D12 is unavailable the D3D11-only paths
+        // (RIFE interp, passthrough upscale) remain fully usable and the DX12
+        // backends surface CATRA_ERR_DEVICE at use time (RN-07 degradation).
+        ID3D12Device* device12 = nullptr;
+        ID3D12CommandQueue* queue12 = nullptr;
+        const int irc = catra::interop_init(device, &device12, &queue12);
+        if (irc == CATRA_OK)
+        {
+            g_d3d12Device.Attach(device12);
+            g_d3d12Queue.Attach(queue12);
+            log_msg(CATRA_LOG_INFO,
+                    "catra_init: D3D11<->DX12 interop ready (shared adapter)");
+        }
+        else
+        {
+            log_msg(CATRA_LOG_WARN,
+                    "catra_init: interop_init rc=%d -> DX12 path disabled "
+                    "(D3D11 paths unaffected)", irc);
+        }
+
         log_msg(CATRA_LOG_INFO, "catra_init: bridge initialized");
         return CATRA_OK;
     });
@@ -280,10 +311,15 @@ void catra_shutdown(void)
         // borrow, then let go of the device/context.
         catra::InterpRifeDestroyAll();
         DestroyAllUpscale();
+
+        // ST-15: tear down the interop (pool textures reference BOTH devices)
+        // before releasing the bridge's device refs. Idempotent.
+        catra::interop_shutdown();
+        g_d3d12Queue.Reset();
+        g_d3d12Device.Reset();
         g_deviceContext.Reset();
         g_device.Reset();
 
-        // ST-15: flush + release the D3D12 command queue and device here.
         log_msg(CATRA_LOG_INFO, "catra_shutdown: bridge shut down");
     });
 }

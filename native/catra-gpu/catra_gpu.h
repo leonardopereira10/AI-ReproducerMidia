@@ -16,14 +16,17 @@
 //   * The log callback is invoked on whatever thread produced the message;
 //     the callee must be thread-safe and must not call back into the bridge.
 //
-// STATUS (ST-14): lifecycle (init/shutdown), capability queries, frame
+// STATUS (ST-15): lifecycle (init/shutdown), capability queries, frame
 // interpolation and upscale are implemented. The RIFE backend is live when the
 // bridge is built with ONNX Runtime (CATRA_HAS_ONNXRUNTIME; DirectML EP when
 // USE_DML is detected, CPU fallback otherwise); without it, interp reports
 // unavailable and returns CATRA_ERR_NOT_IMPL. Upscale (ST-14) runs FSR 4 when
 // the bridge is built against the FidelityFX SDK (CATRA_HAS_FSR4) on an RDNA 4
-// adapter and downgrades to the self-contained FSR 1 (EASU) otherwise; the
-// DX12 dispatch path activates once the D3D11<->DX12 interop (ST-15) lands.
+// adapter and downgrades to the self-contained FSR 1 (EASU) otherwise.
+// catra_init now also creates the shared D3D12 device + DIRECT command queue
+// on the D3D11 adapter via the D3D11<->DX12 interop (ST-15: NT shared
+// handles + keyed mutex + a pooled GPU-GPU copy fallback); when D3D12 is
+// unavailable the bridge soft-fails and the D3D11-only paths keep working.
 // Encode (AMF H.265, ST-16) remains a CATRA_ERR_NOT_IMPL stub.
 //
 // EXCEPTION SAFETY: every fallible entry point is guarded at the C ABI
