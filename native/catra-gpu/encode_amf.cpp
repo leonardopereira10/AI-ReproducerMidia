@@ -85,7 +85,7 @@ int SelectHevcTier(int width, int height, double fps)
 // define). Layout matches the GPUOpen AMF repository (AMF/public/include/...).
 #include <AMF/public/include/core/Factory.h>
 #include <AMF/public/include/core/Context.h>
-#include <AMF/public/include/core/Component.h>
+#include <AMF/public/include/components/Component.h>
 #include <AMF/public/include/core/Surface.h>
 #include <AMF/public/include/core/Buffer.h>
 #include <AMF/public/include/core/Data.h>
