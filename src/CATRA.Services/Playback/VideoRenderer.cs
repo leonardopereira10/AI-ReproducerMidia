@@ -438,7 +438,7 @@ public sealed unsafe class VideoRenderer : IVideoRenderer
         _swsContext = ffmpeg.sws_getContext(
             sourceWidth, sourceHeight, sourceFormat,
             targetWidth, targetHeight, AVPixelFormat.AV_PIX_FMT_BGRA,
-            ffmpeg.SWS_BILINEAR, null, null, null);
+            (int)FFmpeg.AutoGen.SwsFlags.SWS_BILINEAR, null, null, null);
         if (_swsContext is null)
         {
             throw new InvalidOperationException("sws_getContext failed to create a scaler.");

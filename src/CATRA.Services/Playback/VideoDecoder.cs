@@ -403,7 +403,7 @@ public sealed unsafe class VideoDecoder : IVideoDecoder
             _swsContext = ffmpeg.sws_getContext(
                 width, height, sourceFormat,
                 width, height, AVPixelFormat.AV_PIX_FMT_BGRA,
-                ffmpeg.SWS_BILINEAR, null, null, null);
+                (int)FFmpeg.AutoGen.SwsFlags.SWS_BILINEAR, null, null, null);
             if (_swsContext == null)
             {
                 throw new InvalidOperationException("sws_getContext failed to create a scaler.");

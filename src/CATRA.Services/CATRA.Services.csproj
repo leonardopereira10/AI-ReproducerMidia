@@ -15,7 +15,7 @@
 
   <ItemGroup>
     <!-- FFmpeg bindings: D3D11VA hw decode + audio decode (ST-05). -->
-    <PackageReference Include="FFmpeg.AutoGen" Version="7.1.1" />
+    <PackageReference Include="FFmpeg.AutoGen" Version="8.1.0" />
     <!-- WASAPI output for the audio renderer (ST-05). -->
     <PackageReference Include="NAudio" Version="2.2.1" />
     <!-- D3D11/DXGI swapchain rendering into the WPF HwndHost (ST-05). -->

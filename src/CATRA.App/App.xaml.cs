@@ -261,26 +261,55 @@ public partial class App : Application
     /// <c>lib/ffmpeg</c> folder is absent (e.g. fresh clone before running
     /// <c>scripts/download-ffmpeg.ps1</c>) the default loader search path is kept.
     /// </summary>
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    private static extern bool SetDllDirectory(string lpPathName);
+
     private static void ConfigureFfmpeg()
     {
         string ffmpegDir = Path.Combine(AppContext.BaseDirectory, "lib", "ffmpeg");
-        if (Directory.Exists(ffmpegDir))
+        if (!Directory.Exists(ffmpegDir))
         {
-            FFmpeg.AutoGen.ffmpeg.RootPath = ffmpegDir;
-
-            // FFmpeg.AutoGen 7.x DynamicallyLoadedBindings uses NativeLibrary.Load
-            // which searches AppContext.BaseDirectory and PATH — NOT ffmpeg.RootPath.
-            // Prepend lib/ffmpeg/ to PATH so the dynamic loader finds the DLLs.
-            string currentPath = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
-            if (!currentPath.Contains(ffmpegDir, StringComparison.OrdinalIgnoreCase))
-            {
-                Environment.SetEnvironmentVariable("PATH", ffmpegDir + Path.PathSeparator + currentPath);
-            }
+            System.Diagnostics.Trace.WriteLine("[App] lib/ffmpeg/ not found — FFmpeg unavailable.");
+            return;
         }
 
-        // FFmpeg.AutoGen 7.x uses DynamicallyLoadedBindings: all function pointers
-        // are stubs that throw NotSupportedException until Initialize() resolves them
-        // from the native DLLs.
+        FFmpeg.AutoGen.ffmpeg.RootPath = ffmpegDir;
+
+        // FFmpeg.AutoGen 8.x DynamicallyLoadedBindings uses kernel32 LoadLibrary
+        // which searches the EXE directory (dotnet.exe) — NOT AppContext.BaseDirectory.
+        // SetDllDirectory adds lib/ffmpeg/ to the LoadLibrary search path.
+        SetDllDirectory(ffmpegDir);
+
+        // The BtbN 'latest' build may have newer library version numbers than
+        // FFmpeg.AutoGen expects. Scan lib/ffmpeg/ and patch LibraryVersionMap
+        // so DynamicallyLoadedBindings.Initialize() loads the right files.
+        try
+        {
+            var versionMap = typeof(FFmpeg.AutoGen.ffmpeg).GetField("LibraryVersionMap",
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+            if (versionMap?.GetValue(null) is System.Collections.Generic.Dictionary<string, int> map)
+            {
+                foreach (string libName in map.Keys.ToList())
+                {
+                    // Find the actual DLL on disk: <libName>-<N>.dll
+                    var match = Directory.GetFiles(ffmpegDir, $"{libName}-*.dll").FirstOrDefault();
+                    if (match is null) continue;
+                    string fileName = Path.GetFileNameWithoutExtension(match); // e.g. "avcodec-63"
+                    string versionStr = fileName[(libName.Length + 1)..];       // e.g. "63"
+                    if (int.TryParse(versionStr, out int actualVersion) && actualVersion != map[libName])
+                    {
+                        System.Diagnostics.Trace.WriteLine(
+                            $"[App] Patching {libName} version: {map[libName]} → {actualVersion}");
+                        map[libName] = actualVersion;
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.WriteLine($"[App] version map patch failed: {ex.Message}");
+        }
+
         try
         {
             FFmpeg.AutoGen.DynamicallyLoadedBindings.Initialize();
@@ -289,6 +318,11 @@ public partial class App : Application
         catch (Exception ex)
         {
             System.Diagnostics.Trace.WriteLine($"[App] FFmpeg bindings init failed: {ex.Message}");
+        }
+        finally
+        {
+            // Restore default search order after init.
+            SetDllDirectory(null!);
         }
     }
 

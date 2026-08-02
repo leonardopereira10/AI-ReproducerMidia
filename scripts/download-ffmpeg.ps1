@@ -14,6 +14,7 @@
 
 [CmdletBinding()]
 param(
+    # BtbN 'latest' = master/8.x which matches FFmpeg.AutoGen 8.1.0 (avcodec-63 etc.).
     [string]$ReleaseUrl = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip'
 )
 
