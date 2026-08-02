@@ -1,3 +1,5 @@
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
 using CATRA.Core.Models;
 
 namespace CATRA.Core.Library;
@@ -6,8 +8,10 @@ namespace CATRA.Core.Library;
 /// Read model for an episode card on the Detail screen (Tela 2): the episode
 /// joined with its (optional) watch state.
 /// </summary>
-public sealed class EpisodeDetail
+public sealed class EpisodeDetail : INotifyPropertyChanged
 {
+    private string? _thumbnailPath;
+
     /// <summary>Creates a detail from an episode and its optional watch state.</summary>
     public EpisodeDetail(Episode episode, WatchState? watchState)
     {
@@ -43,4 +47,29 @@ public sealed class EpisodeDetail
     /// <summary>Display title; falls back to the raw file name.</summary>
     public string Title =>
         string.IsNullOrWhiteSpace(Episode.DisplayTitle) ? Episode.FileName : Episode.DisplayTitle;
+
+    /// <summary>
+    /// Resolved thumbnail image path (ST-09), populated lazily by the view
+    /// model after an async thumbnail lookup. <c>null</c> means "show
+    /// placeholder".
+    /// </summary>
+    public string? ThumbnailPath
+    {
+        get => _thumbnailPath;
+        set => SetField(ref _thumbnailPath, value);
+    }
+
+    /// <inheritdoc />
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    private void SetField<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
+    {
+        if (EqualityComparer<T>.Default.Equals(field, value))
+        {
+            return;
+        }
+
+        field = value;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+    }
 }

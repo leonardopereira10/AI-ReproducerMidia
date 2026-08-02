@@ -4,6 +4,7 @@
              xmlns:converters="clr-namespace:CATRA.UI.Converters">
     <UserControl.Resources>
         <converters:BoolToVisibilityConverter x:Key="BoolToVisibility" />
+        <converters:ThumbnailPathToImageConverter x:Key="ThumbnailToImage" />
     </UserControl.Resources>
 
     <!-- DataContext is a MediaItemSummary (set by the host ItemsControl). -->
@@ -17,7 +18,9 @@
                 Margin="6"
                 Style="{StaticResource CardStyle}">
             <StackPanel>
-                <!-- Thumbnail placeholder (real thumbnails: ST-09) -->
+                <!-- Thumbnail (ST-09): real cover image over the placeholder;
+                     when ThumbnailPath is null the converter yields null and the
+                     placeholder stays visible (RF-08 fallback). -->
                 <Grid Height="104">
                     <Border Background="{DynamicResource SeekBarBackgroundBrush}" CornerRadius="4">
                         <TextBlock HorizontalAlignment="Center"
@@ -26,6 +29,10 @@
                                    Foreground="{DynamicResource SectionHeaderForegroundBrush}"
                                    Text="🎬" />
                     </Border>
+                    <Image HorizontalAlignment="Center"
+                           VerticalAlignment="Center"
+                           Source="{Binding ThumbnailPath, Converter={StaticResource ThumbnailToImage}}"
+                           Stretch="UniformToFill" />
                     <!-- RN-03 badge -->
                     <Border Margin="0,6,6,0"
                             Padding="6,2"

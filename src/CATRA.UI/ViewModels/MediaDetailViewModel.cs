@@ -17,6 +17,7 @@ public sealed partial class MediaDetailViewModel : ObservableObject
 {
     private readonly ILibraryService _library;
     private readonly IWatchStateService _watchStateService;
+    private readonly IThumbnailService _thumbnails;
     private readonly IAppNavigator _navigator;
     private readonly IDialogService _dialogs;
 
@@ -26,11 +27,13 @@ public sealed partial class MediaDetailViewModel : ObservableObject
     public MediaDetailViewModel(
         ILibraryService library,
         IWatchStateService watchStateService,
+        IThumbnailService thumbnails,
         IAppNavigator navigator,
         IDialogService dialogs)
     {
         _library = library ?? throw new ArgumentNullException(nameof(library));
         _watchStateService = watchStateService ?? throw new ArgumentNullException(nameof(watchStateService));
+        _thumbnails = thumbnails ?? throw new ArgumentNullException(nameof(thumbnails));
         _navigator = navigator ?? throw new ArgumentNullException(nameof(navigator));
         _dialogs = dialogs ?? throw new ArgumentNullException(nameof(dialogs));
     }
@@ -101,6 +104,43 @@ public sealed partial class MediaDetailViewModel : ObservableObject
         ProgressLine = episodes.Count == 0
             ? "Sem episódios catalogados"
             : $"{episodes.Count} eps | {watched} assistidos";
+
+        QueueThumbnailLoads(episodes);
+    }
+
+    /// <summary>
+    /// Lazily resolves episode thumbnails for the detail grids (ST-09). Each
+    /// lookup runs on the thread pool so a slow ffmpeg never blocks the UI; a
+    /// failure leaves <c>ThumbnailPath</c> null and the card shows its
+    /// placeholder.
+    /// </summary>
+    private void QueueThumbnailLoads(IEnumerable<EpisodeDetail> episodes)
+    {
+        foreach (var episode in episodes.ToList())
+        {
+            if (!string.IsNullOrEmpty(episode.ThumbnailPath))
+            {
+                continue;
+            }
+
+            _ = LoadEpisodeThumbnailAsync(episode);
+        }
+    }
+
+    private async Task LoadEpisodeThumbnailAsync(EpisodeDetail episode)
+    {
+        try
+        {
+            var path = await Task.Run(() => _thumbnails.GetOrCreateThumbnailAsync(episode.Episode));
+            if (path is not null)
+            {
+                episode.ThumbnailPath = path;
+            }
+        }
+        catch (Exception)
+        {
+            // Best effort: the card keeps its placeholder.
+        }
     }
 
     /// <summary>← Voltar.</summary>
@@ -169,7 +209,10 @@ public sealed partial class MediaDetailViewModel : ObservableObject
             return;
         }
 
-        await _library.SetMediaCoverAsync(_mediaItemId, path);
+        // RF-08: route through the thumbnail service so the image is copied
+        // into the cache (%AppData%/CATRA/thumbs/{id}_cover_custom.jpg) AND
+        // MediaItem.CoverPath is persisted — not just the raw source path.
+        await _thumbnails.SetCustomCoverAsync(_mediaItemId, path);
         _dialogs.ShowMessage("Capa configurada", path);
     }
 

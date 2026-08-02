@@ -6,6 +6,7 @@
     <UserControl.Resources>
         <converters:BoolToVisibilityConverter x:Key="BoolToVisibility" />
         <converters:ProgressToBadgeConverter x:Key="ProgressToBadge" />
+        <converters:ThumbnailPathToImageConverter x:Key="ThumbnailToImage" />
         <!-- ContextMenu lives in its own visual/data tree, so it cannot reach
              the UserControl via RelativeSource. This proxy exposes the control
              (and its command DPs) as a static resource for the menu items. -->
@@ -46,7 +47,9 @@
                 Margin="6"
                 Style="{StaticResource CardStyle}">
             <StackPanel>
-                <!-- Thumbnail placeholder (real thumbnails: ST-09) -->
+                <!-- Thumbnail (ST-09): real frame over the placeholder; when
+                     ThumbnailPath is null the converter yields null and the
+                     placeholder stays visible (RF-08 fallback). -->
                 <Grid Height="84">
                     <Border Background="{DynamicResource SeekBarBackgroundBrush}" CornerRadius="4">
                         <TextBlock HorizontalAlignment="Center"
@@ -55,6 +58,10 @@
                                    Foreground="{DynamicResource SectionHeaderForegroundBrush}"
                                    Text="🎞" />
                     </Border>
+                    <Image HorizontalAlignment="Center"
+                           VerticalAlignment="Center"
+                           Source="{Binding ThumbnailPath, Converter={StaticResource ThumbnailToImage}}"
+                           Stretch="UniformToFill" />
                     <!-- Status badge: ✓ watched / ▶ progress / ○ untouched -->
                     <Border Margin="0,6,6,0"
                             HorizontalAlignment="Right"

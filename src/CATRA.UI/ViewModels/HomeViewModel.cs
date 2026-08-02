@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.Windows;
+using CATRA.Core.Interfaces;
 using CATRA.Core.Library;
 using CATRA.UI.Navigation;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -22,6 +23,7 @@ public sealed record CategoryTab(int? Id, string Name, int Count);
 public sealed partial class HomeViewModel : ObservableObject, IDisposable
 {
     private readonly ILibraryService _library;
+    private readonly IThumbnailService _thumbnails;
     private readonly IAppNavigator _navigator;
 
     private IReadOnlyList<MediaItemSummary> _allItems = [];
@@ -33,9 +35,10 @@ public sealed partial class HomeViewModel : ObservableObject, IDisposable
     private bool _disposed;
 
     /// <summary>Creates the view model with its dependencies.</summary>
-    public HomeViewModel(ILibraryService library, IAppNavigator navigator)
+    public HomeViewModel(ILibraryService library, IThumbnailService thumbnails, IAppNavigator navigator)
     {
         _library = library ?? throw new ArgumentNullException(nameof(library));
+        _thumbnails = thumbnails ?? throw new ArgumentNullException(nameof(thumbnails));
         _navigator = navigator ?? throw new ArgumentNullException(nameof(navigator));
         _library.LibraryUpdated += OnLibraryUpdated;
     }
@@ -225,5 +228,40 @@ public sealed partial class HomeViewModel : ObservableObject, IDisposable
         }
 
         HasMediaItems = MediaItems.Count > 0;
+        QueueThumbnailLoads();
+    }
+
+    /// <summary>
+    /// Lazily resolves series covers for the visible cards (ST-09). Each lookup
+    /// runs on the thread pool so a slow ffmpeg never blocks the UI; a failure
+    /// leaves <c>ThumbnailPath</c> null and the card shows its placeholder.
+    /// </summary>
+    private void QueueThumbnailLoads()
+    {
+        foreach (var item in MediaItems.ToList())
+        {
+            if (!string.IsNullOrEmpty(item.ThumbnailPath))
+            {
+                continue;
+            }
+
+            _ = LoadCoverAsync(item);
+        }
+    }
+
+    private async Task LoadCoverAsync(MediaItemSummary item)
+    {
+        try
+        {
+            var path = await Task.Run(() => _thumbnails.GetOrCreateSeriesCoverAsync(item.Item));
+            if (path is not null)
+            {
+                item.ThumbnailPath = path;
+            }
+        }
+        catch (Exception ex)
+        {
+            StatusMessage = $"Falha ao carregar capa: {ex.Message}";
+        }
     }
 }

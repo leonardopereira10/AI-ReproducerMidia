@@ -9,6 +9,7 @@ using CATRA.Data.Repositories;
 using CATRA.Services;
 using CATRA.Services.Casting;
 using CATRA.Services.Library;
+using CATRA.Services.Metadata;
 using CATRA.Services.Playback;
 using CATRA.UI.Navigation;
 using CATRA.UI.Services;
@@ -82,6 +83,13 @@ public partial class App : Application
                 services.AddSingleton<IMediaProbeService, FfprobeMediaProbeService>();
                 services.AddSingleton<ILibraryScanner, LibraryScanner>();
                 services.AddSingleton<ILibraryWatcher, LibraryWatcher>();
+
+                // Thumbnails / covers (ST-09, RF-08, RN-05): ffmpeg CLI frame
+                // grabber behind an injectable extractor + caching service. The
+                // binary is not bundled yet, so extraction degrades to the UI
+                // placeholder until ffmpeg is available.
+                services.AddSingleton<IThumbnailExtractor, FfmpegThumbnailExtractor>();
+                services.AddSingleton<IThumbnailService, ThumbnailService>();
 
                 // Navigation
                 services.AddSingleton<FrameNavigationService>();

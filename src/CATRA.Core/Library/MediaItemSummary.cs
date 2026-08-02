@@ -1,3 +1,5 @@
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
 using CATRA.Core.Enums;
 using CATRA.Core.Models;
 
@@ -7,8 +9,10 @@ namespace CATRA.Core.Library;
 /// Read model for a media card on the Home screen (Tela 1): the media item
 /// plus aggregated episode/watch progress.
 /// </summary>
-public sealed class MediaItemSummary
+public sealed class MediaItemSummary : INotifyPropertyChanged
 {
+    private string? _thumbnailPath;
+
     /// <summary>Creates a summary from a media item and its aggregate counters.</summary>
     public MediaItemSummary(
         MediaItem item,
@@ -50,6 +54,30 @@ public sealed class MediaItemSummary
 
     /// <summary>Most recent watch-state update among this item's episodes (UTC).</summary>
     public DateTime? LastActivityUtc { get; }
+
+    /// <summary>
+    /// Resolved cover image path (ST-09), populated lazily by the view model
+    /// after an async thumbnail lookup. <c>null</c> means "show placeholder".
+    /// </summary>
+    public string? ThumbnailPath
+    {
+        get => _thumbnailPath;
+        set => SetField(ref _thumbnailPath, value);
+    }
+
+    /// <inheritdoc />
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    private void SetField<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
+    {
+        if (EqualityComparer<T>.Default.Equals(field, value))
+        {
+            return;
+        }
+
+        field = value;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+    }
 
     /// <summary>Every episode of this item is marked watched.</summary>
     public bool IsFullyWatched => EpisodeCount > 0 && WatchedCount >= EpisodeCount;
