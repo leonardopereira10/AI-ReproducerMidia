@@ -29,4 +29,15 @@
     <None Include="$(CatraNativeDll)" CopyToOutputDirectory="PreserveNewest" Link="runtimes\win-x64\native\catra-gpu.dll" Visible="false" />
   </ItemGroup>
 
+  <!-- ST-05: deploy FFmpeg native DLLs when present in lib/ffmpeg/.
+       scripts/download-ffmpeg.ps1 populates that folder. App.xaml.cs sets
+       ffmpeg.RootPath to AppContext.BaseDirectory/lib/ffmpeg at startup.
+       The Condition keeps `dotnet build` green on machines without FFmpeg. -->
+  <PropertyGroup>
+    <FfmpegLibDir>$(MSBuildThisFileDirectory)\..\..\lib\ffmpeg</FfmpegLibDir>
+  </PropertyGroup>
+  <ItemGroup Condition="Exists('$(FfmpegLibDir)')">
+    <None Include="$(FfmpegLibDir)\*.dll" CopyToOutputDirectory="PreserveNewest" Link="lib\ffmpeg\%(Filename)%(Extension)" Visible="false" />
+  </ItemGroup>
+
 </Project>
