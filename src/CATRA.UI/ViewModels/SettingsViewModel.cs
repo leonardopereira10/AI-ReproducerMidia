@@ -81,6 +81,9 @@ public sealed partial class SettingsViewModel : ObservableObject
         _loading = false;
 
         OnPropertyChanged(nameof(SkipIntroDisplay));
+        OnPropertyChanged(nameof(LocalSizeEstimate));
+        OnPropertyChanged(nameof(DlnaSizeEstimate));
+        RefreshUpscaleWarning();
         RefreshUsage();
     }
 
@@ -93,6 +96,21 @@ public sealed partial class SettingsViewModel : ObservableObject
 
     /// <summary>Upscale methods (Fase 2).</summary>
     public IReadOnlyList<string> UpscaleOptions { get; } = new[] { "fsr4", "fsr1" };
+
+    // --- Processamento: validation ranges (ST-22) ---
+    internal const int MinWindowSize = 1;
+    internal const int MaxWindowSize = 20;
+    internal const int MinFps = 24;
+    internal const int MaxFps = 240;
+    internal const int MinWidth = 640;
+    internal const int MaxWidth = 7680;
+    internal const int MinHeight = 360;
+    internal const int MaxHeight = 4320;
+    internal const int MinBitrateKbps = 1000;
+    internal const int MaxBitrateKbps = 200000;
+
+    /// <summary>Reference episode length used for the size estimate (22 min).</summary>
+    internal const double EstimateEpisodeSeconds = 22 * 60;
 
     // ---------------------------------------------------------------------
     // Biblioteca
@@ -167,7 +185,7 @@ public sealed partial class SettingsViewModel : ObservableObject
     private string _statusMessage = string.Empty;
 
     // ---------------------------------------------------------------------
-    // Processamento (Fase 2 — seção visível mas desabilitada)
+    // Processamento (ST-22 — habilitado, persiste e valida em tempo real)
     // ---------------------------------------------------------------------
 
     /// <summary>Sliding-window episode count.</summary>
@@ -213,6 +231,25 @@ public sealed partial class SettingsViewModel : ObservableObject
     /// <summary>DLNA profile encode bitrate (kbps).</summary>
     [ObservableProperty]
     private int _dlnaBitrate = 45000;
+
+    /// <summary>
+    /// Whether FSR 4 is available on this machine (headless default: true;
+    /// injectable/overridable for machines without FSR 4 support).
+    /// </summary>
+    [ObservableProperty]
+    private bool _fsr4Available = true;
+
+    /// <summary>
+    /// Warning shown when FSR 4 is selected but unavailable (empty when OK).
+    /// </summary>
+    [ObservableProperty]
+    private string _upscaleWarning = string.Empty;
+
+    /// <summary>Estimated output size per 22-min episode for the Local profile.</summary>
+    public string LocalSizeEstimate => FormatSizeEstimate(LocalBitrate);
+
+    /// <summary>Estimated output size per 22-min episode for the DLNA profile.</summary>
+    public string DlnaSizeEstimate => FormatSizeEstimate(DlnaBitrate);
 
     // ---------------------------------------------------------------------
     // Commands
@@ -379,52 +416,106 @@ public sealed partial class SettingsViewModel : ObservableObject
         }
     }
 
-    // --- Processamento (Fase 2): persistem, embora a seção fique desabilitada ---
+    // --- Processamento (ST-22): clamp + persistência imediata ---
 
     partial void OnWindowSizeChanged(int value)
-        => SaveIntIfNotLoading(AppSettingsModel.WindowSizeKey, value);
+        => ClampAndSave(ref value, MinWindowSize, MaxWindowSize, v => WindowSize = v,
+            AppSettingsModel.WindowSizeKey);
 
     partial void OnInterpMethodChanged(string value)
         => SaveStringIfNotLoading(AppSettingsModel.InterpMethodKey, value);
 
     partial void OnUpscaleMethodChanged(string value)
-        => SaveStringIfNotLoading(AppSettingsModel.UpscaleMethodKey, value);
+    {
+        RefreshUpscaleWarning();
+        SaveStringIfNotLoading(AppSettingsModel.UpscaleMethodKey, value);
+    }
+
+    partial void OnFsr4AvailableChanged(bool value)
+        => RefreshUpscaleWarning();
 
     partial void OnLocalWidthChanged(int value)
-        => SaveIntIfNotLoading(AppSettingsModel.LocalTargetWidthKey, value);
+        => ClampAndSave(ref value, MinWidth, MaxWidth, v => LocalWidth = v,
+            AppSettingsModel.LocalTargetWidthKey);
 
     partial void OnLocalHeightChanged(int value)
-        => SaveIntIfNotLoading(AppSettingsModel.LocalTargetHeightKey, value);
+        => ClampAndSave(ref value, MinHeight, MaxHeight, v => LocalHeight = v,
+            AppSettingsModel.LocalTargetHeightKey);
 
     partial void OnLocalFpsChanged(int value)
-        => SaveIntIfNotLoading(AppSettingsModel.LocalTargetFpsKey, value);
+        => ClampAndSave(ref value, MinFps, MaxFps, v => LocalFps = v,
+            AppSettingsModel.LocalTargetFpsKey);
 
     partial void OnLocalBitrateChanged(int value)
-        => SaveIntIfNotLoading(AppSettingsModel.LocalEncodeBitrateKey, value);
+    {
+        OnPropertyChanged(nameof(LocalSizeEstimate));
+        ClampAndSave(ref value, MinBitrateKbps, MaxBitrateKbps, v => LocalBitrate = v,
+            AppSettingsModel.LocalEncodeBitrateKey);
+    }
 
     partial void OnDlnaWidthChanged(int value)
-        => SaveIntIfNotLoading(AppSettingsModel.DlnaTargetWidthKey, value);
+        => ClampAndSave(ref value, MinWidth, MaxWidth, v => DlnaWidth = v,
+            AppSettingsModel.DlnaTargetWidthKey);
 
     partial void OnDlnaHeightChanged(int value)
-        => SaveIntIfNotLoading(AppSettingsModel.DlnaTargetHeightKey, value);
+        => ClampAndSave(ref value, MinHeight, MaxHeight, v => DlnaHeight = v,
+            AppSettingsModel.DlnaTargetHeightKey);
 
     partial void OnDlnaFpsChanged(int value)
-        => SaveIntIfNotLoading(AppSettingsModel.DlnaTargetFpsKey, value);
+        => ClampAndSave(ref value, MinFps, MaxFps, v => DlnaFps = v,
+            AppSettingsModel.DlnaTargetFpsKey);
 
     partial void OnDlnaBitrateChanged(int value)
-        => SaveIntIfNotLoading(AppSettingsModel.DlnaEncodeBitrateKey, value);
+    {
+        OnPropertyChanged(nameof(DlnaSizeEstimate));
+        ClampAndSave(ref value, MinBitrateKbps, MaxBitrateKbps, v => DlnaBitrate = v,
+            AppSettingsModel.DlnaEncodeBitrateKey);
+    }
 
     // ---------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------
 
-    private void SaveIntIfNotLoading(string key, int value)
+    /// <summary>
+    /// Clamps <paramref name="value"/> into [min, max]. Out-of-range values are
+    /// written back through <paramref name="setter"/> (which re-enters the
+    /// change handler with the clamped value and persists it); in-range values
+    /// are persisted immediately.
+    /// </summary>
+    private void ClampAndSave(ref int value, int min, int max, Action<int> setter, string key)
     {
-        if (!_loading)
+        if (_loading)
         {
-            _settings.Set(key, value.ToString(CultureInfo.InvariantCulture));
+            return;
         }
+
+        var clamped = Math.Clamp(value, min, max);
+        if (clamped != value)
+        {
+            setter(clamped);
+            return;
+        }
+
+        _settings.Set(key, value.ToString(CultureInfo.InvariantCulture));
     }
+
+    /// <summary>Recomputes <see cref="UpscaleWarning"/> from the current state.</summary>
+    private void RefreshUpscaleWarning()
+    {
+        UpscaleWarning = UpscaleMethod == "fsr4" && !Fsr4Available
+            ? "FSR 4 não está disponível nesta máquina. Sugestão: use FSR 1."
+            : string.Empty;
+    }
+
+    /// <summary>
+    /// Estimated output size in GB for one 22-minute episode at the given
+    /// bitrate: 22min × bitrate / 8 (decimal GB, matches spec examples).
+    /// </summary>
+    internal static double EstimateGbPerEpisode(int bitrateKbps)
+        => bitrateKbps * 1000d / 8d * EstimateEpisodeSeconds / 1e9;
+
+    private static string FormatSizeEstimate(int bitrateKbps)
+        => $"~{EstimateGbPerEpisode(bitrateKbps).ToString("0.#", CultureInfo.InvariantCulture)} GB por episódio (22min)";
 
     private void SaveStringIfNotLoading(string key, string value)
     {

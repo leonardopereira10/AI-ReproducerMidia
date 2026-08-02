@@ -7,6 +7,7 @@
       Title="CATRA — Configurações">
     <Page.Resources>
         <converters:AppThemeToLabelConverter x:Key="AppThemeToLabel" />
+        <converters:ProcessMethodToLabelConverter x:Key="ProcessMethodToLabel" />
 
         <Style x:Key="SectionTitle" TargetType="TextBlock">
             <Setter Property="FontSize" Value="18" />
@@ -150,9 +151,9 @@
                                Text="{Binding UsageText}" />
                 </DockPanel>
 
-                <!-- ============ Processamento (Fase 2 — disabled) ============ -->
-                <StackPanel IsEnabled="False" Opacity="0.6">
-                    <TextBlock Style="{StaticResource SectionTitle}" Text="Processamento (Fase 2)" />
+                <!-- ============ Processamento (ST-22) ============ -->
+                <StackPanel>
+                    <TextBlock Style="{StaticResource SectionTitle}" Text="Processamento" />
                     <DockPanel Style="{StaticResource Row}">
                         <TextBlock Style="{StaticResource FieldLabel}" Text="Janela de episódios:" />
                         <TextBox Width="80"
@@ -163,14 +164,27 @@
                         <TextBlock Style="{StaticResource FieldLabel}" Text="Método interpolação:" />
                         <ComboBox Width="160"
                                   ItemsSource="{Binding InterpOptions}"
-                                  SelectedItem="{Binding InterpMethod}" />
+                                  SelectedItem="{Binding InterpMethod}">
+                            <ComboBox.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding Converter={StaticResource ProcessMethodToLabel}}" />
+                                </DataTemplate>
+                            </ComboBox.ItemTemplate>
+                        </ComboBox>
                     </DockPanel>
                     <DockPanel Style="{StaticResource Row}">
                         <TextBlock Style="{StaticResource FieldLabel}" Text="Método upscale:" />
                         <ComboBox Width="160"
                                   ItemsSource="{Binding UpscaleOptions}"
-                                  SelectedItem="{Binding UpscaleMethod}" />
+                                  SelectedItem="{Binding UpscaleMethod}">
+                            <ComboBox.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding Converter={StaticResource ProcessMethodToLabel}}" />
+                                </DataTemplate>
+                            </ComboBox.ItemTemplate>
+                        </ComboBox>
                     </DockPanel>
+                    <TextBlock Style="{StaticResource ErrorLabel}" Text="{Binding UpscaleWarning}" />
 
                     <TextBlock Margin="0,8,0,4"
                                FontWeight="SemiBold"
@@ -186,6 +200,10 @@
                         <TextBlock Margin="12,0,0,0" Style="{StaticResource FieldLabel}" Text="Bitrate:" />
                         <TextBox Width="90" Padding="6,4" Text="{Binding LocalBitrate, UpdateSourceTrigger=PropertyChanged}" />
                     </DockPanel>
+                    <TextBlock Margin="120,2,0,0"
+                               FontSize="11"
+                               Foreground="{DynamicResource SectionHeaderForegroundBrush}"
+                               Text="{Binding LocalSizeEstimate}" />
 
                     <TextBlock Margin="0,8,0,4"
                                FontWeight="SemiBold"
@@ -201,6 +219,10 @@
                         <TextBlock Margin="12,0,0,0" Style="{StaticResource FieldLabel}" Text="Bitrate:" />
                         <TextBox Width="90" Padding="6,4" Text="{Binding DlnaBitrate, UpdateSourceTrigger=PropertyChanged}" />
                     </DockPanel>
+                    <TextBlock Margin="120,2,0,0"
+                               FontSize="11"
+                               Foreground="{DynamicResource SectionHeaderForegroundBrush}"
+                               Text="{Binding DlnaSizeEstimate}" />
                 </StackPanel>
             </StackPanel>
         </ScrollViewer>
