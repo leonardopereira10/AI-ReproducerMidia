@@ -34,6 +34,14 @@ public partial class App : Application
                 // Domain services
                 services.AddSingleton<ILibraryService, LibraryService>();
 
+                // Library scanning (ST-03): parser, probe, scanner, watcher.
+                // IMediaProbeService is ffprobe-based; the real binary is bundled
+                // later (ST-05, FFmpeg.AutoGen) — until then probing returns null.
+                services.AddSingleton<IFilenameParser, FilenameParser>();
+                services.AddSingleton<IMediaProbeService, FfprobeMediaProbeService>();
+                services.AddSingleton<ILibraryScanner, LibraryScanner>();
+                services.AddSingleton<ILibraryWatcher, LibraryWatcher>();
+
                 // Navigation
                 services.AddSingleton<FrameNavigationService>();
                 services.AddSingleton<INavigationService>(sp => sp.GetRequiredService<FrameNavigationService>());
