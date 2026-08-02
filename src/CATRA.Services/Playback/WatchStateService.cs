@@ -42,12 +42,24 @@ public sealed class WatchStateService : IWatchStateService
 
     private readonly IWatchStateRepository _watchStates;
     private readonly IEpisodeRepository _episodes;
+    private readonly ISlidingWindowService? _slidingWindow;
 
     /// <summary>Creates the service with its dependencies.</summary>
-    public WatchStateService(IWatchStateRepository watchStates, IEpisodeRepository episodes)
+    /// <param name="watchStates">Watch-state repository.</param>
+    /// <param name="episodes">Episode repository.</param>
+    /// <param name="slidingWindow">
+    /// Optional sliding-window service (ST-18). When supplied, every transition to
+    /// watched notifies it (fire-and-forget) so the pre-processing window rotates.
+    /// Optional so the service stays constructible without the processing layer.
+    /// </param>
+    public WatchStateService(
+        IWatchStateRepository watchStates,
+        IEpisodeRepository episodes,
+        ISlidingWindowService? slidingWindow = null)
     {
         _watchStates = watchStates ?? throw new ArgumentNullException(nameof(watchStates));
         _episodes = episodes ?? throw new ArgumentNullException(nameof(episodes));
+        _slidingWindow = slidingWindow;
     }
 
     /// <summary>
@@ -110,6 +122,7 @@ public sealed class WatchStateService : IWatchStateService
         EnsureEpisodeExists(episodeId);
 
         var state = _watchStates.GetByEpisodeId(episodeId);
+        bool becameWatched;
         if (state is null)
         {
             _watchStates.Insert(new WatchState
@@ -118,6 +131,7 @@ public sealed class WatchStateService : IWatchStateService
                 Watched = true,
                 ProgressPct = 100d,
             });
+            becameWatched = true;
         }
         else
         {
@@ -128,6 +142,12 @@ public sealed class WatchStateService : IWatchStateService
             }
 
             _watchStates.Update(state);
+            becameWatched = state.Watched;
+        }
+
+        if (becameWatched)
+        {
+            NotifyEpisodeWatched(episodeId);
         }
 
         return Task.CompletedTask;
@@ -157,6 +177,11 @@ public sealed class WatchStateService : IWatchStateService
             }
 
             _watchStates.Update(state);
+        }
+
+        if (watched)
+        {
+            NotifyEpisodeWatched(episodeId);
         }
 
         return Task.CompletedTask;
@@ -215,6 +240,7 @@ public sealed class WatchStateService : IWatchStateService
     private void Upsert(int episodeId, double positionSec, double progressPct, bool markWatched)
     {
         var state = _watchStates.GetByEpisodeId(episodeId);
+        bool becameWatched = false;
         if (state is null)
         {
             _watchStates.Insert(new WatchState
@@ -224,19 +250,51 @@ public sealed class WatchStateService : IWatchStateService
                 ProgressPct = progressPct,
                 LastPositionSec = positionSec,
             });
+            becameWatched = markWatched;
         }
         else
         {
             state.LastPositionSec = positionSec;
             state.ProgressPct = progressPct;
             // A manual watched mark is never reverted by a later low-progress save.
-            if (markWatched)
+            if (markWatched && !state.Watched)
             {
                 state.Watched = true;
+                becameWatched = true;
             }
 
             _watchStates.Update(state);
         }
+
+        if (becameWatched)
+        {
+            NotifyEpisodeWatched(episodeId);
+        }
+    }
+
+    /// <summary>
+    /// ST-18 hook: notifies the sliding window that an episode was watched so the
+    /// pre-processing window rotates. Fire-and-forget with full error isolation — a
+    /// rotation failure must never break playback progress persistence.
+    /// </summary>
+    private void NotifyEpisodeWatched(int episodeId)
+    {
+        if (_slidingWindow is null)
+        {
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _slidingWindow.OnEpisodeWatchedAsync(episodeId).ConfigureAwait(false);
+            }
+            catch
+            {
+                // Swallow: rotation is best-effort and must not surface into playback.
+            }
+        });
     }
 
     private void EnsureEpisodeExists(int episodeId)

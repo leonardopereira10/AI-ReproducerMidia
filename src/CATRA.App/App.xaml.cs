@@ -101,6 +101,16 @@ public partial class App : Application
                     () => sp.GetRequiredService<IFrameDecoder>(),
                     sp.GetRequiredService<IAudioMuxer>()));
 
+                // Pre-processing queue + sliding window (ST-18, RF-03, RN-10): a
+                // dedicated background worker drains a thread-safe channel of jobs
+                // through the pipeline; the sliding window keeps the next window_size
+                // unwatched episodes queued and rotates as episodes are watched.
+                // ProcessedFileUsage is the conservative "in use" probe (RF-04: never
+                // delete a file being played/streamed).
+                services.AddSingleton<IProcessedFileUsage, ProcessedFileUsage>();
+                services.AddSingleton<IProcessingQueueService, ProcessingQueueService>();
+                services.AddSingleton<ISlidingWindowService, SlidingWindowService>();
+
                 // Thumbnails / covers (ST-09, RF-08, RN-05): ffmpeg CLI frame
                 // grabber behind an injectable extractor + caching service. The
                 // binary is not bundled yet, so extraction degrades to the UI
@@ -143,6 +153,10 @@ public partial class App : Application
         // Create/migrate the SQLite schema and seed default settings.
         _host.Services.GetRequiredService<DatabaseInitializer>().Initialize();
 
+        // Start the pre-processing queue worker (ST-18): runs crash recovery
+        // (processing → failed) then the background processing loop.
+        await _host.Services.GetRequiredService<IProcessingQueueService>().StartAsync();
+
         // Start the embedded DLNA media server (ST-08): Kestrel on an ephemeral
         // LAN port, ready before the first cast. The firewall rule attempt is
         // best-effort (needs elevation; logs the manual instruction otherwise).
@@ -164,6 +178,13 @@ public partial class App : Application
     {
         if (_host is not null)
         {
+            // Stop the pre-processing queue worker before tearing down the host (ST-18).
+            var queue = _host.Services.GetService<IProcessingQueueService>();
+            if (queue is not null)
+            {
+                await queue.StopAsync();
+            }
+
             // Stop the DLNA media server before tearing down the host (ST-08).
             var mediaServer = _host.Services.GetService<IMediaHttpServer>();
             if (mediaServer is not null)
