@@ -1,0 +1,122 @@
+<Page x:Class="CATRA.UI.Views.HomeView"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      xmlns:controls="clr-namespace:CATRA.UI.Controls"
+      xmlns:converters="clr-namespace:CATRA.UI.Converters"
+      Background="{DynamicResource WindowBackgroundBrush}"
+      KeepAlive="True"
+      Title="CATRA — Biblioteca">
+    <Page.Resources>
+        <converters:BoolToVisibilityConverter x:Key="BoolToVisibility" />
+    </Page.Resources>
+
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <!-- Header: title + search + refresh + settings -->
+        <DockPanel Grid.Row="0">
+            <TextBlock DockPanel.Dock="Left"
+                       FontSize="24"
+                       FontWeight="Bold"
+                       Foreground="{DynamicResource WindowForegroundBrush}"
+                       Text="CATRA" />
+            <StackPanel HorizontalAlignment="Right"
+                        DockPanel.Dock="Right"
+                        Orientation="Horizontal">
+                <TextBox Width="200"
+                         Padding="6,4"
+                         VerticalContentAlignment="Center"
+                         Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}" />
+                <Button Margin="8,0,0,0"
+                        Command="{Binding RefreshLibraryCommand}"
+                        Content="🔄 Atualizar"
+                        Style="{StaticResource AccentButtonStyle}" />
+                <Button Margin="8,0,0,0"
+                        Command="{Binding OpenSettingsCommand}"
+                        Content="⚙️"
+                        Style="{StaticResource BaseButtonStyle}" />
+            </StackPanel>
+        </DockPanel>
+
+        <!-- Category tabs ("Todos" first) -->
+        <ListBox Grid.Row="1"
+                 Margin="0,12,0,0"
+                 Background="Transparent"
+                 BorderThickness="0"
+                 Foreground="{DynamicResource WindowForegroundBrush}"
+                 ItemsSource="{Binding Categories}"
+                 ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                 ScrollViewer.VerticalScrollBarVisibility="Disabled"
+                 SelectedItem="{Binding SelectedCategory}">
+            <ListBox.ItemsPanel>
+                <ItemsPanelTemplate>
+                    <StackPanel Orientation="Horizontal" />
+                </ItemsPanelTemplate>
+            </ListBox.ItemsPanel>
+            <ListBox.ItemTemplate>
+                <DataTemplate>
+                    <TextBlock Margin="2,0,14,0" FontSize="14">
+                        <Run FontWeight="SemiBold" Text="{Binding Name, Mode=OneWay}" />
+                        <Run Foreground="{DynamicResource SectionHeaderForegroundBrush}"
+                             Text="{Binding Count, Mode=OneWay, StringFormat=({0})}" />
+                    </TextBlock>
+                </DataTemplate>
+            </ListBox.ItemTemplate>
+        </ListBox>
+
+        <!-- Media card grid -->
+        <ScrollViewer Grid.Row="2"
+                      Margin="0,12,0,0"
+                      HorizontalScrollBarVisibility="Disabled"
+                      VerticalScrollBarVisibility="Auto">
+            <Grid>
+                <ItemsControl ItemsSource="{Binding MediaItems}">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <WrapPanel Orientation="Horizontal" />
+                        </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <controls:MediaCardControl
+                                Command="{Binding DataContext.OpenMediaCommand,
+                                                  RelativeSource={RelativeSource AncestorType=ItemsControl}}" />
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+
+                <!-- Empty state -->
+                <StackPanel HorizontalAlignment="Center"
+                            VerticalAlignment="Center"
+                            Visibility="{Binding HasMediaItems, Converter={StaticResource BoolToVisibility}, ConverterParameter=Invert}">
+                    <TextBlock HorizontalAlignment="Center"
+                               FontSize="16"
+                               Foreground="{DynamicResource SectionHeaderForegroundBrush}"
+                               Text="Nenhuma mídia encontrada." />
+                    <TextBlock Margin="0,6,0,0"
+                               HorizontalAlignment="Center"
+                               Foreground="{DynamicResource SectionHeaderForegroundBrush}"
+                               Text="Configure a pasta raiz em Configurações e clique em 🔄 Atualizar." />
+                </StackPanel>
+            </Grid>
+        </ScrollViewer>
+
+        <!-- Status bar -->
+        <DockPanel Grid.Row="3" Margin="0,8,0,0">
+            <ProgressBar Width="120"
+                         Height="14"
+                         DockPanel.Dock="Right"
+                         IsIndeterminate="True"
+                         Visibility="{Binding IsRefreshing, Converter={StaticResource BoolToVisibility}}" />
+            <TextBlock VerticalAlignment="Center"
+                       Foreground="{DynamicResource SectionHeaderForegroundBrush}"
+                       Text="{Binding StatusMessage}"
+                       TextTrimming="CharacterEllipsis" />
+        </DockPanel>
+    </Grid>
+</Page>

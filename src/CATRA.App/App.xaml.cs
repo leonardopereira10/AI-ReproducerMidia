@@ -8,6 +8,8 @@ using CATRA.Data.Repositories;
 using CATRA.Services;
 using CATRA.Services.Library;
 using CATRA.UI.Navigation;
+using CATRA.UI.Services;
+using CATRA.UI.ViewModels;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 
@@ -53,6 +55,12 @@ public partial class App : Application
                 // Navigation
                 services.AddSingleton<FrameNavigationService>();
                 services.AddSingleton<INavigationService>(sp => sp.GetRequiredService<FrameNavigationService>());
+                services.AddSingleton<IAppNavigator, AppNavigator>();
+
+                // UI services + view models (ST-04: Home / Detail screens)
+                services.AddSingleton<IDialogService, DialogService>();
+                services.AddTransient<HomeViewModel>();
+                services.AddTransient<MediaDetailViewModel>();
 
                 // Theme
                 services.AddSingleton<ISystemThemeDetector, SystemThemeDetector>();

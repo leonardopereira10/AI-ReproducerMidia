@@ -13,8 +13,8 @@ public class ServicesSkeletonTests
     [Fact]
     public void LibraryService_ShouldImplementILibraryService()
     {
-        var service = new LibraryService();
-
-        service.Should().BeAssignableTo<ILibraryService>();
+        // Full behavior is covered by LibraryServiceTests; the facade now
+        // requires repository/scanner dependencies, so assert the contract.
+        typeof(LibraryService).Should().Implement<ILibraryService>();
     }
 }

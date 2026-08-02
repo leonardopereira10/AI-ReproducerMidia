@@ -7,7 +7,11 @@ public interface INavigationService
 {
     bool CanGoBack { get; }
 
-    void Navigate(Type pageType);
+    /// <summary>
+    /// Navigates to a page, optionally passing a parameter that is delivered to
+    /// pages implementing <see cref="INavigationAware"/>.
+    /// </summary>
+    void Navigate(Type pageType, object? parameter = null);
 
     void GoBack();
 }

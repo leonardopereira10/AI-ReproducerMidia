@@ -1,0 +1,161 @@
+<Page x:Class="CATRA.UI.Views.MediaDetailView"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      xmlns:controls="clr-namespace:CATRA.UI.Controls"
+      xmlns:converters="clr-namespace:CATRA.UI.Converters"
+      Background="{DynamicResource WindowBackgroundBrush}"
+      KeepAlive="True"
+      Title="CATRA — Detalhe">
+    <Page.Resources>
+        <converters:BoolToVisibilityConverter x:Key="BoolToVisibility" />
+
+        <!-- Shared episode grid template (unwatched/watched sections) -->
+        <DataTemplate x:Key="EpisodeGridTemplate">
+            <controls:EpisodeCardControl
+                DetailsCommand="{Binding DataContext.ShowDetailsCommand,
+                                         RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                PlayCommand="{Binding DataContext.PlayEpisodeCommand,
+                                      RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                RenameCommand="{Binding DataContext.RenameEpisodeCommand,
+                                        RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                SetCoverCommand="{Binding DataContext.SetCoverCommand,
+                                          RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                ToggleWatchedCommand="{Binding DataContext.ToggleWatchedCommand,
+                                               RelativeSource={RelativeSource AncestorType=ItemsControl}}" />
+        </DataTemplate>
+
+        <ItemsPanelTemplate x:Key="EpisodePanelTemplate">
+            <WrapPanel Orientation="Horizontal" />
+        </ItemsPanelTemplate>
+    </Page.Resources>
+
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!-- Header: back + title -->
+        <StackPanel Grid.Row="0" Orientation="Horizontal">
+            <Button VerticalAlignment="Center"
+                    Command="{Binding GoBackCommand}"
+                    Content="← Voltar"
+                    Style="{StaticResource BaseButtonStyle}" />
+            <TextBlock Margin="16,0,0,0"
+                       VerticalAlignment="Center"
+                       FontSize="22"
+                       FontWeight="Bold"
+                       Foreground="{DynamicResource WindowForegroundBrush}"
+                       Text="{Binding Title}"
+                       TextTrimming="CharacterEllipsis" />
+        </StackPanel>
+
+        <ScrollViewer Grid.Row="1"
+                      Margin="0,12,0,0"
+                      HorizontalScrollBarVisibility="Disabled"
+                      VerticalScrollBarVisibility="Auto">
+            <StackPanel>
+                <!-- Cover + metadata -->
+                <Border Style="{StaticResource CardStyle}">
+                    <DockPanel>
+                        <!-- Cover placeholder (real covers/thumbnails: ST-08/ST-09) -->
+                        <Border Width="120"
+                                Height="168"
+                                Margin="0,0,16,0"
+                                Background="{DynamicResource SeekBarBackgroundBrush}"
+                                CornerRadius="6"
+                                DockPanel.Dock="Left">
+                            <TextBlock HorizontalAlignment="Center"
+                                       VerticalAlignment="Center"
+                                       FontSize="32"
+                                       Foreground="{DynamicResource SectionHeaderForegroundBrush}"
+                                       Text="🖼" />
+                        </Border>
+
+                        <StackPanel VerticalAlignment="Center">
+                            <TextBlock Foreground="{DynamicResource WindowForegroundBrush}"
+                                       Text="{Binding InfoLine}" />
+                            <TextBlock Margin="0,6,0,0"
+                                       Foreground="{DynamicResource SectionHeaderForegroundBrush}"
+                                       Text="{Binding ProgressLine}" />
+                            <TextBlock Margin="0,6,0,0"
+                                       Foreground="{DynamicResource SectionHeaderForegroundBrush}">
+                                <Run Text="Skip Intro:" />
+                                <Run FontWeight="SemiBold" Text="{Binding SkipIntroDisplay, Mode=OneWay}" />
+                            </TextBlock>
+                        </StackPanel>
+                    </DockPanel>
+                </Border>
+
+                <!-- Pre-process placeholder (real pipeline: ST-19) -->
+                <Border Margin="0,12,0,0"
+                        IsEnabled="False"
+                        Opacity="0.6"
+                        Style="{StaticResource CardStyle}">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource SectionHeaderStyle}" Text="Pre-Processar" />
+                        <DockPanel>
+                            <StackPanel Orientation="Horizontal">
+                                <RadioButton Content="Local"
+                                             Foreground="{DynamicResource WindowForegroundBrush}"
+                                             IsChecked="{Binding IsLocalProfile}" />
+                                <RadioButton Margin="16,0,0,0"
+                                             Content="DLNA"
+                                             Foreground="{DynamicResource WindowForegroundBrush}" />
+                            </StackPanel>
+                            <Button HorizontalAlignment="Right"
+                                    Content="📥 Iniciar"
+                                    DockPanel.Dock="Right"
+                                    IsEnabled="False"
+                                    Style="{StaticResource AccentButtonStyle}" />
+                        </DockPanel>
+                        <TextBlock Margin="0,6,0,0"
+                                   FontSize="12"
+                                   Foreground="{DynamicResource SectionHeaderForegroundBrush}"
+                                   Text="Janela: 5 episódios não-assistidos (disponível em ST-19)" />
+                    </StackPanel>
+                </Border>
+
+                <!-- Unwatched episodes -->
+                <StackPanel Margin="0,20,0,0"
+                            Visibility="{Binding HasUnwatched, Converter={StaticResource BoolToVisibility}}">
+                    <TextBlock Style="{StaticResource SectionHeaderStyle}" Text="Não Assistidos" />
+                    <ItemsControl ItemTemplate="{StaticResource EpisodeGridTemplate}"
+                                  ItemsPanel="{StaticResource EpisodePanelTemplate}"
+                                  ItemsSource="{Binding UnwatchedEpisodes}" />
+                </StackPanel>
+
+                <!-- Watched episodes (reduced opacity) -->
+                <StackPanel Margin="0,20,0,0"
+                            Opacity="0.65"
+                            Visibility="{Binding HasWatched, Converter={StaticResource BoolToVisibility}}">
+                    <TextBlock Style="{StaticResource SectionHeaderStyle}" Text="Assistidos" />
+                    <ItemsControl ItemTemplate="{StaticResource EpisodeGridTemplate}"
+                                  ItemsPanel="{StaticResource EpisodePanelTemplate}"
+                                  ItemsSource="{Binding WatchedEpisodes}" />
+                </StackPanel>
+
+                <!-- No episodes at all -->
+                <TextBlock Margin="0,24,0,0"
+                           HorizontalAlignment="Center"
+                           Foreground="{DynamicResource SectionHeaderForegroundBrush}"
+                           Text="Nenhum episódio catalogado. Clique em 🔄 Atualizar na Home.">
+                    <TextBlock.Style>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="Visibility" Value="Collapsed" />
+                            <Style.Triggers>
+                                <MultiDataTrigger>
+                                    <MultiDataTrigger.Conditions>
+                                        <Condition Binding="{Binding HasUnwatched}" Value="False" />
+                                        <Condition Binding="{Binding HasWatched}" Value="False" />
+                                    </MultiDataTrigger.Conditions>
+                                    <Setter Property="Visibility" Value="Visible" />
+                                </MultiDataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </TextBlock.Style>
+                </TextBlock>
+            </StackPanel>
+        </ScrollViewer>
+    </Grid>
+</Page>

@@ -20,7 +20,7 @@ public partial class MainWindow : Window
     {
         var navigation = App.Services.GetRequiredService<FrameNavigationService>();
         navigation.Attach(ContentFrame);
-        navigation.Navigate(typeof(HomeDummyPage));
+        navigation.Navigate(typeof(HomeView));
     }
 
     private void MinimizeButton_Click(object sender, RoutedEventArgs e)
