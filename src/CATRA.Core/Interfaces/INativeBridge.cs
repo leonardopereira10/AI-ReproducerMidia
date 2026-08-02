@@ -48,9 +48,18 @@ public interface INativeBridge : IDisposable
     /// <summary>Active interpolation method: 0 = none, 1 = RIFE, 2 = FSR 3 FG. Returns 0 when unavailable.</summary>
     int GetInterpMethod();
 
-    // --- Frame interpolation (stubs until ST-13) ---------------------------
+    // --- Frame interpolation (RIFE v4, ST-13) ------------------------------
 
-    /// <summary>Creates an interpolation job; returns an opaque context handle.</summary>
+    /// <summary>
+    /// Creates an interpolation job; returns an opaque context handle.
+    /// </summary>
+    /// <remarks>
+    /// The intermediate-frame count is computed natively as
+    /// <c>ceil(targetFps / srcFps) - 1</c> (e.g. 24→135 → 5, 24→55 → 2).
+    /// Per RN-07, when <paramref name="srcFps"/> &gt;= <paramref name="targetFps"/>
+    /// the native context is a passthrough and
+    /// <see cref="ProcessInterpolation"/> yields zero frames.
+    /// </remarks>
     IntPtr CreateInterpolation(int srcWidth, int srcHeight, double srcFps, double targetFps, int method);
 
     /// <summary>
@@ -58,6 +67,11 @@ public interface INativeBridge : IDisposable
     /// number of generated frames and writes the native frame array pointer to
     /// <paramref name="framesBuffer"/>.
     /// </summary>
+    /// <remarks>
+    /// The returned buffer is a native array of texture pointers owned by the
+    /// caller (release each texture and free the array). Returns <c>0</c> for a
+    /// passthrough context (RN-07: source FPS already meets the target).
+    /// </remarks>
     int ProcessInterpolation(IntPtr context, IntPtr frameA, IntPtr frameB, out IntPtr framesBuffer);
 
     /// <summary>Destroys an interpolation job. No-op when unavailable.</summary>

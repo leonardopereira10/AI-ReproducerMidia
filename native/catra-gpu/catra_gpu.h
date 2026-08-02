@@ -16,9 +16,16 @@
 //   * The log callback is invoked on whatever thread produced the message;
 //     the callee must be thread-safe and must not call back into the bridge.
 //
-// STATUS (ST-12): skeleton only. Lifecycle (init/shutdown) and capability
-// queries are wired; interp / upscale / encode return CATRA_ERR_NOT_IMPL.
-// Real FSR 4 / RIFE / AMF backends land in ST-13..ST-16.
+// STATUS (ST-13): lifecycle (init/shutdown), capability queries and frame
+// interpolation are implemented. The RIFE backend is live when the bridge is
+// built with ONNX Runtime (CATRA_HAS_ONNXRUNTIME; DirectML EP when USE_DML is
+// detected, CPU fallback otherwise); without it, interp reports unavailable
+// and returns CATRA_ERR_NOT_IMPL. Upscale (FSR 4/1, ST-14) and encode
+// (AMF H.265, ST-16) remain CATRA_ERR_NOT_IMPL stubs.
+//
+// EXCEPTION SAFETY: every fallible entry point is guarded at the C ABI
+// boundary; no C++ exception escapes this DLL. Stray exceptions (e.g.
+// std::bad_alloc) surface as CATRA_ERR_UNKNOWN.
 
 #ifndef CATRA_GPU_H
 #define CATRA_GPU_H
@@ -48,6 +55,7 @@
 #define CATRA_ERR_INVALID_ARG -3  // null / out-of-range argument
 #define CATRA_ERR_DEVICE     -4   // D3D device / resource failure
 #define CATRA_ERR_CONTEXT    -5   // unknown or stale context handle
+#define CATRA_ERR_UNKNOWN    -6   // unhandled C++ exception at the C ABI boundary
 
 // ---------------------------------------------------------------------------
 // Capability enumerations (returned by the query functions)
@@ -88,20 +96,22 @@ CATRA_API int  catra_init(void* d3d11_device);
 // Tears down the bridge and releases every owned resource. Idempotent.
 CATRA_API void catra_shutdown(void);
 
-// Current upscale mode (CATRA_UPSCALE_*). Skeleton: CATRA_UPSCALE_OFF (0).
+// Current upscale mode (CATRA_UPSCALE_*). Stub (ST-14): CATRA_UPSCALE_OFF (0).
 CATRA_API int  catra_get_upscale_mode(void);
 
-// Non-zero if FSR 4 is usable on the active adapter. Skeleton: 0.
+// Non-zero if FSR 4 is usable on the active adapter. Stub (ST-14): 0.
 CATRA_API int  catra_is_fsr4_available(void);
 
-// Active interpolation method (CATRA_INTERP_*). Skeleton: CATRA_ERR_NOT_IMPL.
+// Active interpolation method (CATRA_INTERP_*). Returns CATRA_INTERP_RIFE
+// when the bridge was compiled with ONNX Runtime, CATRA_INTERP_NONE otherwise
+// (no ONNX Runtime, or source fps already meets the target at create time).
 CATRA_API int  catra_get_interp_method(void);
 
 // Installs (or clears, with NULL) the log sink. Safe to call before init.
 CATRA_API void catra_set_log_callback(catra_log_callback cb);
 
 // ===========================================================================
-// Frame interpolation (RIFE / FSR 3 FG) — stubs
+// Frame interpolation — RIFE v4 backend (ST-13); FSR 3 FG is a later ST
 // ===========================================================================
 
 // Creates an interpolation job. On success writes a handle to *out_ctx.

@@ -13,6 +13,9 @@
 # Output:
 #   native/catra-gpu/build/...                      (build tree)
 #   native/catra-gpu/install/runtimes/win-x64/native/catra-gpu.dll
+#       (+ onnxruntime.dll / DirectML.dll when the ONNX Runtime package is
+#        resolved, deployed by the CMake install step)
+#   lib/rife/rife_v4.onnx                            (downloaded on demand)
 # The CATRA.App.csproj copies that installed DLL into the app output when it
 # exists, so `dotnet build` picks it up automatically afterwards.
 
@@ -21,7 +24,13 @@ param(
     [ValidateSet('Debug', 'Release')]
     [string]$Configuration = 'Release',
 
-    [string]$VcpkgRoot = $env:VCPKG_ROOT
+    [string]$VcpkgRoot = $env:VCPKG_ROOT,
+
+    # RIFE v4 arbitrary-timestep ONNX model. Override to point at a specific
+    # Practical-RIFE export. NOT downloaded when the file already exists.
+    [string]$RifeModelUrl = 'https://github.com/hzwer/Practical-RIFE/releases/latest/download/rife-v4.onnx',
+
+    [switch]$SkipModelDownload
 )
 
 $ErrorActionPreference = 'Stop'
@@ -34,6 +43,40 @@ $installDir = Join-Path $nativeDir 'install'
 function Fail([string]$message) {
     Write-Error "build-native: $message"
     exit 1
+}
+
+# --- RIFE model (ST-13) -----------------------------------------------------
+# The RIFE v4 ONNX model is a large binary (~10-20MB) and is NEVER committed
+# (lib/rife/ is gitignored). This restores it on demand so the native bridge
+# can load it at runtime. A failed download is a WARNING, not a fatal error:
+# the DLL still builds; only live inference needs the file.
+#
+# Model sources (pick an arbitrary-timestep RIFE v4 export):
+#   * https://github.com/hzwer/Practical-RIFE            (reference impl)
+#   * community ONNX exports of Practical-RIFE / rife-ncnn-vulkan
+# Override with -RifeModelUrl or $env:CATRA_RIFE_MODEL_URL.
+function Ensure-RifeModel {
+    if ($SkipModelDownload) {
+        Write-Host "build-native: skipping RIFE model download (-SkipModelDownload)."
+        return
+    }
+    $modelDir  = Join-Path $repoRoot 'lib/rife'
+    $modelPath = Join-Path $modelDir 'rife_v4.onnx'
+    if (Test-Path $modelPath) {
+        Write-Host "build-native: RIFE model present -> $modelPath"
+        return
+    }
+    $url = $env:CATRA_RIFE_MODEL_URL
+    if ([string]::IsNullOrWhiteSpace($url)) { $url = $RifeModelUrl }
+    Write-Host "build-native: downloading RIFE model from $url ..."
+    try {
+        New-Item -ItemType Directory -Force -Path $modelDir | Out-Null
+        Invoke-WebRequest -Uri $url -OutFile $modelPath -UseBasicParsing
+        Write-Host "build-native: RIFE model saved -> $modelPath"
+    }
+    catch {
+        Write-Warning "build-native: RIFE model download failed ($($_.Exception.Message)). The DLL still builds; place rife_v4.onnx in lib/rife/ manually or set CATRA_RIFE_MODEL_PATH."
+    }
 }
 
 # --- Locate vcpkg -----------------------------------------------------------
@@ -59,9 +102,13 @@ Write-Host "build-native: repo root   = $repoRoot"
 Write-Host "build-native: vcpkg root  = $VcpkgRoot"
 Write-Host "build-native: config      = $Configuration"
 
+# Restore the RIFE ONNX model before building so a fresh clone is runtime-ready.
+Ensure-RifeModel
+
 # --- Install dependencies (manifest mode) -----------------------------------
 # vcpkg.json lives next to CMakeLists.txt; running `vcpkg install` there
-# restores directx-headers + dxguid into native/catra-gpu/vcpkg_installed.
+# restores directx-headers + dxguid + onnxruntime-gpu (RIFE/DirectML) into
+# native/catra-gpu/vcpkg_installed.
 Write-Host "build-native: restoring vcpkg dependencies (x64-windows)..."
 Push-Location $nativeDir
 try {

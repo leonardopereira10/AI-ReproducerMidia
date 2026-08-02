@@ -44,6 +44,16 @@ internal sealed class FakeNativeLibrary : INativeLibrary
     public int InitCallCount { get; private set; }
     public IntPtr LastInitDevice { get; private set; }
     public int ShutdownCallCount { get; private set; }
+    public int InterpCreateCallCount { get; private set; }
+    public int LastInterpCreateSrcWidth { get; private set; }
+    public int LastInterpCreateSrcHeight { get; private set; }
+    public double LastInterpCreateSrcFps { get; private set; }
+    public double LastInterpCreateTargetFps { get; private set; }
+    public int LastInterpCreateMethod { get; private set; }
+    public int InterpProcessCallCount { get; private set; }
+    public int LastInterpProcessContext { get; private set; }
+    public IntPtr LastInterpProcessFrameA { get; private set; }
+    public IntPtr LastInterpProcessFrameB { get; private set; }
     public int InterpDestroyCallCount { get; private set; }
     public int LastInterpDestroyContext { get; private set; }
     public int UpscaleDestroyCallCount { get; private set; }
@@ -74,12 +84,22 @@ internal sealed class FakeNativeLibrary : INativeLibrary
 
     public int InterpCreate(int srcWidth, int srcHeight, double srcFps, double targetFps, int method, out int context)
     {
+        InterpCreateCallCount++;
+        LastInterpCreateSrcWidth = srcWidth;
+        LastInterpCreateSrcHeight = srcHeight;
+        LastInterpCreateSrcFps = srcFps;
+        LastInterpCreateTargetFps = targetFps;
+        LastInterpCreateMethod = method;
         context = InterpCreateContext;
         return InterpCreateResult;
     }
 
     public int InterpProcess(int context, IntPtr frameA, IntPtr frameB, out IntPtr framesBuffer, out int frameCount)
     {
+        InterpProcessCallCount++;
+        LastInterpProcessContext = context;
+        LastInterpProcessFrameA = frameA;
+        LastInterpProcessFrameB = frameB;
         framesBuffer = InterpProcessFrames;
         frameCount = InterpProcessCount;
         return InterpProcessResult;
@@ -461,6 +481,104 @@ public class NativeBridgeTests
     public void NativeBridgeException_DefaultErrorCode_IsZero()
     {
         new NativeBridgeException("missing").ErrorCode.Should().Be(0);
+    }
+}
+
+/// <summary>
+/// ST-13 interpolation coverage for <see cref="NativeBridge"/>: argument
+/// forwarding to the native ABI, native error-code mapping, the RN-07
+/// passthrough (source FPS >= target FPS yields zero frames) and disposal
+/// guard rails. All driven through <see cref="FakeNativeLibrary"/> — no DLL.
+/// </summary>
+public class NativeBridgeInterpTests
+{
+    [Fact]
+    public void CreateInterpolation_ForwardsAllArgumentsToNative()
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = true, InterpCreateResult = 0, InterpCreateContext = 7 };
+        var bridge = new NativeBridge(lib);
+
+        IntPtr handle = bridge.CreateInterpolation(1920, 1080, 24.0, 135.0, 1);
+
+        handle.Should().Be((IntPtr)7);
+        lib.InterpCreateCallCount.Should().Be(1);
+        lib.LastInterpCreateSrcWidth.Should().Be(1920);
+        lib.LastInterpCreateSrcHeight.Should().Be(1080);
+        lib.LastInterpCreateSrcFps.Should().Be(24.0);
+        lib.LastInterpCreateTargetFps.Should().Be(135.0);
+        lib.LastInterpCreateMethod.Should().Be(1);
+    }
+
+    [Fact]
+    public void ProcessInterpolation_ForwardsContextAndFramePointers()
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = true, InterpProcessResult = 0, InterpProcessCount = 5 };
+        var bridge = new NativeBridge(lib);
+        var frameA = new IntPtr(0xA1);
+        var frameB = new IntPtr(0xB2);
+
+        int count = bridge.ProcessInterpolation(new IntPtr(7), frameA, frameB, out _);
+
+        count.Should().Be(5);
+        lib.InterpProcessCallCount.Should().Be(1);
+        lib.LastInterpProcessContext.Should().Be(7);
+        lib.LastInterpProcessFrameA.Should().Be(frameA);
+        lib.LastInterpProcessFrameB.Should().Be(frameB);
+    }
+
+    [Theory]
+    [InlineData(-3)]
+    [InlineData(-4)]
+    [InlineData(-5)]
+    public void ProcessInterpolation_NativeError_ThrowsWithCode(int code)
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = true, InterpProcessResult = code };
+        var bridge = new NativeBridge(lib);
+
+        var act = () => bridge.ProcessInterpolation(new IntPtr(1), new IntPtr(2), new IntPtr(3), out _);
+
+        act.Should().Throw<NativeBridgeException>().Which.ErrorCode.Should().Be(code);
+    }
+
+    [Fact]
+    public void ProcessInterpolation_Rn07Passthrough_ReturnsZeroFrames()
+    {
+        // Source FPS >= target FPS: the native context emits no intermediate
+        // frames (count 0) and the wrapper surfaces that as a clean zero.
+        var lib = new FakeNativeLibrary
+        {
+            IsAvailable = true,
+            InterpProcessResult = 0,
+            InterpProcessCount = 0,
+            InterpProcessFrames = IntPtr.Zero,
+        };
+        var bridge = new NativeBridge(lib);
+
+        int count = bridge.ProcessInterpolation(new IntPtr(1), new IntPtr(2), new IntPtr(3), out IntPtr buffer);
+
+        count.Should().Be(0);
+        buffer.Should().Be(IntPtr.Zero);
+    }
+
+    [Fact]
+    public void Unavailable_ProcessInterpolation_ThrowsNativeBridgeException()
+    {
+        var bridge = new NativeBridge(new FakeNativeLibrary { IsAvailable = false });
+
+        var act = () => bridge.ProcessInterpolation(new IntPtr(1), new IntPtr(2), new IntPtr(3), out _);
+
+        act.Should().Throw<NativeBridgeException>().WithMessage("*not available*");
+    }
+
+    [Fact]
+    public void AfterDispose_CreateInterpolation_ThrowsObjectDisposed()
+    {
+        var bridge = new NativeBridge(new FakeNativeLibrary { IsAvailable = true });
+        bridge.Dispose();
+
+        var act = () => bridge.CreateInterpolation(1920, 1080, 24, 135, 1);
+
+        act.Should().Throw<ObjectDisposedException>();
     }
 }
 

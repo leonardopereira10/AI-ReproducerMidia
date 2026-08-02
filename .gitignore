@@ -64,3 +64,9 @@ Desktop.ini
 # ---- FFmpeg shared binaries (ST-05) ----
 # Downloaded on demand by scripts/download-ffmpeg.ps1; never committed.
 lib/ffmpeg/
+
+# ---- RIFE model + ONNX Runtime binaries (ST-13) ----
+# Large binaries downloaded on demand by scripts/build-native.ps1; never committed.
+lib/rife/
+lib/onnxruntime/
+*.onnx
