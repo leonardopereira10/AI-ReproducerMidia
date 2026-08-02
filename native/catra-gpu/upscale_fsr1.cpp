@@ -3,10 +3,13 @@
 // See upscale_fsr1.h for the design overview. The EASU compute shader is
 // embedded as HLSL below and compiled to DXBC at runtime (D3DCompile), so the
 // backend is fully self-contained: no FidelityFX SDK, no dxc, no on-disk shader
-// blob. The DX12 dispatch path depends on the D3D11<->DX12 interop (ST-15);
-// until that lands, catra::CreateD3D12Device / catra::ShareTexture are stubs
-// returning E_NOTIMPL and this backend reports CATRA_ERR_NOT_IMPL at runtime
-// while remaining complete and correct by inspection.
+// blob. The DX12 dispatch path rides on the D3D11<->DX12 interop (ST-15, now
+// implemented in d3d_interop.cpp): catra::CreateD3D12Device returns the shared
+// bridge device and catra::ShareTexture hands back a D3D12 resource backed by
+// the pooled GPU-GPU copy (or a zero-copy NT share). Because that resource is
+// co-owned with the interop pool, Process brackets its dispatch with the
+// consumer half of the keyed-mutex ping-pong (see d3d_interop.h) so the read
+// never races the pool's next copy on real hardware.
 //
 // ROOT-CAUSE / DESIGN NOTES
 //   * EASU is a single fixed spatial algorithm — FSR 1 has no quality presets.
@@ -52,7 +55,7 @@ namespace {
 using Microsoft::WRL::ComPtr;
 
 // Maps an HRESULT to a CATRA_ERR_* code. E_NOTIMPL is surfaced distinctly so
-// the caller can tell "ST-15 interop not wired yet" from a genuine device fault.
+// the caller can tell a genuine "not implemented" from a device fault.
 int HrToCatra(HRESULT hr)
 {
     if (SUCCEEDED(hr))
@@ -69,6 +72,34 @@ int HrToCatra(HRESULT hr)
     }
     return CATRA_ERR_DEVICE;
 }
+
+// RAII guard for the CONSUMER half of the keyed-mutex ping-pong (ST-15). The
+// shared input resource is co-owned with the interop pool, whose producer does
+// Acquire(k)->copy->Release(k) with k alternating 0/1 (g_frameKey). The
+// consumer must Acquire(k) before reading and Release(k) after, on EVERY exit
+// path, or a stuck key deadlocks the producer two frames later. This guard
+// releases (and advances the consumer key) in its destructor; it is a no-op
+// when the resource carried no keyed mutex (mutex == null / not held), which is
+// the case for textures we own outright.
+struct KeyedMutexGuard
+{
+    IDXGIKeyedMutex* mutex = nullptr;
+    uint64_t key = 0;
+    uint64_t* nextKey = nullptr; // consumer key state advanced on release
+    bool held = false;
+
+    ~KeyedMutexGuard()
+    {
+        if (held && mutex != nullptr)
+        {
+            interop_release(mutex, key);
+            if (nextKey != nullptr)
+            {
+                *nextKey ^= 1; // ping-pong: 0/1, matches the producer schedule
+            }
+        }
+    }
+};
 
 // ---------------------------------------------------------------------------
 // EASU compute shader (FSR 1, self-contained HLSL)
@@ -230,6 +261,11 @@ struct Fsr1Upscaler::Impl
     ComPtr<ID3D12Resource> constBuffer;   // root constant buffer (b0)
 
     UINT cbvSrvUavSize = 0;
+
+    // Consumer half of the keyed-mutex ping-pong (ST-15). Starts at 0 and
+    // alternates 0/1 per consumed frame, in lockstep with the pool producer's
+    // g_frameKey, so Acquire(k) always waits on the matching Release(k).
+    uint64_t consumerKey = 0;
 };
 
 Fsr1Upscaler::~Fsr1Upscaler() = default;
@@ -257,14 +293,13 @@ int Fsr1Upscaler::Create(ID3D11Device* d3d11Device,
     d.d3d11Device = d3d11Device; // borrowed; outlives the context (shutdown ordering)
 
     // --- D3D12 device on the bridge's adapter (ST-15 interop) --------------
-    // CreateD3D12Device is a stub (E_NOTIMPL) until ST-15 wires the shared
-    // device; surface that distinctly so the caller knows FSR 1 is structurally
-    // present but waiting on the interop, not broken.
+    // CreateD3D12Device returns the shared interop device when interop_init has
+    // run (the normal case), else a standalone device on the same adapter.
     HRESULT hr = CreateD3D12Device(d3d11Device, d.device.GetAddressOf());
     if (FAILED(hr))
     {
         BackendLog(CATRA_LOG_WARN,
-                   "upscale_fsr1: CreateD3D12Device hr=0x%08lX (ST-15 interop pending)",
+                   "upscale_fsr1: CreateD3D12Device hr=0x%08lX",
                    static_cast<unsigned long>(hr));
         return HrToCatra(hr);
     }
@@ -440,16 +475,41 @@ int Fsr1Upscaler::Process(ID3D11Texture2D* src, ID3D12Resource** outDst)
 
     // --- D3D11 -> DX12 shared input resource (ST-15 interop) ---------------
     // ShareTexture bridges the bridge's D3D11 device + source texture into a
-    // DX12 resource on the device we own. The interop stub validates non-null
-    // args and returns E_NOTIMPL until ST-15 wires the shared-handle path.
+    // DX12 resource on the device we own, via the pooled GPU-GPU copy (or a
+    // zero-copy NT share). The returned resource is co-owned with the interop
+    // pool, so it carries a keyed mutex we must honor around the dispatch.
     ComPtr<ID3D12Resource> srcRes;
     HRESULT hr = ShareTexture(d.d3d11Device, d.device.Get(), src, srcRes.GetAddressOf());
     if (FAILED(hr))
     {
         BackendLog(CATRA_LOG_WARN,
-                   "upscale_fsr1: ShareTexture hr=0x%08lX (ST-15 interop pending)",
+                   "upscale_fsr1: ShareTexture hr=0x%08lX",
                    static_cast<unsigned long>(hr));
         return HrToCatra(hr);
+    }
+
+    // --- Keyed-mutex consumer acquire (ST-15 ping-pong) --------------------
+    // QI the keyed mutex off the shared resource; shared resources expose it on
+    // both API sides. A resource we own outright (no shared heap) yields S_FALSE
+    // and a null mutex -> we skip the acquire (guard stays inert). AcquireSync
+    // blocks until the pool producer's matching Release(key) completes on the
+    // GPU timeline, which both synchronizes the cross-queue hand-off and provides
+    // backpressure. A timeout/failure is a device fault (CATRA_ERR_DEVICE).
+    KeyedMutexGuard mutexGuard;
+    mutexGuard.nextKey = &d.consumerKey;
+    mutexGuard.key = d.consumerKey;
+    srcRes.As(&mutexGuard.mutex); // S_FALSE when absent -> mutex stays null
+    if (mutexGuard.mutex != nullptr)
+    {
+        int arc = interop_acquire(mutexGuard.mutex, mutexGuard.key, 5000);
+        if (arc != CATRA_OK)
+        {
+            BackendLog(CATRA_LOG_ERROR,
+                       "upscale_fsr1: keyed-mutex acquire rc=%d (key=%llu)",
+                       arc, static_cast<unsigned long long>(mutexGuard.key));
+            return CATRA_ERR_DEVICE;
+        }
+        mutexGuard.held = true; // destructor releases on every exit from here
     }
 
     // --- Output UAV texture (dstW x dstH, RGBA8) ---------------------------

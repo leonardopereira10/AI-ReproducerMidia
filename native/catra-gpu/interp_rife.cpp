@@ -17,6 +17,14 @@
 //     missing DirectML, RDNA4 driver gap) falls back to the CPU EP so the job
 //     still completes (slowly). This is the RN-07 / risk-mitigation decision:
 //     quality/availability over speed, offline pipeline.
+//   * KEYED-MUTEX NOTE (ST-15): unlike the FSR backends, RIFE never consumes a
+//     shared D3D12 resource. Input frames are read entirely in D3D11 space via
+//     a staging CopyResource + Map (TextureToTensor) and written back through a
+//     D3D11 staging texture (TensorToTexture). There is no cross-queue D3D12
+//     hand-off here, hence no IDXGIKeyedMutex acquire/release is required (the
+//     D3D11 immediate-context copies are already ordered on one queue). If a
+//     future path feeds RIFE a pooled interop D3D12 texture, it must adopt the
+//     same consumer ping-pong the FSR backends use (see d3d_interop.h).
 
 #include "interp_rife.h"
 #include "catra_gpu.h"

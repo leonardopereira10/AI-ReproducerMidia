@@ -20,11 +20,12 @@
 //     "does a throw-away ffx context initialize on this adapter", preceded by a
 //     cheap DXGI vendor/device-ID pre-filter (AMD 0x1002 + RDNA 4 gfx12 range).
 //   * The DX12 device used by the context comes from catra::CreateD3D12Device
-//     (the ST-15 interop seam). Until ST-15 lands that is a stub (E_NOTIMPL), so
-//     even on RDNA 4 + SDK the probe reports unavailable and Create returns
-//     CATRA_ERR_NOT_IMPL; Process additionally needs catra::ShareTexture (ST-15).
-//     This is intentional and documented: FSR 4 activates end-to-end once ST-15
-//     wires the shared device + texture path.
+//     (the ST-15 interop seam, now implemented in d3d_interop.cpp): it returns
+//     the shared bridge device once interop_init has run. Process obtains the
+//     input via catra::ShareTexture (pooled GPU-GPU copy / zero-copy NT share)
+//     and, because that resource is co-owned with the interop pool, brackets the
+//     ffx dispatch with the consumer half of the keyed-mutex ping-pong (see
+//     d3d_interop.h) so the read never races the pool's next copy on hardware.
 //   * No exception escapes this TU. ffx returns error codes (ffx::ReturnCode);
 //     every failure is mapped to a CATRA_ERR_* and logged.
 
@@ -104,6 +105,33 @@ int FfxToCatra(ffx::ReturnCode rc)
     return (rc == FFX_OK) ? CATRA_OK : CATRA_ERR_DEVICE;
 }
 
+// RAII guard for the CONSUMER half of the keyed-mutex ping-pong (ST-15). The
+// shared input resource is co-owned with the interop pool, whose producer does
+// Acquire(k)->copy->Release(k) with k alternating 0/1 (g_frameKey). The
+// consumer must Acquire(k) before reading and Release(k) after, on EVERY exit
+// path, or a stuck key deadlocks the producer two frames later. Releases (and
+// advances the consumer key) in the destructor; no-op when the resource carried
+// no keyed mutex (mutex == null / not held) — the case for textures we own.
+struct KeyedMutexGuard
+{
+    IDXGIKeyedMutex* mutex = nullptr;
+    uint64_t key = 0;
+    uint64_t* nextKey = nullptr; // consumer key state advanced on release
+    bool held = false;
+
+    ~KeyedMutexGuard()
+    {
+        if (held && mutex != nullptr)
+        {
+            interop_release(mutex, key);
+            if (nextKey != nullptr)
+            {
+                *nextKey ^= 1; // ping-pong: 0/1, matches the producer schedule
+            }
+        }
+    }
+};
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -124,6 +152,11 @@ struct Fsr4Upscaler::Impl
     ffx::ContextUpscale context;
     UpscaleQualityMode quality = UpscaleQualityMode::Quality;
     bool contextValid = false;
+
+    // Consumer half of the keyed-mutex ping-pong (ST-15). Starts at 0 and
+    // alternates 0/1 per consumed frame, in lockstep with the pool producer's
+    // g_frameKey, so Acquire(k) always waits on the matching Release(k).
+    uint64_t consumerKey = 0;
 };
 
 Fsr4Upscaler::~Fsr4Upscaler() = default;
@@ -165,8 +198,8 @@ bool Fsr4IsAvailable(ID3D11Device* d3d11Device)
     }
 
     // 2. Definitive probe: build a throw-away context on a D3D12 device for this
-    //    adapter. CreateD3D12Device is the ST-15 seam (a stub until then), so the
-    //    probe stays false until the shared-device path is wired.
+    //    adapter. CreateD3D12Device is the ST-15 seam (the shared interop device
+    //    once interop_init has run, else a standalone device on the adapter).
     std::unique_ptr<Fsr4Upscaler> probe;
     int rc = Fsr4Upscaler::Create(d3d11Device, 64, 64, 128, 128,
                                   UpscaleQualityMode::Quality, probe);
@@ -209,7 +242,7 @@ int Fsr4Upscaler::Create(ID3D11Device* d3d11Device,
     if (FAILED(hr))
     {
         BackendLog(CATRA_LOG_WARN,
-                   "upscale_fsr4: CreateD3D12Device hr=0x%08lX (ST-15 interop pending)",
+                   "upscale_fsr4: CreateD3D12Device hr=0x%08lX",
                    static_cast<unsigned long>(hr));
         return (hr == E_NOTIMPL) ? CATRA_ERR_NOT_IMPL : CATRA_ERR_DEVICE;
     }
@@ -291,14 +324,38 @@ int Fsr4Upscaler::Process(ID3D11Texture2D* src, ID3D12Resource** outDst)
     }
 
     // --- D3D11 -> DX12 shared input (ST-15 interop) ------------------------
+    // Pooled GPU-GPU copy (or zero-copy NT share); the returned resource is
+    // co-owned with the interop pool and carries a keyed mutex we must honor.
     ComPtr<ID3D12Resource> srcRes;
     HRESULT hr = ShareTexture(d.d3d11Device, d.device.Get(), src, srcRes.GetAddressOf());
     if (FAILED(hr))
     {
         BackendLog(CATRA_LOG_WARN,
-                   "upscale_fsr4: ShareTexture hr=0x%08lX (ST-15 interop pending)",
+                   "upscale_fsr4: ShareTexture hr=0x%08lX",
                    static_cast<unsigned long>(hr));
         return (hr == E_NOTIMPL) ? CATRA_ERR_NOT_IMPL : CATRA_ERR_DEVICE;
+    }
+
+    // --- Keyed-mutex consumer acquire (ST-15 ping-pong) --------------------
+    // QI the keyed mutex off the shared resource (S_FALSE + null when the
+    // resource is ours outright -> skip). AcquireSync blocks until the pool
+    // producer's matching Release(key) completes on the GPU timeline; a
+    // timeout/failure is a device fault (CATRA_ERR_DEVICE).
+    KeyedMutexGuard mutexGuard;
+    mutexGuard.nextKey = &d.consumerKey;
+    mutexGuard.key = d.consumerKey;
+    srcRes.As(&mutexGuard.mutex); // S_FALSE when absent -> mutex stays null
+    if (mutexGuard.mutex != nullptr)
+    {
+        int arc = interop_acquire(mutexGuard.mutex, mutexGuard.key, 5000);
+        if (arc != CATRA_OK)
+        {
+            BackendLog(CATRA_LOG_ERROR,
+                       "upscale_fsr4: keyed-mutex acquire rc=%d (key=%llu)",
+                       arc, static_cast<unsigned long long>(mutexGuard.key));
+            return CATRA_ERR_DEVICE;
+        }
+        mutexGuard.held = true; // destructor releases on every exit from here
     }
 
     // --- Output texture (dstW x dstH) --------------------------------------
