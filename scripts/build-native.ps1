@@ -168,6 +168,7 @@ Write-Host "build-native: configuring CMake..."
 # carries upscaling. The SDK is license-gated and is NEVER downloaded here.
 $fsrArgs = @()
 if (-not [string]::IsNullOrWhiteSpace($FsrSdkRoot)) {
+    $FsrSdkRoot = (Resolve-Path $FsrSdkRoot -ErrorAction Stop).Path
     Write-Host "build-native: FSR 4 SDK root = $FsrSdkRoot"
     $fsrArgs += "-DCATRA_FSR_SDK_ROOT=$FsrSdkRoot"
     if (-not [string]::IsNullOrWhiteSpace($FsrSdkLib)) {
@@ -184,6 +185,7 @@ else {
 # NEVER downloaded here; the AMF runtime (amfrt64.dll) comes from the AMD driver.
 $amfArgs = @()
 if (-not [string]::IsNullOrWhiteSpace($AmfRoot)) {
+    $AmfRoot = (Resolve-Path $AmfRoot -ErrorAction Stop).Path
     Write-Host "build-native: AMF SDK root = $AmfRoot"
     $amfArgs += "-DCATRA_AMF_ROOT=$AmfRoot"
 }
