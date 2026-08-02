@@ -1,6 +1,9 @@
 using System.Windows;
+using CATRA.Core.Interfaces;
 using CATRA.Core.Library;
 using CATRA.Core.Navigation;
+using CATRA.Data.Database;
+using CATRA.Data.Repositories;
 using CATRA.Services.Library;
 using CATRA.UI.Navigation;
 using Microsoft.Extensions.DependencyInjection;
@@ -34,10 +37,24 @@ public partial class App : Application
                 // Navigation
                 services.AddSingleton<FrameNavigationService>();
                 services.AddSingleton<INavigationService>(sp => sp.GetRequiredService<FrameNavigationService>());
+
+                // Data layer
+                services.AddSingleton(_ => new DatabaseConnection(DatabaseLocation.Default));
+                services.AddSingleton<DatabaseInitializer>();
+                services.AddSingleton<ICategoryRepository, CategoryRepository>();
+                services.AddSingleton<IMediaItemRepository, MediaItemRepository>();
+                services.AddSingleton<IEpisodeRepository, EpisodeRepository>();
+                services.AddSingleton<IProcessedFileRepository, ProcessedFileRepository>();
+                services.AddSingleton<IProcessJobRepository, ProcessJobRepository>();
+                services.AddSingleton<IWatchStateRepository, WatchStateRepository>();
+                services.AddSingleton<IAppSettingsRepository, AppSettingsRepository>();
             })
             .Build();
 
         await _host.StartAsync();
+
+        // Create/migrate the SQLite schema and seed default settings.
+        _host.Services.GetRequiredService<DatabaseInitializer>().Initialize();
 
         var mainWindow = new MainWindow();
         MainWindow = mainWindow;
