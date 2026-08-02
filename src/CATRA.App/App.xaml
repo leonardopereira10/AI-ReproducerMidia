@@ -1,5 +1,14 @@
 <Application x:Class="CATRA.App.App"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
-    <Application.Resources />
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <!-- Theme-independent shared styles -->
+                <ResourceDictionary Source="pack://application:,,,/CATRA.UI;component/Themes/SharedStyles.xaml" />
+                <!-- Default theme (dark); ThemeService swaps this at runtime -->
+                <ResourceDictionary Source="pack://application:,,,/CATRA.UI;component/Themes/DarkTheme.xaml" />
+            </ResourceDictionary.MergedDictionaries>
+        </ResourceDictionary>
+    </Application.Resources>
 </Application>
