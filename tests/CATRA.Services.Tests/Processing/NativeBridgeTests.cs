@@ -57,6 +57,16 @@ internal sealed class FakeNativeLibrary : INativeLibrary
     public int InterpDestroyCallCount { get; private set; }
     public int LastInterpDestroyContext { get; private set; }
     public int UpscaleDestroyCallCount { get; private set; }
+    public int LastUpscaleDestroyContext { get; private set; }
+    public int UpscaleCreateCallCount { get; private set; }
+    public int LastUpscaleCreateSrcWidth { get; private set; }
+    public int LastUpscaleCreateSrcHeight { get; private set; }
+    public int LastUpscaleCreateDstWidth { get; private set; }
+    public int LastUpscaleCreateDstHeight { get; private set; }
+    public int LastUpscaleCreateMethod { get; private set; }
+    public int UpscaleProcessCallCount { get; private set; }
+    public int LastUpscaleProcessContext { get; private set; }
+    public IntPtr LastUpscaleProcessSrc { get; private set; }
     public int EncodeDestroyCallCount { get; private set; }
     public int SetLogCallbackCallCount { get; private set; }
     public NativeLogCallback? LastLogCallback { get; private set; }
@@ -113,17 +123,30 @@ internal sealed class FakeNativeLibrary : INativeLibrary
 
     public int UpscaleCreate(int srcWidth, int srcHeight, int dstWidth, int dstHeight, int method, out int context)
     {
+        UpscaleCreateCallCount++;
+        LastUpscaleCreateSrcWidth = srcWidth;
+        LastUpscaleCreateSrcHeight = srcHeight;
+        LastUpscaleCreateDstWidth = dstWidth;
+        LastUpscaleCreateDstHeight = dstHeight;
+        LastUpscaleCreateMethod = method;
         context = UpscaleCreateContext;
         return UpscaleCreateResult;
     }
 
     public int UpscaleProcess(int context, IntPtr srcTexture, out IntPtr dstTexture)
     {
+        UpscaleProcessCallCount++;
+        LastUpscaleProcessContext = context;
+        LastUpscaleProcessSrc = srcTexture;
         dstTexture = UpscaleProcessDst;
         return UpscaleProcessResult;
     }
 
-    public void UpscaleDestroy(int context) => UpscaleDestroyCallCount++;
+    public void UpscaleDestroy(int context)
+    {
+        UpscaleDestroyCallCount++;
+        LastUpscaleDestroyContext = context;
+    }
 
     public int EncodeCreate(int width, int height, int bitrateKbps, double fps, out int context)
     {
@@ -577,6 +600,160 @@ public class NativeBridgeInterpTests
         bridge.Dispose();
 
         var act = () => bridge.CreateInterpolation(1920, 1080, 24, 135, 1);
+
+        act.Should().Throw<ObjectDisposedException>();
+    }
+}
+
+/// <summary>
+/// ST-14 upscale coverage for <see cref="NativeBridge"/>: argument forwarding,
+/// native error-code mapping, the FSR 4 -> FSR 1 downgrade (transparent to the
+/// wrapper — the native bridge performs it and still returns CATRA_OK), the
+/// method=0 passthrough and disposal guard rails. All driven through
+/// <see cref="FakeNativeLibrary"/> — no DLL.
+/// </summary>
+public class NativeBridgeUpscaleTests
+{
+    [Fact]
+    public void CreateUpscaler_ForwardsAllArgumentsToNative()
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = true, UpscaleCreateResult = 0, UpscaleCreateContext = 11 };
+        var bridge = new NativeBridge(lib);
+
+        IntPtr handle = bridge.CreateUpscaler(1920, 1080, 3840, 2160, 2);
+
+        handle.Should().Be((IntPtr)11);
+        lib.UpscaleCreateCallCount.Should().Be(1);
+        lib.LastUpscaleCreateSrcWidth.Should().Be(1920);
+        lib.LastUpscaleCreateSrcHeight.Should().Be(1080);
+        lib.LastUpscaleCreateDstWidth.Should().Be(3840);
+        lib.LastUpscaleCreateDstHeight.Should().Be(2160);
+        lib.LastUpscaleCreateMethod.Should().Be(2);
+    }
+
+    [Fact]
+    public void CreateUpscaler_Fsr4Request_ReturnsHandle_AndDoesNotReject()
+    {
+        // The FSR 4 -> FSR 1 downgrade happens NATIVELY (the bridge logs + returns
+        // CATRA_OK with a FSR 1 context). The wrapper must forward method=2 as-is
+        // and surface the handle; it never second-guesses the native decision.
+        var lib = new FakeNativeLibrary { IsAvailable = true, UpscaleCreateResult = 0, UpscaleCreateContext = 22 };
+        var bridge = new NativeBridge(lib);
+
+        bridge.CreateUpscaler(1280, 720, 3840, 2160, method: 2).Should().Be((IntPtr)22);
+        lib.LastUpscaleCreateMethod.Should().Be(2, "the wrapper forwards the requested method unchanged");
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public void CreateUpscaler_PassthroughAndFsr1_ForwardMethod(int method)
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = true, UpscaleCreateResult = 0 };
+        var bridge = new NativeBridge(lib);
+
+        bridge.CreateUpscaler(1280, 720, 1920, 1080, method);
+
+        lib.LastUpscaleCreateMethod.Should().Be(method);
+    }
+
+    [Theory]
+    [InlineData(-2)]
+    [InlineData(-4)]
+    [InlineData(-5)]
+    public void CreateUpscaler_NativeError_ThrowsWithCode(int code)
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = true, UpscaleCreateResult = code };
+        var bridge = new NativeBridge(lib);
+
+        var act = () => bridge.CreateUpscaler(1920, 1080, 3840, 2160, 2);
+
+        act.Should().Throw<NativeBridgeException>().Which.ErrorCode.Should().Be(code);
+    }
+
+    [Fact]
+    public void ProcessUpscale_ForwardsContextAndSrcPointer()
+    {
+        var dst = new IntPtr(0xD5D5);
+        var src = new IntPtr(0x5E5E);
+        var lib = new FakeNativeLibrary { IsAvailable = true, UpscaleProcessResult = 0, UpscaleProcessDst = dst };
+        var bridge = new NativeBridge(lib);
+
+        IntPtr result = bridge.ProcessUpscale(new IntPtr(9), src);
+
+        result.Should().Be(dst);
+        lib.UpscaleProcessCallCount.Should().Be(1);
+        lib.LastUpscaleProcessContext.Should().Be(9);
+        lib.LastUpscaleProcessSrc.Should().Be(src);
+    }
+
+    [Fact]
+    public void ProcessUpscale_PassthroughContext_ReturnsCopiedTexture()
+    {
+        // method=0 context: the native bridge returns a copied ID3D11Texture2D*.
+        // The wrapper simply surfaces whatever pointer the native side hands back.
+        var copied = new IntPtr(0xC0DE);
+        var lib = new FakeNativeLibrary { IsAvailable = true, UpscaleProcessResult = 0, UpscaleProcessDst = copied };
+        var bridge = new NativeBridge(lib);
+
+        bridge.ProcessUpscale(new IntPtr(1), new IntPtr(2)).Should().Be(copied);
+    }
+
+    [Theory]
+    [InlineData(-3)]
+    [InlineData(-4)]
+    [InlineData(-6)]
+    public void ProcessUpscale_NativeError_ThrowsWithCode(int code)
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = true, UpscaleProcessResult = code };
+        var bridge = new NativeBridge(lib);
+
+        var act = () => bridge.ProcessUpscale(new IntPtr(1), new IntPtr(2));
+
+        act.Should().Throw<NativeBridgeException>().Which.ErrorCode.Should().Be(code);
+    }
+
+    [Fact]
+    public void DestroyUpscaler_ForwardsHandleAsInt()
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = true };
+        var bridge = new NativeBridge(lib);
+
+        bridge.DestroyUpscaler(new IntPtr(88));
+
+        lib.UpscaleDestroyCallCount.Should().Be(1);
+        lib.LastUpscaleDestroyContext.Should().Be(88);
+    }
+
+    [Fact]
+    public void Unavailable_ProcessUpscale_ThrowsNativeBridgeException()
+    {
+        var bridge = new NativeBridge(new FakeNativeLibrary { IsAvailable = false });
+
+        var act = () => bridge.ProcessUpscale(new IntPtr(1), new IntPtr(2));
+
+        act.Should().Throw<NativeBridgeException>().WithMessage("*not available*");
+    }
+
+    [Fact]
+    public void Unavailable_DestroyUpscaler_IsNoOp()
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = false };
+        var bridge = new NativeBridge(lib);
+
+        var act = () => bridge.DestroyUpscaler(new IntPtr(3));
+
+        act.Should().NotThrow();
+        lib.UpscaleDestroyCallCount.Should().Be(0);
+    }
+
+    [Fact]
+    public void AfterDispose_CreateUpscaler_ThrowsObjectDisposed()
+    {
+        var bridge = new NativeBridge(new FakeNativeLibrary { IsAvailable = true });
+        bridge.Dispose();
+
+        var act = () => bridge.CreateUpscaler(1920, 1080, 3840, 2160, 2);
 
         act.Should().Throw<ObjectDisposedException>();
     }

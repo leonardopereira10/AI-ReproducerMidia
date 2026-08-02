@@ -120,7 +120,9 @@ endif()
 add_library(catra-gpu SHARED
     catra_gpu.cpp
     d3d_interop.cpp
-    interp_rife.cpp)
+    interp_rife.cpp
+    upscale_fsr1.cpp
+    upscale_fsr4.cpp)
 
 target_include_directories(catra-gpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
@@ -132,12 +134,15 @@ if(MSVC)
     target_compile_options(catra-gpu PRIVATE /W4 /WX /permissive- /utf-8 /EHsc)
 endif()
 
-# System import libs ship with the Windows SDK.
+# System import libs ship with the Windows SDK. d3dcompiler provides
+# D3DCompile, which upscale_fsr1.cpp uses to compile the embedded EASU HLSL to
+# DXBC at runtime (no on-disk shader blob, no dxc dependency).
 target_link_libraries(catra-gpu PRIVATE
     d3d12
     dxgi
     d3d11
-    dxguid)
+    dxguid
+    d3dcompiler)
 
 # Optional vcpkg-provided packages (linked when the toolchain resolved them).
 if(TARGET Microsoft::DirectX-Headers)
@@ -160,6 +165,57 @@ endif()
 # intentionally inert, not dead code by accident).
 if(CATRA_HAS_DML)
     target_compile_definitions(catra-gpu PRIVATE USE_DML=1)
+endif()
+
+# --- FSR 4 / FidelityFX SDK (ST-14) ----------------------------------------
+# FSR 4 is ML upscale for RDNA 4, delivered by the license-gated FidelityFX SDK
+# (GPUOpen). The SDK is NEVER vendored or downloaded by this repo (lib/fsr-sdk/
+# is gitignored). upscale_fsr1.cpp (the FSR 1 EASU fallback) is ALWAYS compiled
+# and carries the MVP; upscale_fsr4.cpp only lights up when the integrator
+# supplies the SDK via -DCATRA_FSR_SDK_ROOT=<path>.
+#
+# Expected layout (see scripts/build-native.ps1):
+#   <CATRA_FSR_SDK_ROOT>/ffx-api/include/ffx_api/ffx_api.hpp   (C++ wrapper)
+#   <CATRA_FSR_SDK_ROOT>/ffx-api/include/ffx_api/ffx_upscale.hpp
+#   <CATRA_FSR_SDK_ROOT>/ffx-api/include/ffx_api/dx12/ffx_api_dx12.hpp
+# plus a built ffx_api backend import lib, pointed at via -DCATRA_FSR_SDK_LIB
+# (e.g. .../ffx_api_backend.lib). Build it from the SDK's ffx_api project.
+#
+# When the SDK (or its headers) is absent, CATRA_HAS_FSR4 stays undefined:
+# upscale_fsr4.cpp compiles to an inert stub, catra_is_fsr4_available() == 0,
+# and method=2 (FSR 4) downgrades to method=1 (FSR 1) at runtime.
+option(CATRA_WITH_FSR4 "Build the FSR 4 backend against the FidelityFX SDK (needs CATRA_FSR_SDK_ROOT)" ON)
+
+set(CATRA_HAS_FSR4 FALSE)
+if(CATRA_WITH_FSR4 AND DEFINED CATRA_FSR_SDK_ROOT)
+    set(_fsr_api_inc "${CATRA_FSR_SDK_ROOT}/ffx-api/include")
+    if(EXISTS "${_fsr_api_inc}/ffx_api/ffx_api.hpp")
+        set(CATRA_HAS_FSR4 TRUE)
+        target_include_directories(catra-gpu PRIVATE "${_fsr_api_inc}")
+        target_compile_definitions(catra-gpu PRIVATE CATRA_HAS_FSR4=1)
+        message(STATUS "catra-gpu: FidelityFX SDK found at ${CATRA_FSR_SDK_ROOT} -> FSR 4 backend enabled")
+
+        # The ffx_api backend is a static/shared lib the integrator builds from
+        # the SDK. Link it when provided; otherwise emit a loud warning (the
+        # compile will fail at link, which is the correct signal).
+        if(DEFINED CATRA_FSR_SDK_LIB AND EXISTS "${CATRA_FSR_SDK_LIB}")
+            target_link_libraries(catra-gpu PRIVATE "${CATRA_FSR_SDK_LIB}")
+            message(STATUS "catra-gpu: linking FSR 4 backend lib ${CATRA_FSR_SDK_LIB}")
+        else()
+            message(WARNING
+                "catra-gpu: CATRA_FSR_SDK_ROOT set but CATRA_FSR_SDK_LIB not found. "
+                "Build the SDK's ffx_api backend and pass -DCATRA_FSR_SDK_LIB=<...>/ffx_api_backend.lib "
+                "or the link step will fail.")
+        endif()
+    else()
+        message(WARNING
+            "catra-gpu: CATRA_FSR_SDK_ROOT='${CATRA_FSR_SDK_ROOT}' but "
+            "${_fsr_api_inc}/ffx_api/ffx_api.hpp not found -> FSR 4 disabled (FSR 1 fallback).")
+    endif()
+elseif(CATRA_WITH_FSR4)
+    message(STATUS
+        "catra-gpu: CATRA_FSR_SDK_ROOT not set -> FSR 4 disabled "
+        "(FSR 1 EASU fallback carries upscale; pass -DCATRA_FSR_SDK_ROOT to enable FSR 4)")
 endif()
 
 # --- Install ----------------------------------------------------------------

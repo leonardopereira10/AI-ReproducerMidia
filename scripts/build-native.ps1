@@ -30,6 +30,18 @@ param(
     # Practical-RIFE export. NOT downloaded when the file already exists.
     [string]$RifeModelUrl = 'https://github.com/hzwer/Practical-RIFE/releases/latest/download/rife-v4.onnx',
 
+    # FSR 4 / FidelityFX SDK root (ST-14). OPTIONAL and license-gated: this
+    # script NEVER downloads it. When omitted, FSR 4 is disabled and the bridge
+    # falls back to the self-contained FSR 1 (EASU) upscaler. To enable FSR 4:
+    #   1. Accept the GPUOpen license and clone the FidelityFX SDK:
+    #        git clone https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK lib/fsr-sdk
+    #      (lib/fsr-sdk/ is gitignored.)
+    #   2. Build the SDK's ffx_api backend project (ffx_api_backend.lib).
+    #   3. Pass -FsrSdkRoot lib/fsr-sdk -FsrSdkLib <...>/ffx_api_backend.lib
+    # CMake then defines CATRA_HAS_FSR4 and lights up the FSR 4 backend.
+    [string]$FsrSdkRoot = $env:CATRA_FSR_SDK_ROOT,
+    [string]$FsrSdkLib  = $env:CATRA_FSR_SDK_LIB,
+
     [switch]$SkipModelDownload
 )
 
@@ -121,10 +133,27 @@ finally {
 
 # --- Configure --------------------------------------------------------------
 Write-Host "build-native: configuring CMake..."
+
+# FSR 4 (ST-14): forward the optional FidelityFX SDK location. When -FsrSdkRoot
+# is empty CMake leaves CATRA_HAS_FSR4 undefined and the FSR 1 EASU fallback
+# carries upscaling. The SDK is license-gated and is NEVER downloaded here.
+$fsrArgs = @()
+if (-not [string]::IsNullOrWhiteSpace($FsrSdkRoot)) {
+    Write-Host "build-native: FSR 4 SDK root = $FsrSdkRoot"
+    $fsrArgs += "-DCATRA_FSR_SDK_ROOT=$FsrSdkRoot"
+    if (-not [string]::IsNullOrWhiteSpace($FsrSdkLib)) {
+        $fsrArgs += "-DCATRA_FSR_SDK_LIB=$FsrSdkLib"
+    }
+}
+else {
+    Write-Host "build-native: FSR 4 SDK not supplied -> FSR 1 (EASU) fallback active."
+}
+
 & cmake -B $buildDir -S $nativeDir `
     -DCMAKE_TOOLCHAIN_FILE="$toolchainFile" `
     -DVCPKG_TARGET_TRIPLET=x64-windows `
-    -DCMAKE_BUILD_TYPE=$Configuration
+    -DCMAKE_BUILD_TYPE=$Configuration `
+    @fsrArgs
 if ($LASTEXITCODE -ne 0) { Fail "CMake configure failed (exit $LASTEXITCODE)." }
 
 # --- Build ------------------------------------------------------------------

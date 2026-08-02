@@ -16,12 +16,15 @@
 //   * The log callback is invoked on whatever thread produced the message;
 //     the callee must be thread-safe and must not call back into the bridge.
 //
-// STATUS (ST-13): lifecycle (init/shutdown), capability queries and frame
-// interpolation are implemented. The RIFE backend is live when the bridge is
-// built with ONNX Runtime (CATRA_HAS_ONNXRUNTIME; DirectML EP when USE_DML is
-// detected, CPU fallback otherwise); without it, interp reports unavailable
-// and returns CATRA_ERR_NOT_IMPL. Upscale (FSR 4/1, ST-14) and encode
-// (AMF H.265, ST-16) remain CATRA_ERR_NOT_IMPL stubs.
+// STATUS (ST-14): lifecycle (init/shutdown), capability queries, frame
+// interpolation and upscale are implemented. The RIFE backend is live when the
+// bridge is built with ONNX Runtime (CATRA_HAS_ONNXRUNTIME; DirectML EP when
+// USE_DML is detected, CPU fallback otherwise); without it, interp reports
+// unavailable and returns CATRA_ERR_NOT_IMPL. Upscale (ST-14) runs FSR 4 when
+// the bridge is built against the FidelityFX SDK (CATRA_HAS_FSR4) on an RDNA 4
+// adapter and downgrades to the self-contained FSR 1 (EASU) otherwise; the
+// DX12 dispatch path activates once the D3D11<->DX12 interop (ST-15) lands.
+// Encode (AMF H.265, ST-16) remains a CATRA_ERR_NOT_IMPL stub.
 //
 // EXCEPTION SAFETY: every fallible entry point is guarded at the C ABI
 // boundary; no C++ exception escapes this DLL. Stray exceptions (e.g.
@@ -96,10 +99,15 @@ CATRA_API int  catra_init(void* d3d11_device);
 // Tears down the bridge and releases every owned resource. Idempotent.
 CATRA_API void catra_shutdown(void);
 
-// Current upscale mode (CATRA_UPSCALE_*). Stub (ST-14): CATRA_UPSCALE_OFF (0).
+// Current upscale mode (CATRA_UPSCALE_*): the effective method of the most
+// recently created upscale context (CATRA_UPSCALE_OFF before any create). The
+// effective method reflects the FSR 4 -> FSR 1 downgrade, so a caller that
+// requested FSR 4 on a non-RDNA 4 adapter sees CATRA_UPSCALE_FSR1 here.
 CATRA_API int  catra_get_upscale_mode(void);
 
-// Non-zero if FSR 4 is usable on the active adapter. Stub (ST-14): 0.
+// Non-zero if FSR 4 is usable on the active adapter: built with the FidelityFX
+// SDK (CATRA_HAS_FSR4), AMD adapter (VendorID 0x1002), RDNA 4, and a throw-away
+// FSR 4 context initializes. 0 before catra_init or when any check fails.
 CATRA_API int  catra_is_fsr4_available(void);
 
 // Active interpolation method (CATRA_INTERP_*). Returns CATRA_INTERP_RIFE
@@ -131,19 +139,29 @@ CATRA_API int  catra_interp_process(int ctx,
 CATRA_API void catra_interp_destroy(int ctx);
 
 // ===========================================================================
-// Upscale (FSR 4 / FSR 1) — stubs
+// Upscale (FSR 4 / FSR 1) — ST-14
 // ===========================================================================
 
+// Creates an upscale job. `method`: 0 = off (passthrough copy), 1 = FSR 1
+// (EASU, always available), 2 = FSR 4 (FidelityFX SDK, RDNA 4). When method=2
+// but FSR 4 is unavailable (no SDK / not RDNA 4) the bridge logs a warning and
+// downgrades to FSR 1; catra_get_upscale_mode then reports CATRA_UPSCALE_FSR1.
+// On success writes a handle to *out_ctx.
 CATRA_API int  catra_upscale_create(int src_w, int src_h,
                                     int dst_w, int dst_h,
                                     int method, int* out_ctx);
 
-// Upscales one texture. On success writes the destination texture to
-// *dst_texture and returns CATRA_OK.
+// Upscales one texture. `src_texture` is an ID3D11Texture2D* (src_w x src_h).
+// On success writes the destination texture to *dst_texture and returns
+// CATRA_OK. For passthrough the destination is an ID3D11Texture2D*; for
+// FSR 1 / FSR 4 it is an ID3D12Resource* (shared back to D3D11 by the caller).
+// The caller owns the returned texture (Release). *dst_texture stays null on
+// every failure path.
 CATRA_API int  catra_upscale_process(int ctx,
                                      void* src_texture,
                                      void** dst_texture);
 
+// Destroys an upscale job. No-op for an unknown handle.
 CATRA_API void catra_upscale_destroy(int ctx);
 
 // ===========================================================================

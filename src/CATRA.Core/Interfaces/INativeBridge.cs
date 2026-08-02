@@ -77,12 +77,27 @@ public interface INativeBridge : IDisposable
     /// <summary>Destroys an interpolation job. No-op when unavailable.</summary>
     void DestroyInterpolation(IntPtr context);
 
-    // --- Upscale (stubs until ST-14) ---------------------------------------
+    // --- Upscale (FSR 4 / FSR 1, ST-14) ------------------------------------
 
     /// <summary>Creates an upscaler; returns an opaque context handle.</summary>
+    /// <remarks>
+    /// <paramref name="method"/> selects the backend: <c>0</c> = off (passthrough
+    /// copy), <c>1</c> = FSR 1 (EASU, always available), <c>2</c> = FSR 4
+    /// (FidelityFX SDK, RDNA 4). When <c>2</c> is requested but FSR 4 is
+    /// unavailable (no SDK / non-RDNA 4 adapter) the native bridge logs a warning
+    /// and downgrades to FSR 1; <see cref="GetUpscaleMode"/> then reports <c>1</c>.
+    /// Per RN-07 the caller decides whether to upscale at all (source already
+    /// &gt;= target &rarr; request <c>0</c>); the bridge only executes what it is asked.
+    /// </remarks>
     IntPtr CreateUpscaler(int srcWidth, int srcHeight, int dstWidth, int dstHeight, int method);
 
     /// <summary>Upscales one texture and returns the destination texture pointer.</summary>
+    /// <remarks>
+    /// The returned pointer is an owned native texture reference the caller must
+    /// release. For passthrough it is an <c>ID3D11Texture2D*</c>; for FSR 1 / FSR 4
+    /// it is an <c>ID3D12Resource*</c> (shared back to D3D11 by the pipeline).
+    /// Throws a native-bridge exception on a negative native return code.
+    /// </remarks>
     IntPtr ProcessUpscale(IntPtr context, IntPtr srcTexture);
 
     /// <summary>Destroys an upscaler. No-op when unavailable.</summary>

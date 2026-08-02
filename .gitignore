@@ -70,3 +70,9 @@ lib/ffmpeg/
 lib/rife/
 lib/onnxruntime/
 *.onnx
+
+# ---- FSR 4 / FidelityFX SDK (ST-14) ----
+# License-gated GPUOpen SDK supplied by the integrator via -DCATRA_FSR_SDK_ROOT;
+# never vendored or downloaded by this repo. FSR 1 (EASU) is the self-contained
+# fallback when the SDK is absent.
+lib/fsr-sdk/
