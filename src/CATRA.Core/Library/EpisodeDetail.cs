@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
+using CATRA.Core.Enums;
 using CATRA.Core.Models;
 
 namespace CATRA.Core.Library;
@@ -11,6 +12,7 @@ namespace CATRA.Core.Library;
 public sealed class EpisodeDetail : INotifyPropertyChanged
 {
     private string? _thumbnailPath;
+    private EpisodeProcessStatus _processStatus = EpisodeProcessStatus.Original;
 
     /// <summary>Creates a detail from an episode and its optional watch state.</summary>
     public EpisodeDetail(Episode episode, WatchState? watchState)
@@ -57,6 +59,17 @@ public sealed class EpisodeDetail : INotifyPropertyChanged
     {
         get => _thumbnailPath;
         set => SetField(ref _thumbnailPath, value);
+    }
+
+    /// <summary>
+    /// Pre-processing badge state for the active profile (ST-19): ⚙ fila /
+    /// ✓ pronto / ○ original / ↻ stale. Populated by the detail view model;
+    /// defaults to <see cref="EpisodeProcessStatus.Original"/>.
+    /// </summary>
+    public EpisodeProcessStatus ProcessStatus
+    {
+        get => _processStatus;
+        set => SetField(ref _processStatus, value);
     }
 
     /// <inheritdoc />

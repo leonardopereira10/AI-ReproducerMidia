@@ -16,6 +16,7 @@
                                          RelativeSource={RelativeSource AncestorType=ItemsControl}}"
                 PlayCommand="{Binding DataContext.PlayEpisodeCommand,
                                       RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                ProcessStatus="{Binding ProcessStatus}"
                 RenameCommand="{Binding DataContext.RenameEpisodeCommand,
                                         RelativeSource={RelativeSource AncestorType=ItemsControl}}"
                 SetCoverCommand="{Binding DataContext.SetCoverCommand,
@@ -87,32 +88,39 @@
                     </DockPanel>
                 </Border>
 
-                <!-- Pre-process placeholder (real pipeline: ST-19) -->
-                <Border Margin="0,12,0,0"
-                        IsEnabled="False"
-                        Opacity="0.6"
-                        Style="{StaticResource CardStyle}">
+                <!-- Pre-process (ST-19): profile radio-switch, window estimate,
+                     start/stop + queue navigation. -->
+                <Border Margin="0,12,0,0" Style="{StaticResource CardStyle}">
                     <StackPanel>
                         <TextBlock Style="{StaticResource SectionHeaderStyle}" Text="Pre-Processar" />
                         <DockPanel>
-                            <StackPanel Orientation="Horizontal">
-                                <RadioButton Content="Local"
-                                             Foreground="{DynamicResource WindowForegroundBrush}"
-                                             IsChecked="{Binding IsLocalProfile}" />
-                                <RadioButton Margin="16,0,0,0"
-                                             Content="DLNA"
-                                             Foreground="{DynamicResource WindowForegroundBrush}" />
+                            <controls:ProfileRadioSwitch VerticalAlignment="Center"
+                                                         IsEnabled="{Binding IsProfileSwitchEnabled}"
+                                                         SelectedProfile="{Binding SelectedProfile, Mode=TwoWay}" />
+                            <StackPanel HorizontalAlignment="Right"
+                                        DockPanel.Dock="Right"
+                                        Orientation="Horizontal">
+                                <Button VerticalAlignment="Center"
+                                        Command="{Binding OpenQueueCommand}"
+                                        Content="📜 Fila"
+                                        Style="{StaticResource BaseButtonStyle}" />
+                                <Button Margin="8,0,0,0"
+                                        VerticalAlignment="Center"
+                                        Command="{Binding StartStopWindowCommand}"
+                                        Content="{Binding StartStopLabel}"
+                                        Style="{StaticResource AccentButtonStyle}" />
                             </StackPanel>
-                            <Button HorizontalAlignment="Right"
-                                    Content="📥 Iniciar"
-                                    DockPanel.Dock="Right"
-                                    IsEnabled="False"
-                                    Style="{StaticResource AccentButtonStyle}" />
                         </DockPanel>
                         <TextBlock Margin="0,6,0,0"
                                    FontSize="12"
                                    Foreground="{DynamicResource SectionHeaderForegroundBrush}"
-                                   Text="Janela: 5 episódios não-assistidos (disponível em ST-19)" />
+                                   Text="{Binding WindowEstimateLabel}" />
+                        <!-- Warning: another series owns the active window. -->
+                        <TextBlock Margin="0,6,0,0"
+                                   FontSize="12"
+                                   Foreground="{DynamicResource ErrorForegroundBrush}"
+                                   Text="⚠ Trocar de série cancela a fila atual."
+                                   Visibility="{Binding IsOtherSeriesWindowActive, Converter={StaticResource BoolToVisibility}}" />
                     </StackPanel>
                 </Border>
 

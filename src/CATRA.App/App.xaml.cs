@@ -128,6 +128,7 @@ public partial class App : Application
                 services.AddSingleton<IFolderPicker, FolderPicker>();
                 services.AddTransient<HomeViewModel>();
                 services.AddTransient<MediaDetailViewModel>();
+                services.AddTransient<ProcessingQueueViewModel>();
                 services.AddTransient<PlayerViewModel>();
                 services.AddTransient<SettingsViewModel>();
 

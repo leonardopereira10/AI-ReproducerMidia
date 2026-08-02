@@ -19,6 +19,13 @@ public interface IAppNavigator
     /// <summary>Navigates to the settings screen (Tela 6).</summary>
     void GoToSettings();
 
+    /// <summary>
+    /// Navigates to the pre-processing queue screen (Tela 3). When
+    /// <paramref name="mediaItemId"/> is given it is passed to the view; when
+    /// <c>null</c> the queue falls back to the active sliding window's series.
+    /// </summary>
+    void GoToProcessingQueue(int? mediaItemId = null);
+
     /// <summary>Goes back in the navigation stack; falls back to Home.</summary>
     void GoBack();
 }

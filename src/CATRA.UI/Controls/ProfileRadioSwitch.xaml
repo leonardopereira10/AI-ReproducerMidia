@@ -1,0 +1,27 @@
+<UserControl x:Class="CATRA.UI.Controls.ProfileRadioSwitch"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Name="Root">
+    <!-- Two RadioButtons styled as a Local/DLNA pill toggle (ST-19). The
+         SelectedProfile dependency property is the single source of truth; the
+         radio Checked handlers write it and the DP callback syncs the radios. -->
+    <Border Background="{DynamicResource SeekBarBackgroundBrush}"
+            CornerRadius="14"
+            Padding="3">
+        <StackPanel Orientation="Horizontal">
+            <RadioButton x:Name="LocalRadio"
+                         Padding="10,4"
+                         Checked="LocalRadio_OnChecked"
+                         Content="Local"
+                         Foreground="{DynamicResource WindowForegroundBrush}"
+                         GroupName="ProfileSwitch" />
+            <RadioButton x:Name="DlnaRadio"
+                         Margin="6,0,0,0"
+                         Padding="10,4"
+                         Checked="DlnaRadio_OnChecked"
+                         Content="DLNA"
+                         Foreground="{DynamicResource WindowForegroundBrush}"
+                         GroupName="ProfileSwitch" />
+        </StackPanel>
+    </Border>
+</UserControl>

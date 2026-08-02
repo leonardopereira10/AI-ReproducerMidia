@@ -32,6 +32,10 @@ public sealed class AppNavigator : IAppNavigator
     public void GoToSettings() => _navigation.Navigate(typeof(SettingsView));
 
     /// <inheritdoc />
+    public void GoToProcessingQueue(int? mediaItemId = null) =>
+        _navigation.Navigate(typeof(ProcessingQueueView), mediaItemId);
+
+    /// <inheritdoc />
     public void GoBack()
     {
         if (_navigation.CanGoBack)

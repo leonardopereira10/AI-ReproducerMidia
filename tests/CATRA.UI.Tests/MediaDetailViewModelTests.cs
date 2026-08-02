@@ -21,9 +21,12 @@ public sealed class MediaDetailViewModelTests
     private readonly RecordingThumbnailService _thumbnails = new();
     private readonly FakeNavigator _navigator = new();
     private readonly ScriptableDialogService _dialogs = new();
+    private readonly FakeSlidingWindowService _window = new();
+    private readonly FakeProcessedFileRepository _processedFiles = new();
+    private readonly FakeProcessJobRepository _jobs = new();
 
     private MediaDetailViewModel CreateVm() =>
-        new(_library, _watchState, _thumbnails, _navigator, _dialogs);
+        new(_library, _watchState, _thumbnails, _navigator, _dialogs, _window, _processedFiles, _jobs);
 
     [Fact]
     public async Task SetCover_PickedFile_RoutesThroughThumbnailService_NotRawLibraryPath()
@@ -55,6 +58,64 @@ public sealed class MediaDetailViewModelTests
 
         _thumbnails.SetCustomCoverCalls.Should().BeEmpty();
         _library.SetMediaCoverCalls.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task StartStopWindow_NoActiveWindow_StartsWindowWithSelectedProfile()
+    {
+        _library.MediaItem = new MediaItem { Id = 7, Title = "Série" };
+        var vm = CreateVm();
+        vm.SelectedProfile = CATRA.Core.Enums.ProcessProfile.Dlna;
+        await vm.LoadAsync(7);
+
+        await vm.StartStopWindowCommand.ExecuteAsync(null);
+
+        _window.StartCalls.Should().ContainSingle();
+        _window.StartCalls[0].MediaItemId.Should().Be(7);
+        _window.StartCalls[0].Profile.Should().Be(CATRA.Core.Enums.ProcessProfile.Dlna);
+    }
+
+    [Fact]
+    public async Task StartStopWindow_ActiveForThisSeries_StopsWindow()
+    {
+        _library.MediaItem = new MediaItem { Id = 7, Title = "Série" };
+        _window.ActiveMediaItemId = 7;
+        _window.ActiveProfile = CATRA.Core.Enums.ProcessProfile.Local;
+        var vm = CreateVm();
+        await vm.LoadAsync(7);
+
+        vm.StartStopLabel.Should().Be("⏹ Parar");
+        vm.IsWindowActiveForThisSeries.Should().BeTrue();
+
+        await vm.StartStopWindowCommand.ExecuteAsync(null);
+
+        _window.StopCalls.Should().ContainSingle().Which.Should().Be(7);
+        _window.StartCalls.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task Load_OtherSeriesActive_SetsWarningFlag()
+    {
+        _library.MediaItem = new MediaItem { Id = 7, Title = "Série" };
+        _window.ActiveMediaItemId = 99; // outra série
+        var vm = CreateVm();
+
+        await vm.LoadAsync(7);
+
+        vm.IsOtherSeriesWindowActive.Should().BeTrue();
+        vm.IsWindowActiveForThisSeries.Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task OpenQueue_NavigatesToProcessingQueueWithMediaItem()
+    {
+        _library.MediaItem = new MediaItem { Id = 7, Title = "Série" };
+        var vm = CreateVm();
+        await vm.LoadAsync(7);
+
+        vm.OpenQueueCommand.Execute(null);
+
+        _navigator.QueueIds.Should().ContainSingle().Which.Should().Be(7);
     }
 
     // ── fakes ──────────────────────────────────────────────────────────────

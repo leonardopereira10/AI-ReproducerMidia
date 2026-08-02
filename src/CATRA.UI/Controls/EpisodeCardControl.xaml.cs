@@ -1,6 +1,7 @@
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using CATRA.Core.Enums;
 
 namespace CATRA.UI.Controls;
 
@@ -31,6 +32,10 @@ public partial class EpisodeCardControl : UserControl
     /// <summary>Identifies the <see cref="DetailsCommand"/> dependency property.</summary>
     public static readonly DependencyProperty DetailsCommandProperty =
         DependencyProperty.Register(nameof(DetailsCommand), typeof(ICommand), typeof(EpisodeCardControl), new PropertyMetadata(null));
+
+    /// <summary>Identifies the <see cref="ProcessStatus"/> dependency property.</summary>
+    public static readonly DependencyProperty ProcessStatusProperty =
+        DependencyProperty.Register(nameof(ProcessStatus), typeof(EpisodeProcessStatus), typeof(EpisodeCardControl), new PropertyMetadata(EpisodeProcessStatus.Original));
 
     /// <summary>Creates the control.</summary>
     public EpisodeCardControl()
@@ -71,5 +76,12 @@ public partial class EpisodeCardControl : UserControl
     {
         get => (ICommand?)GetValue(DetailsCommandProperty);
         set => SetValue(DetailsCommandProperty, value);
+    }
+
+    /// <summary>Pre-processing badge state (ST-19): ⚙/✓/○/↻.</summary>
+    public EpisodeProcessStatus ProcessStatus
+    {
+        get => (EpisodeProcessStatus)GetValue(ProcessStatusProperty);
+        set => SetValue(ProcessStatusProperty, value);
     }
 }

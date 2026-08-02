@@ -261,6 +261,8 @@ internal sealed class FakeNavigator : IAppNavigator
 
     public List<int> PlayerIds { get; } = new();
 
+    public List<int?> QueueIds { get; } = new();
+
     public void GoToHome() => HomeCount++;
 
     public void GoToMediaDetail(int mediaItemId) => DetailIds.Add(mediaItemId);
@@ -268,6 +270,8 @@ internal sealed class FakeNavigator : IAppNavigator
     public void GoToPlayer(int episodeId) => PlayerIds.Add(episodeId);
 
     public void GoToSettings() => SettingsCount++;
+
+    public void GoToProcessingQueue(int? mediaItemId = null) => QueueIds.Add(mediaItemId);
 
     public void GoBack() => BackCount++;
 }
@@ -485,5 +489,177 @@ internal sealed class FakeFolderPicker : IFolderPicker
     {
         Titles.Add(title);
         return Result;
+    }
+}
+
+/// <summary>Recording <see cref="ISlidingWindowService"/> fake (ST-19).</summary>
+internal sealed class FakeSlidingWindowService : ISlidingWindowService
+{
+    public List<(int MediaItemId, ProcessProfile Profile)> StartCalls { get; } = new();
+
+    public List<int> StopCalls { get; } = new();
+
+    public List<int> WatchedCalls { get; } = new();
+
+    public int? ActiveMediaItemId { get; set; }
+
+    public ProcessProfile? ActiveProfile { get; set; }
+
+    public List<Episode> WindowEpisodes { get; set; } = new();
+
+    public Task StartWindowAsync(int mediaItemId, ProcessProfile profile)
+    {
+        StartCalls.Add((mediaItemId, profile));
+        ActiveMediaItemId = mediaItemId;
+        ActiveProfile = profile;
+        return Task.CompletedTask;
+    }
+
+    public Task StopWindowAsync(int mediaItemId)
+    {
+        StopCalls.Add(mediaItemId);
+        if (ActiveMediaItemId == mediaItemId)
+        {
+            ActiveMediaItemId = null;
+            ActiveProfile = null;
+            WindowEpisodes = new List<Episode>();
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public Task OnEpisodeWatchedAsync(int episodeId)
+    {
+        WatchedCalls.Add(episodeId);
+        return Task.CompletedTask;
+    }
+}
+
+/// <summary>
+/// Recording <see cref="IProcessingQueueService"/> fake (ST-19). Events are
+/// raised explicitly by the tests; no background worker.
+/// </summary>
+internal sealed class FakeProcessingQueueService : IProcessingQueueService
+{
+    public List<(List<int> EpisodeIds, ProcessProfile Profile)> EnqueueCalls { get; } = new();
+
+    public int CancelCurrentCount { get; private set; }
+
+    public int ClearQueueCount { get; private set; }
+
+    public int StartCount { get; private set; }
+
+    public int StopCount { get; private set; }
+
+    public ProcessJob? CurrentJob { get; set; }
+
+    public List<ProcessJob> QueuedJobs { get; set; } = new();
+
+    public event EventHandler<ProcessJob>? JobStarted;
+
+    public event EventHandler<ProcessJob>? JobCompleted;
+
+    public event EventHandler<ProcessJob>? JobFailed;
+
+    public event EventHandler<CATRA.Core.Processing.PipelineProgress>? ProgressChanged;
+
+    public Task EnqueueAsync(List<int> episodeIds, ProcessProfile profile)
+    {
+        EnqueueCalls.Add((episodeIds, profile));
+        return Task.CompletedTask;
+    }
+
+    public Task CancelCurrentAsync()
+    {
+        CancelCurrentCount++;
+        return Task.CompletedTask;
+    }
+
+    public Task ClearQueueAsync()
+    {
+        ClearQueueCount++;
+        return Task.CompletedTask;
+    }
+
+    public Task StartAsync()
+    {
+        StartCount++;
+        return Task.CompletedTask;
+    }
+
+    public Task StopAsync()
+    {
+        StopCount++;
+        return Task.CompletedTask;
+    }
+
+    public void RaiseJobStarted(ProcessJob job) => JobStarted?.Invoke(this, job);
+
+    public void RaiseJobCompleted(ProcessJob job) => JobCompleted?.Invoke(this, job);
+
+    public void RaiseJobFailed(ProcessJob job) => JobFailed?.Invoke(this, job);
+
+    public void RaiseProgressChanged(CATRA.Core.Processing.PipelineProgress sample)
+        => ProgressChanged?.Invoke(this, sample);
+}
+
+/// <summary>In-memory <see cref="IProcessedFileRepository"/>.</summary>
+internal sealed class FakeProcessedFileRepository : IProcessedFileRepository
+{
+    private readonly Dictionary<int, ProcessedFile> _byId = new();
+
+    public void Add(ProcessedFile file) => _byId[file.Id] = file;
+
+    public IReadOnlyList<ProcessedFile> GetAll() => _byId.Values.ToList();
+
+    public ProcessedFile? GetById(int id) => _byId.GetValueOrDefault(id);
+
+    public ProcessedFile Insert(ProcessedFile entity)
+    {
+        _byId[entity.Id] = entity;
+        return entity;
+    }
+
+    public bool Update(ProcessedFile entity) => _byId.ContainsKey(entity.Id);
+
+    public bool Delete(int id) => _byId.Remove(id);
+
+    public ProcessedFile? GetByEpisodeAndProfile(int episodeId, ProcessProfile profile)
+        => _byId.Values.FirstOrDefault(f => f.EpisodeId == episodeId && f.Profile == profile);
+
+    public IReadOnlyList<ProcessedFile> GetByEpisode(int episodeId)
+        => _byId.Values.Where(f => f.EpisodeId == episodeId).ToList();
+}
+
+/// <summary>In-memory <see cref="IProcessJobRepository"/>.</summary>
+internal sealed class FakeProcessJobRepository : IProcessJobRepository
+{
+    private readonly Dictionary<int, ProcessJob> _byId = new();
+
+    public Func<int, IReadOnlyList<int>>? EpisodeIdsByMediaItem { get; set; }
+
+    public void Add(ProcessJob job) => _byId[job.Id] = job;
+
+    public IReadOnlyList<ProcessJob> GetAll() => _byId.Values.ToList();
+
+    public ProcessJob? GetById(int id) => _byId.GetValueOrDefault(id);
+
+    public ProcessJob Insert(ProcessJob entity)
+    {
+        _byId[entity.Id] = entity;
+        return entity;
+    }
+
+    public bool Update(ProcessJob entity) => _byId.ContainsKey(entity.Id);
+
+    public bool Delete(int id) => _byId.Remove(id);
+
+    public IReadOnlyList<ProcessJob> GetActiveByMediaItem(int mediaItemId)
+    {
+        var ids = EpisodeIdsByMediaItem?.Invoke(mediaItemId) ?? new List<int>();
+        return _byId.Values
+            .Where(j => ids.Contains(j.EpisodeId)
+                && (j.Status == JobStatus.Queued || j.Status == JobStatus.Processing))
+            .ToList();
     }
 }

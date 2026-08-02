@@ -1,6 +1,8 @@
 using System.Collections.ObjectModel;
+using CATRA.Core.Enums;
 using CATRA.Core.Interfaces;
 using CATRA.Core.Library;
+using CATRA.UI.Models;
 using CATRA.UI.Navigation;
 using CATRA.UI.Services;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -20,6 +22,9 @@ public sealed partial class MediaDetailViewModel : ObservableObject
     private readonly IThumbnailService _thumbnails;
     private readonly IAppNavigator _navigator;
     private readonly IDialogService _dialogs;
+    private readonly ISlidingWindowService _window;
+    private readonly IProcessedFileRepository _processedFiles;
+    private readonly IProcessJobRepository _jobs;
 
     private int _mediaItemId;
 
@@ -29,13 +34,19 @@ public sealed partial class MediaDetailViewModel : ObservableObject
         IWatchStateService watchStateService,
         IThumbnailService thumbnails,
         IAppNavigator navigator,
-        IDialogService dialogs)
+        IDialogService dialogs,
+        ISlidingWindowService window,
+        IProcessedFileRepository processedFiles,
+        IProcessJobRepository jobs)
     {
         _library = library ?? throw new ArgumentNullException(nameof(library));
         _watchStateService = watchStateService ?? throw new ArgumentNullException(nameof(watchStateService));
         _thumbnails = thumbnails ?? throw new ArgumentNullException(nameof(thumbnails));
         _navigator = navigator ?? throw new ArgumentNullException(nameof(navigator));
         _dialogs = dialogs ?? throw new ArgumentNullException(nameof(dialogs));
+        _window = window ?? throw new ArgumentNullException(nameof(window));
+        _processedFiles = processedFiles ?? throw new ArgumentNullException(nameof(processedFiles));
+        _jobs = jobs ?? throw new ArgumentNullException(nameof(jobs));
     }
 
     /// <summary>Unwatched episodes (display order).</summary>
@@ -68,9 +79,29 @@ public sealed partial class MediaDetailViewModel : ObservableObject
     [ObservableProperty]
     private bool _hasWatched;
 
-    /// <summary>Selected pre-process profile (placeholder until ST-19).</summary>
+    /// <summary>Selected pre-process profile (ST-19, bound to ProfileRadioSwitch).</summary>
     [ObservableProperty]
-    private bool _isLocalProfile = true;
+    private ProcessProfile _selectedProfile = ProcessProfile.Local;
+
+    /// <summary>Whether the active sliding window belongs to this series.</summary>
+    [ObservableProperty]
+    private bool _isWindowActiveForThisSeries;
+
+    /// <summary>Whether another series has an active window (warn on switch).</summary>
+    [ObservableProperty]
+    private bool _isOtherSeriesWindowActive;
+
+    /// <summary>Window estimate line ("Janela: 5 episódios | ~16.5 GB estimados").</summary>
+    [ObservableProperty]
+    private string _windowEstimateLabel = "Janela: 5 episódios | ~0.0 GB estimados";
+
+    /// <summary>Start/stop button label ("📥 Iniciar" / "⏹ Parar").</summary>
+    [ObservableProperty]
+    private string _startStopLabel = "📥 Iniciar";
+
+    /// <summary>Whether the profile radio-switch can be edited (disabled while this series' window is active).</summary>
+    [ObservableProperty]
+    private bool _isProfileSwitchEnabled = true;
 
     /// <summary>Loads (or reloads) the media item and its episodes.</summary>
     public async Task LoadAsync(int mediaItemId)
@@ -104,6 +135,9 @@ public sealed partial class MediaDetailViewModel : ObservableObject
         ProgressLine = episodes.Count == 0
             ? "Sem episódios catalogados"
             : $"{episodes.Count} eps | {watched} assistidos";
+
+        ComputeEpisodeStatuses();
+        RefreshPreProcessState();
 
         QueueThumbnailLoads(episodes);
     }
@@ -146,6 +180,76 @@ public sealed partial class MediaDetailViewModel : ObservableObject
     /// <summary>← Voltar.</summary>
     [RelayCommand]
     private void GoBack() => _navigator.GoBack();
+
+    /// <summary>
+    /// Starts the sliding window for this series under
+    /// <see cref="SelectedProfile"/>, or stops it when it is already active for
+    /// this series (ST-19, RF-03). Starting while another series is active
+    /// implicitly cancels that series' queue (RN-10, handled by the service).
+    /// </summary>
+    [RelayCommand]
+    private async Task StartStopWindowAsync()
+    {
+        if (IsWindowActiveForThisSeries)
+        {
+            await _window.StopWindowAsync(_mediaItemId);
+        }
+        else
+        {
+            await _window.StartWindowAsync(_mediaItemId, SelectedProfile);
+        }
+
+        await LoadAsync(_mediaItemId);
+    }
+
+    /// <summary>Opens the pre-processing queue screen (Tela 3) for this series.</summary>
+    [RelayCommand]
+    private void OpenQueue() => _navigator.GoToProcessingQueue(_mediaItemId);
+
+    /// <summary>
+    /// Computes the pre-processing badge (⚙/✓/○/↻) for every loaded episode
+    /// under the active profile (ST-19). Uses the window's active profile when
+    /// this series owns it, otherwise the locally selected profile.
+    /// </summary>
+    private void ComputeEpisodeStatuses()
+    {
+        var profile = _window.ActiveMediaItemId == _mediaItemId && _window.ActiveProfile is { } active
+            ? active
+            : SelectedProfile;
+
+        var activeJobs = _jobs.GetActiveByMediaItem(_mediaItemId)
+            .ToDictionary(j => j.EpisodeId, j => j);
+
+        foreach (var detail in UnwatchedEpisodes.Concat(WatchedEpisodes))
+        {
+            var processed = _processedFiles.GetByEpisodeAndProfile(detail.Id, profile);
+            activeJobs.TryGetValue(detail.Id, out var job);
+            detail.ProcessStatus = EpisodeProcessStatusMapper.Compute(detail.Episode, processed, job);
+        }
+    }
+
+    /// <summary>Refreshes the pre-process section state (button label, warning, estimate).</summary>
+    private void RefreshPreProcessState()
+    {
+        var activeId = _window.ActiveMediaItemId;
+        IsWindowActiveForThisSeries = activeId == _mediaItemId;
+        IsOtherSeriesWindowActive = activeId.HasValue && activeId.Value != _mediaItemId;
+        IsProfileSwitchEnabled = !IsWindowActiveForThisSeries;
+        StartStopLabel = IsWindowActiveForThisSeries ? "⏹ Parar" : "📥 Iniciar";
+        WindowEstimateLabel = BuildEstimateLabel();
+    }
+
+    private string BuildEstimateLabel()
+    {
+        var candidates = UnwatchedEpisodes.Take(5).Select(e => e.Episode).ToList();
+        int windowSize = candidates.Count;
+        double avgDuration = windowSize > 0 ? candidates.Average(e => e.DurationSec ?? 0d) : 0d;
+        int bitrateKbps = SelectedProfile == ProcessProfile.Dlna ? 45_000 : 20_000;
+
+        // bytes = windowSize × avgDurationSec × (bitrateKbps × 1000 / 8).
+        double bytes = windowSize * avgDuration * bitrateKbps * 1000d / 8d;
+        return $"Janela: {windowSize} episódios | ~{bytes / 1_000_000_000d:F1} GB estimados";
+    }
 
     /// <summary>Episode click → opens the player (Tela 4) for the episode.</summary>
     [RelayCommand]

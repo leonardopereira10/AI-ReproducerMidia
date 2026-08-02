@@ -7,6 +7,8 @@
         <converters:BoolToVisibilityConverter x:Key="BoolToVisibility" />
         <converters:ProgressToBadgeConverter x:Key="ProgressToBadge" />
         <converters:ThumbnailPathToImageConverter x:Key="ThumbnailToImage" />
+        <converters:JobStatusToIconConverter x:Key="StatusToIcon" />
+        <converters:EpisodeProcessStatusToBrushConverter x:Key="StatusToBrush" />
         <!-- ContextMenu lives in its own visual/data tree, so it cannot reach
              the UserControl via RelativeSource. This proxy exposes the control
              (and its command DPs) as a static resource for the menu items. -->
@@ -69,6 +71,25 @@
                             Style="{StaticResource BadgeStyle}">
                         <TextBlock Style="{StaticResource BadgeTextStyle}"
                                    Text="{Binding Converter={StaticResource ProgressToBadge}}" />
+                    </Border>
+                    <!-- Pre-process badge (ST-19): ⚙ fila / ✓ pronto / ↻ stale.
+                         Hidden for Original so the watch badge stays uncluttered. -->
+                    <Border Margin="6,6,0,0"
+                            HorizontalAlignment="Left"
+                            VerticalAlignment="Top">
+                        <Border.Style>
+                            <Style BasedOn="{StaticResource BadgeStyle}" TargetType="Border">
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding ProcessStatus, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                                                 Value="Original">
+                                        <Setter Property="Visibility" Value="Collapsed" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Border.Style>
+                        <TextBlock Style="{StaticResource BadgeTextStyle}"
+                                   Foreground="{Binding ProcessStatus, RelativeSource={RelativeSource AncestorType=UserControl}, Converter={StaticResource StatusToBrush}}"
+                                   Text="{Binding ProcessStatus, RelativeSource={RelativeSource AncestorType=UserControl}, Converter={StaticResource StatusToIcon}}" />
                     </Border>
                 </Grid>
 

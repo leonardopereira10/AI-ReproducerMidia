@@ -1,0 +1,45 @@
+<UserControl x:Class="CATRA.UI.Controls.ProcessJobCardControl"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:converters="clr-namespace:CATRA.UI.Converters">
+    <UserControl.Resources>
+        <converters:BoolToVisibilityConverter x:Key="BoolToVisibility" />
+    </UserControl.Resources>
+
+    <!-- Binds to the ProcessingQueueViewModel (inherited DataContext). Shows the
+         job currently being processed: EP + title, progress bar with the active
+         step, ETA and a cancel button (ST-19, Tela 3). -->
+    <Border Style="{StaticResource CardStyle}"
+            Visibility="{Binding HasCurrentJob, Converter={StaticResource BoolToVisibility}}">
+        <StackPanel>
+            <DockPanel>
+                <TextBlock FontWeight="SemiBold"
+                           Foreground="{DynamicResource CardForegroundBrush}">
+                    <Run Text="{Binding CurrentJobEpisodeLabel, Mode=OneWay}" />
+                    <Run Text=" — " />
+                    <Run Text="{Binding CurrentJobTitle, Mode=OneWay}" />
+                </TextBlock>
+                <Button HorizontalAlignment="Right"
+                        Command="{Binding CancelCommand}"
+                        Content="✕ Cancelar"
+                        DockPanel.Dock="Right"
+                        Style="{StaticResource BaseButtonStyle}" />
+            </DockPanel>
+
+            <ProgressBar Height="10"
+                         Margin="0,8,0,0"
+                         Maximum="100"
+                         Minimum="0"
+                         Value="{Binding CurrentProgressPct, Mode=OneWay}" />
+
+            <DockPanel Margin="0,6,0,0">
+                <TextBlock Foreground="{DynamicResource SectionHeaderForegroundBrush}"
+                           Text="{Binding CurrentProgressText, Mode=OneWay}" />
+                <TextBlock HorizontalAlignment="Right"
+                           DockPanel.Dock="Right"
+                           Foreground="{DynamicResource SectionHeaderForegroundBrush}"
+                           Text="{Binding EtaDisplay, Mode=OneWay}" />
+            </DockPanel>
+        </StackPanel>
+    </Border>
+</UserControl>
