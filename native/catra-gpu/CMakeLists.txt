@@ -153,6 +153,7 @@ if(MSVC)
     # High warning bar, standards-conformant, UTF-8 sources. Warnings are
     # promoted to errors to keep the native build as strict as the C# one.
     target_compile_options(catra-gpu PRIVATE /W4 /WX /permissive- /utf-8 /EHsc)
+    target_compile_definitions(catra-gpu PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 # System import libs ship with the Windows SDK. d3dcompiler provides

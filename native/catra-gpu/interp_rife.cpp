@@ -461,17 +461,9 @@ int InterpRifeCreate(ID3D11Device* device,
         ctx->useDml = false;
     }
 #endif
-    if (!ctx->useDml)
-    {
-        try
-        {
-            ctx->sessionOptions.AppendExecutionProvider_CPU({});
-        }
-        catch (const Ort::Exception&)
-        {
-            // CPU is always registered; ignore.
-        }
-    }
+    // CPU EP is always registered by default in ONNX Runtime; no explicit
+    // AppendExecutionProvider_CPU call needed (the method does not exist in
+    // the 1.18 C++ API). When DML is unavailable the session simply uses CPU.
 
     try
     {
@@ -735,8 +727,8 @@ int InterpRifeProcess(int ctxHandle,
 
             // Copy the model output (RGB float32) into the reusable buffer.
             const float* outData = outputs[0].GetTensorData<float>();
-            size_t outCount = static_cast<size_t>(w) * static_cast<size_t>(h) * 3;
-            std::copy(outData, outData + outCount, ctx->tensorOut.begin());
+            size_t pixelCount = static_cast<size_t>(w) * static_cast<size_t>(h) * 3;
+            std::copy(outData, outData + pixelCount, ctx->tensorOut.begin());
 
             ID3D11Texture2D* outTex = nullptr;
             rc = TensorToTexture(ctx->device, ctx->deviceContext, ctx->tensorOut,

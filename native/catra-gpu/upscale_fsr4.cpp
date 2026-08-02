@@ -260,7 +260,7 @@ int Fsr4Upscaler::Create(ID3D11Device* d3d11Device,
     {
         hr = d.device->CreateCommandList(
             D3D12_COMMAND_LIST_TYPE_COMPUTE, d.allocator.Get(), nullptr,
-            IID_PPV_ARGS(d.cmdList.GetAddressOf()));
+            reinterpret_cast<ID3D12CommandList**>(d.cmdList.GetAddressOf()));
     }
     if (SUCCEEDED(hr))
     {

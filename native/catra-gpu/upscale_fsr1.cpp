@@ -38,7 +38,8 @@
 #include <d3d11.h>
 #include <d3d12.h>
 #include <d3dcompiler.h>
-#include <directx/d3dx12.h> // CD3DX12_* root-signature helpers (vcpkg directx-headers)
+// d3dx12.h helpers removed: the vcpkg directx-headers version (1.619+) requires
+// a newer SDK than 10.0.26100. Root signature is built with raw D3D12 structs.
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 
@@ -318,7 +319,7 @@ int Fsr1Upscaler::Create(ID3D11Device* d3d11Device,
     {
         hr = d.device->CreateCommandList(
             D3D12_COMMAND_LIST_TYPE_COMPUTE, d.allocator.Get(), nullptr,
-            IID_PPV_ARGS(d.cmdList.GetAddressOf()));
+            reinterpret_cast<ID3D12CommandList**>(d.cmdList.GetAddressOf()));
     }
     if (SUCCEEDED(hr))
     {
@@ -358,21 +359,34 @@ int Fsr1Upscaler::Create(ID3D11Device* d3d11Device,
     }
 
     // --- Root signature: b0 (constants) + t0 (SRV) + u0 (UAV) --------------
-    CD3DX12_DESCRIPTOR_RANGE1 ranges[2];
-    ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0
-    ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0); // u0
+    // Built with raw D3D12 structs (no d3dx12.h dependency).
+    D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[0].NumDescriptors = 1;
+    ranges[0].BaseShaderRegister = 0; // t0
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    ranges[1].NumDescriptors = 1;
+    ranges[1].BaseShaderRegister = 0; // u0
 
-    CD3DX12_ROOT_PARAMETER1 params[2];
-    params[0].InitAsConstantBufferView(0);                 // b0
-    params[1].InitAsDescriptorTable(2, ranges);            // t0 + u0
+    D3D12_ROOT_PARAMETER params[2] = {};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[0].Descriptor.ShaderRegister = 0; // b0
+    params[0].Descriptor.RegisterSpace = 0;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable.NumDescriptorRanges = 2;
+    params[1].DescriptorTable.pDescriptorRanges = ranges;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-    CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rsDesc;
-    rsDesc.Init_1_1(2, params, 0, nullptr,
-                    D3D12_ROOT_SIGNATURE_FLAG_NONE);
+    D3D12_ROOT_SIGNATURE_DESC rsDesc = {};
+    rsDesc.NumParameters = 2;
+    rsDesc.pParameters = params;
+    rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
 
     ComPtr<ID3DBlob> rsBlob;
     ComPtr<ID3DBlob> rsError;
-    hr = D3DX12SerializeVersionedRootSignature(&rsDesc, rsBlob.GetAddressOf(), rsError.GetAddressOf());
+    hr = D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+                                     rsBlob.GetAddressOf(), rsError.GetAddressOf());
     if (SUCCEEDED(hr))
     {
         hr = d.device->CreateRootSignature(
@@ -498,7 +512,7 @@ int Fsr1Upscaler::Process(ID3D11Texture2D* src, ID3D12Resource** outDst)
     KeyedMutexGuard mutexGuard;
     mutexGuard.nextKey = &d.consumerKey;
     mutexGuard.key = d.consumerKey;
-    srcRes.As(&mutexGuard.mutex); // S_FALSE when absent -> mutex stays null
+    srcRes->QueryInterface(IID_PPV_ARGS(&mutexGuard.mutex)); // S_FALSE when absent -> mutex stays null
     if (mutexGuard.mutex != nullptr)
     {
         int arc = interop_acquire(mutexGuard.mutex, mutexGuard.key, 5000);
