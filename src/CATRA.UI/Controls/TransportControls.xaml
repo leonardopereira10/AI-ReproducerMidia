@@ -78,10 +78,8 @@
                                Text="{Binding ProfileIndicator}"
                                ToolTip="Perfil do arquivo (ST-20)" />
 
-                    <Button Command="{Binding TransmitCommand}"
-                            Content="📺 Transmitir"
-                            Style="{StaticResource BaseButtonStyle}"
-                            ToolTip="Transmissão DLNA (ST-08)" />
+                    <!-- DLNA cast button + device dropdown (ST-08) -->
+                    <controls:CastButtonControl />
 
                     <Button Margin="8,0,0,0"
                             Command="{Binding ToggleFullscreenCommand}"

@@ -154,6 +154,100 @@ internal sealed class FakeDialogService : IDialogService
     public string? OpenFile(string title, string filter) => null;
 }
 
+/// <summary>
+/// Recording <see cref="ICastingService"/> fake (ST-08). No SSDP/Kestrel/SOAP:
+/// records calls and lets tests drive <see cref="StateChanged"/> /
+/// <see cref="PositionChanged"/> explicitly. Default <see cref="State"/> is
+/// <see cref="CastingState.Idle"/> so the player's casting paths stay dormant.
+/// </summary>
+internal sealed class FakeCastingService : ICastingService
+{
+    public CastingState State { get; private set; } = CastingState.Idle;
+
+    public DlnaDeviceInfo? CurrentDevice { get; private set; }
+
+    public string? ErrorMessage { get; private set; }
+
+    public List<DlnaDeviceInfo> DevicesToReturn { get; } = new();
+
+    public int DiscoverCount { get; private set; }
+
+    public List<(DlnaDeviceInfo Device, string FilePath, string Title)> StartCalls { get; } = new();
+
+    public int PlayCount { get; private set; }
+
+    public int PauseCount { get; private set; }
+
+    public int StopCount { get; private set; }
+
+    public List<TimeSpan> SeekCalls { get; } = new();
+
+    public List<int> VolumeCalls { get; } = new();
+
+    public TimeSpan PositionToReturn { get; set; } = TimeSpan.Zero;
+
+    public event EventHandler<CastingState>? StateChanged;
+
+    public event EventHandler<TimeSpan>? PositionChanged;
+
+    public Task<List<DlnaDeviceInfo>> DiscoverDevicesAsync()
+    {
+        DiscoverCount++;
+        return Task.FromResult(DevicesToReturn.ToList());
+    }
+
+    public Task StartCastingAsync(DlnaDeviceInfo device, string filePath, string title)
+    {
+        StartCalls.Add((device, filePath, title));
+        CurrentDevice = device;
+        RaiseStateChanged(CastingState.Streaming);
+        return Task.CompletedTask;
+    }
+
+    public Task PlayAsync()
+    {
+        PlayCount++;
+        return Task.CompletedTask;
+    }
+
+    public Task PauseAsync()
+    {
+        PauseCount++;
+        return Task.CompletedTask;
+    }
+
+    public Task StopCastingAsync()
+    {
+        StopCount++;
+        CurrentDevice = null;
+        RaiseStateChanged(CastingState.Idle);
+        return Task.CompletedTask;
+    }
+
+    public Task SeekAsync(TimeSpan position)
+    {
+        SeekCalls.Add(position);
+        return Task.CompletedTask;
+    }
+
+    public Task SetVolumeAsync(int volume)
+    {
+        VolumeCalls.Add(volume);
+        return Task.CompletedTask;
+    }
+
+    public Task<TimeSpan> GetPositionAsync() => Task.FromResult(PositionToReturn);
+
+    public void RaiseStateChanged(CastingState state)
+    {
+        State = state;
+        StateChanged?.Invoke(this, state);
+    }
+
+    public void RaisePositionChanged(TimeSpan position)
+        => PositionChanged?.Invoke(this, position);
+}
+
 /// <summary>Recording <see cref="IAppNavigator"/> fake.</summary>
 internal sealed class FakeNavigator : IAppNavigator
 {

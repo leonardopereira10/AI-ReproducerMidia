@@ -7,6 +7,13 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Kestrel embedded HTTP server with Range requests for DLNA casting (ST-08).
+         Shared framework reference: flows transitively to referencing projects and
+         does not interfere with WPF (CATRA.UI / CATRA.App). -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- FFmpeg bindings: D3D11VA hw decode + audio decode (ST-05). -->
     <PackageReference Include="FFmpeg.AutoGen" Version="7.1.1" />
     <!-- WASAPI output for the audio renderer (ST-05). -->

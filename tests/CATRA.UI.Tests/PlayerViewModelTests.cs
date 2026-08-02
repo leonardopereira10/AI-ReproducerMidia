@@ -29,6 +29,7 @@ public sealed class PlayerViewModelTests
         public FakeWatchStateService WatchStateService { get; } = new();
         public FakeDialogService Dialogs { get; } = new();
         public FakeNavigator Navigator { get; } = new();
+        public FakeCastingService Casting { get; } = new();
         public PlayerViewModel ViewModel { get; }
 
         public Fixture(double skipIntroSec = 85.0)
@@ -54,7 +55,7 @@ public sealed class PlayerViewModelTests
             });
 
             ViewModel = new PlayerViewModel(
-                Engine, Episodes, MediaItems, WatchStates, WatchStateService, Dialogs, Navigator);
+                Engine, Episodes, MediaItems, WatchStates, WatchStateService, Dialogs, Navigator, Casting);
         }
 
         public void SetWatchState(double progressPct, double lastPositionSec, bool watched = false)

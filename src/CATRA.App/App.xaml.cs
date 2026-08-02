@@ -7,6 +7,7 @@ using CATRA.Core.Navigation;
 using CATRA.Data.Database;
 using CATRA.Data.Repositories;
 using CATRA.Services;
+using CATRA.Services.Casting;
 using CATRA.Services.Library;
 using CATRA.Services.Playback;
 using CATRA.UI.Navigation;
@@ -65,6 +66,15 @@ public partial class App : Application
                     () => sp.GetRequiredService<IVideoRenderer>(),
                     () => sp.GetRequiredService<IAudioRenderer>()));
 
+                // DLNA casting (ST-08): SSDP discovery, embedded Kestrel media
+                // server (Range requests), AVTransport/RenderingControl SOAP clients
+                // and the orchestrator (1s position polling by default).
+                services.AddSingleton<IDlnaDiscoveryService, DlnaDiscoveryService>();
+                services.AddSingleton<IMediaHttpServer>(_ => new MediaHttpServer());
+                services.AddSingleton<IAvTransportClient, AvTransportClient>();
+                services.AddSingleton<IRenderingControlClient, RenderingControlClient>();
+                services.AddSingleton<ICastingService, CastingService>();
+
                 // Library scanning (ST-03): parser, probe, scanner, watcher.
                 // IMediaProbeService is ffprobe-based; the real binary is bundled
                 // later (ST-05, FFmpeg.AutoGen) — until then probing returns null.
@@ -106,6 +116,12 @@ public partial class App : Application
         // Create/migrate the SQLite schema and seed default settings.
         _host.Services.GetRequiredService<DatabaseInitializer>().Initialize();
 
+        // Start the embedded DLNA media server (ST-08): Kestrel on an ephemeral
+        // LAN port, ready before the first cast. The firewall rule attempt is
+        // best-effort (needs elevation; logs the manual instruction otherwise).
+        await _host.Services.GetRequiredService<IMediaHttpServer>().StartAsync();
+        _ = Task.Run(() => FirewallHelper.TryEnsureFirewallRule());
+
         // Initialize theme: apply current theme and start polling.
         var themeService = _host.Services.GetRequiredService<IThemeService>();
         ApplyTheme(themeService.CurrentTheme);
@@ -121,6 +137,13 @@ public partial class App : Application
     {
         if (_host is not null)
         {
+            // Stop the DLNA media server before tearing down the host (ST-08).
+            var mediaServer = _host.Services.GetService<IMediaHttpServer>();
+            if (mediaServer is not null)
+            {
+                await mediaServer.StopAsync();
+            }
+
             var themeService = _host.Services.GetService<IThemeService>();
             if (themeService is not null)
             {

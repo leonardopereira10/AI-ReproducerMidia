@@ -1,0 +1,111 @@
+<UserControl x:Class="CATRA.UI.Controls.CastButtonControl"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:converters="clr-namespace:CATRA.UI.Converters"
+             x:Name="Root">
+    <UserControl.Resources>
+        <converters:BoolToVisibilityConverter x:Key="BoolToVisibility" />
+    </UserControl.Resources>
+
+    <!-- DataContext: PlayerViewModel (inherited from the PlayerView) -->
+    <Grid>
+        <!-- Main button: "📺 Transmitir" → "📺 {device}" while casting (ST-08) -->
+        <Button x:Name="CastButton"
+                Command="{Binding TransmitCommand}"
+                Style="{StaticResource BaseButtonStyle}"
+                ToolTip="Transmissão DLNA (ST-08)">
+            <TextBlock Text="{Binding CastButtonLabel}" />
+        </Button>
+
+        <!-- Device dropdown / casting controls -->
+        <Popup AllowsTransparency="True"
+               IsOpen="{Binding IsCastDropdownOpen, Mode=TwoWay}"
+               Placement="Top"
+               PlacementTarget="{Binding ElementName=CastButton}"
+               StaysOpen="False">
+            <Border MinWidth="250"
+                    Margin="6"
+                    Background="{DynamicResource CardBackgroundBrush}"
+                    BorderBrush="{DynamicResource CardBorderBrush}"
+                    BorderThickness="1"
+                    CornerRadius="6">
+                <Border.Effect>
+                    <DropShadowEffect BlurRadius="10"
+                                      Opacity="0.35"
+                                      ShadowDepth="2" />
+                </Border.Effect>
+
+                <StackPanel Margin="10">
+                    <!-- ── Not casting: device discovery list ─────────────── -->
+                    <StackPanel Visibility="{Binding IsCasting, Converter={StaticResource BoolToVisibility}, ConverterParameter=Invert}">
+                        <TextBlock Margin="0,0,0,6"
+                                   FontWeight="SemiBold"
+                                   Foreground="{DynamicResource WindowForegroundBrush}"
+                                   Text="Transmitir para" />
+
+                        <TextBlock Margin="0,2"
+                                   Foreground="{DynamicResource SectionHeaderForegroundBrush}"
+                                   Text="🔍 Procurando..."
+                                   Visibility="{Binding IsDiscoveringDevices, Converter={StaticResource BoolToVisibility}}" />
+
+                        <ItemsControl ItemsSource="{Binding CastDevices}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <Button Margin="0,2"
+                                            HorizontalContentAlignment="Left"
+                                            Command="{Binding DataContext.CastToDeviceCommand, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                                            CommandParameter="{Binding}"
+                                            Content="{Binding FriendlyName}"
+                                            Style="{StaticResource BaseButtonStyle}"
+                                            ToolTip="{Binding DescriptionUrl}" />
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+
+                        <TextBlock Margin="0,2"
+                                   Foreground="{DynamicResource SectionHeaderForegroundBrush}"
+                                   Text="Nenhum dispositivo encontrado"
+                                   Visibility="{Binding ShowNoDevicesFound, Converter={StaticResource BoolToVisibility}}" />
+                    </StackPanel>
+
+                    <!-- ── Casting: remote transport + volume ─────────────── -->
+                    <StackPanel Visibility="{Binding IsCasting, Converter={StaticResource BoolToVisibility}}">
+                        <TextBlock Margin="0,0,0,6"
+                                   Foreground="{DynamicResource WindowForegroundBrush}"
+                                   Text="{Binding CastStatusText}"
+                                   TextWrapping="Wrap" />
+
+                        <StackPanel HorizontalAlignment="Left" Orientation="Horizontal">
+                            <Button Width="40"
+                                    Command="{Binding CastPlayCommand}"
+                                    Content="▶"
+                                    Style="{StaticResource AccentButtonStyle}"
+                                    ToolTip="Play na TV" />
+                            <Button Width="40"
+                                    Margin="6,0,0,0"
+                                    Command="{Binding CastPauseCommand}"
+                                    Content="⏸"
+                                    Style="{StaticResource BaseButtonStyle}"
+                                    ToolTip="Pause na TV" />
+                            <Button Margin="6,0,0,0"
+                                    Command="{Binding StopCastingCommand}"
+                                    Content="⏹ Parar"
+                                    Style="{StaticResource BaseButtonStyle}"
+                                    ToolTip="Parar transmissão" />
+                        </StackPanel>
+
+                        <DockPanel Margin="0,8,0,0">
+                            <TextBlock DockPanel.Dock="Left"
+                                       Foreground="{DynamicResource WindowForegroundBrush}"
+                                       Text="🔊" />
+                            <Slider Maximum="100"
+                                    Minimum="0"
+                                    TickFrequency="5"
+                                    Value="{Binding Volume, Mode=TwoWay}" />
+                        </DockPanel>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+        </Popup>
+    </Grid>
+</UserControl>

@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using CATRA.Core.Enums;
 using CATRA.Core.Interfaces;
 using CATRA.Core.Models;
@@ -38,6 +39,9 @@ public sealed partial class PlayerViewModel : ObservableObject
     /// <summary>RF-05: progress is persisted on this interval (seconds).</summary>
     public const double ProgressSaveIntervalSec = 5.0;
 
+    /// <summary>ST-08: discovery retry cadence while the device dropdown is open.</summary>
+    public const double CastDiscoveryRetrySec = 10.0;
+
     private readonly IPlaybackEngine _engine;
     private readonly IEpisodeRepository _episodes;
     private readonly IMediaItemRepository _mediaItems;
@@ -45,6 +49,7 @@ public sealed partial class PlayerViewModel : ObservableObject
     private readonly IWatchStateService _watchStateService;
     private readonly IDialogService _dialogs;
     private readonly IAppNavigator _navigator;
+    private readonly ICastingService _casting;
     private readonly SynchronizationContext? _uiContext;
 
     private Episode? _episode;
@@ -55,6 +60,7 @@ public sealed partial class PlayerViewModel : ObservableObject
     private bool _closed;
     private bool _detached;
     private CancellationTokenSource? _progressSaverCts;
+    private CancellationTokenSource? _discoveryRetryCts;
 
     /// <summary>Creates the view model and subscribes to the engine events.</summary>
     public PlayerViewModel(
@@ -64,7 +70,8 @@ public sealed partial class PlayerViewModel : ObservableObject
         IWatchStateRepository watchStates,
         IWatchStateService watchStateService,
         IDialogService dialogs,
-        IAppNavigator navigator)
+        IAppNavigator navigator,
+        ICastingService casting)
     {
         _engine = engine ?? throw new ArgumentNullException(nameof(engine));
         _episodes = episodes ?? throw new ArgumentNullException(nameof(episodes));
@@ -73,6 +80,7 @@ public sealed partial class PlayerViewModel : ObservableObject
         _watchStateService = watchStateService ?? throw new ArgumentNullException(nameof(watchStateService));
         _dialogs = dialogs ?? throw new ArgumentNullException(nameof(dialogs));
         _navigator = navigator ?? throw new ArgumentNullException(nameof(navigator));
+        _casting = casting ?? throw new ArgumentNullException(nameof(casting));
 
         _uiContext = SynchronizationContext.Current;
 
@@ -80,6 +88,9 @@ public sealed partial class PlayerViewModel : ObservableObject
         _engine.StateChanged += OnEngineStateChanged;
         _engine.MediaEnded += OnEngineMediaEnded;
         _engine.Error += OnEngineError;
+
+        _casting.StateChanged += OnCastingStateChanged;
+        _casting.PositionChanged += OnCastingPositionChanged;
     }
 
     /// <summary>Current playback position.</summary>
@@ -141,6 +152,45 @@ public sealed partial class PlayerViewModel : ObservableObject
     /// <summary>Video aspect ratio (width / height) used for letterboxing.</summary>
     [ObservableProperty]
     private double _aspectRatio = 16.0 / 9.0;
+
+    /// <summary>ST-08: a DLNA casting session is active (renderer streaming).</summary>
+    [ObservableProperty]
+    private bool _isCasting;
+
+    /// <summary>ST-08: the TV playback is paused (remote pause state tracker).</summary>
+    [ObservableProperty]
+    private bool _isCastPaused;
+
+    /// <summary>ST-08: an SSDP discovery pass is running.</summary>
+    [ObservableProperty]
+    private bool _isDiscoveringDevices;
+
+    /// <summary>ST-08: the device dropdown is open (drives discovery + 10s retry).</summary>
+    [ObservableProperty]
+    private bool _isCastDropdownOpen;
+
+    /// <summary>ST-08: friendly name of the renderer being cast to.</summary>
+    [ObservableProperty]
+    private string? _castDeviceName;
+
+    /// <summary>ST-08: status bar text ("Transmitindo para {device} [{position}]").</summary>
+    [ObservableProperty]
+    private string _castStatusText = string.Empty;
+
+    /// <summary>ST-08: whether <see cref="CastDevices"/> has any entries.</summary>
+    [ObservableProperty]
+    private bool _hasCastDevices;
+
+    /// <summary>ST-08: show "Nenhum dispositivo encontrado" in the dropdown.</summary>
+    [ObservableProperty]
+    private bool _showNoDevicesFound;
+
+    /// <summary>ST-08: cast button label ("📺 Transmitir" / "📺 {device}").</summary>
+    [ObservableProperty]
+    private string _castButtonLabel = "📺 Transmitir";
+
+    /// <summary>ST-08: renderers found by the last discovery pass.</summary>
+    public ObservableCollection<DlnaDeviceInfo> CastDevices { get; } = new();
 
     /// <summary>The episode being played, once opened.</summary>
     public Episode? Episode => _episode;
@@ -207,6 +257,7 @@ public sealed partial class PlayerViewModel : ObservableObject
 
         StartProgressSaver();
         SkipIntroCommand.NotifyCanExecuteChanged();
+        TransmitCommand.NotifyCanExecuteChanged();
     }
 
     /// <summary>Binds the video renderer to the hosted child window (ST-05).</summary>
@@ -257,10 +308,18 @@ public sealed partial class PlayerViewModel : ObservableObject
         return resume ? watchState.LastPositionSec : 0d;
     }
 
-    /// <summary>Play (re-opening the media when it ended / was stopped).</summary>
+    /// <summary>Play (re-opening the media when it ended / was stopped).
+    /// While casting (ST-08) the command drives the TV instead of the local engine.</summary>
     [RelayCommand]
     private async Task PlayAsync()
     {
+        if (IsCasting)
+        {
+            IsCastPaused = false;
+            await _casting.PlayAsync();
+            return;
+        }
+
         if (_engine.State == PlaybackState.Playing)
         {
             return;
@@ -283,14 +342,38 @@ public sealed partial class PlayerViewModel : ObservableObject
         _engine.Play();
     }
 
-    /// <summary>Pause.</summary>
+    /// <summary>Pause (remote while casting — ST-08).</summary>
     [RelayCommand]
-    private void Pause() => _engine.Pause();
+    private void Pause()
+    {
+        if (IsCasting)
+        {
+            IsCastPaused = true;
+            _ = _casting.PauseAsync();
+            return;
+        }
+
+        _engine.Pause();
+    }
 
     /// <summary>Play/pause toggle bound to the ▶/⏸ button.</summary>
     [RelayCommand]
     private async Task PlayPauseToggleAsync()
     {
+        if (IsCasting)
+        {
+            if (IsCastPaused)
+            {
+                await PlayAsync();
+            }
+            else
+            {
+                Pause();
+            }
+
+            return;
+        }
+
         if (_engine.State == PlaybackState.Playing)
         {
             _engine.Pause();
@@ -313,7 +396,8 @@ public sealed partial class PlayerViewModel : ObservableObject
         SkipIntroCommand.NotifyCanExecuteChanged();
     }
 
-    /// <summary>Seeks to <paramref name="seconds"/> (clamped to the duration).</summary>
+    /// <summary>Seeks to <paramref name="seconds"/> (clamped to the duration).
+    /// While casting (ST-08) the seek goes to the TV via REL_TIME.</summary>
     [RelayCommand]
     private void Seek(double seconds)
     {
@@ -325,6 +409,14 @@ public sealed partial class PlayerViewModel : ObservableObject
         if (Duration > TimeSpan.Zero && seconds > Duration.TotalSeconds)
         {
             seconds = Duration.TotalSeconds;
+        }
+
+        if (IsCasting)
+        {
+            Position = TimeSpan.FromSeconds(seconds);
+            PositionSeconds = seconds;
+            _ = _casting.SeekAsync(TimeSpan.FromSeconds(seconds));
+            return;
         }
 
         _engine.Seek(TimeSpan.FromSeconds(seconds));
@@ -385,10 +477,105 @@ public sealed partial class PlayerViewModel : ObservableObject
     [RelayCommand]
     private void ToggleFullscreen() => IsFullscreen = !IsFullscreen;
 
-    /// <summary>Placeholder until ST-08 implements DLNA transmission.</summary>
+    /// <summary>
+    /// ST-08 (RF-06): toggles the DLNA device dropdown. Enabled only with a
+    /// loaded file; opening starts discovery with a 10s retry while open.
+    /// </summary>
+    [RelayCommand(CanExecute = nameof(CanTransmit))]
+    private void Transmit() => IsCastDropdownOpen = !IsCastDropdownOpen;
+
+    private bool CanTransmit() => _filePath is not null;
+
+    /// <summary>ST-08: runs one SSDP discovery pass and refreshes <see cref="CastDevices"/>.</summary>
     [RelayCommand]
-    private void Transmit()
-        => _dialogs.ShowMessage("Transmitir", "Transmissão DLNA estará disponível em ST-08.");
+    private async Task RefreshCastDevicesAsync()
+    {
+        if (IsDiscoveringDevices)
+        {
+            return;
+        }
+
+        IsDiscoveringDevices = true;
+        try
+        {
+            var devices = await _casting.DiscoverDevicesAsync();
+            RunOnUi(() =>
+            {
+                CastDevices.Clear();
+                foreach (var device in devices)
+                {
+                    CastDevices.Add(device);
+                }
+
+                HasCastDevices = CastDevices.Count > 0;
+                UpdateNoDevicesFound();
+            });
+        }
+        catch (Exception ex)
+        {
+            RunOnUi(() => SetError($"Falha ao procurar dispositivos DLNA: {ex.Message}"));
+        }
+        finally
+        {
+            RunOnUi(() => IsDiscoveringDevices = false);
+        }
+    }
+
+    /// <summary>
+    /// ST-08: starts casting the open file to <paramref name="device"/>. The
+    /// local player pauses (does not stop) while the TV streams.
+    /// </summary>
+    [RelayCommand]
+    private async Task CastToDeviceAsync(DlnaDeviceInfo? device)
+    {
+        if (device is null || _filePath is null)
+        {
+            return;
+        }
+
+        IsCastDropdownOpen = false;
+        _engine.Pause(); // RF-06: local playback pauses, not stops.
+
+        try
+        {
+            await _casting.StartCastingAsync(device, _filePath, Title);
+            IsCastPaused = false;
+        }
+        catch (Exception ex)
+        {
+            SetError($"Falha ao transmitir: {ex.Message}");
+        }
+    }
+
+    /// <summary>ST-08: stops the casting session (server keeps running).</summary>
+    [RelayCommand]
+    private async Task StopCastingAsync()
+    {
+        try
+        {
+            await _casting.StopCastingAsync();
+        }
+        catch (Exception ex)
+        {
+            SetError($"Falha ao parar a transmissão: {ex.Message}");
+        }
+    }
+
+    /// <summary>ST-08: remote play (casting dropdown control).</summary>
+    [RelayCommand]
+    private async Task CastPlayAsync()
+    {
+        IsCastPaused = false;
+        await _casting.PlayAsync();
+    }
+
+    /// <summary>ST-08: remote pause (casting dropdown control).</summary>
+    [RelayCommand]
+    private async Task CastPauseAsync()
+    {
+        IsCastPaused = true;
+        await _casting.PauseAsync();
+    }
 
     /// <summary>Stops playback and navigates back (idempotent).</summary>
     [RelayCommand]
@@ -400,6 +587,7 @@ public sealed partial class PlayerViewModel : ObservableObject
         }
 
         _closed = true;
+        StopCastingFireAndForget(); // ST-08: never leave the TV streaming on exit.
         SaveCurrentProgress(); // RF-05: persist final progress on close.
         _engine.Stop();
         Detach();
@@ -417,6 +605,7 @@ public sealed partial class PlayerViewModel : ObservableObject
             return;
         }
 
+        StopCastingFireAndForget(); // ST-08: stop any active casting session.
         SaveCurrentProgress(); // RF-05: persist final progress on release.
         _engine.Stop();
         Detach();
@@ -432,10 +621,13 @@ public sealed partial class PlayerViewModel : ObservableObject
 
         _detached = true;
         StopProgressSaver();
+        StopDiscoveryRetry();
         _engine.PositionChanged -= OnEnginePositionChanged;
         _engine.StateChanged -= OnEngineStateChanged;
         _engine.MediaEnded -= OnEngineMediaEnded;
         _engine.Error -= OnEngineError;
+        _casting.StateChanged -= OnCastingStateChanged;
+        _casting.PositionChanged -= OnCastingPositionChanged;
     }
 
     partial void OnVolumeChanged(double value)
@@ -446,11 +638,123 @@ public sealed partial class PlayerViewModel : ObservableObject
         }
 
         _engine.SetVolume((float)(Math.Clamp(value, 0d, 100d) / 100d));
+        if (IsCasting)
+        {
+            // ST-08: the slider drives the TV volume while casting.
+            _ = _casting.SetVolumeAsync((int)Math.Round(Math.Clamp(value, 0d, 100d)));
+        }
+
         if (value > 0d && IsMuted)
         {
             IsMuted = false;
         }
     }
+
+    /// <summary>ST-08: dropdown open/close drives discovery + the 10s retry loop.</summary>
+    partial void OnIsDiscoveringDevicesChanged(bool value) => UpdateNoDevicesFound();
+
+    private void UpdateNoDevicesFound()
+        => ShowNoDevicesFound = !IsDiscoveringDevices && !HasCastDevices && !IsCasting;
+
+    partial void OnIsCastDropdownOpenChanged(bool value)
+    {
+        StopDiscoveryRetry();
+        if (value && _filePath is not null)
+        {
+            var cts = new CancellationTokenSource();
+            _discoveryRetryCts = cts;
+            _ = Task.Run(() => DiscoveryRetryLoopAsync(cts.Token));
+        }
+    }
+
+    private async Task DiscoveryRetryLoopAsync(CancellationToken token)
+    {
+        await RefreshCastDevicesAsync();
+        try
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(CastDiscoveryRetrySec));
+            while (await timer.WaitForNextTickAsync(token).ConfigureAwait(false))
+            {
+                await RefreshCastDevicesAsync();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Dropdown closed: retry loop ends.
+        }
+    }
+
+    private void StopDiscoveryRetry()
+    {
+        var cts = _discoveryRetryCts;
+        _discoveryRetryCts = null;
+        if (cts is not null)
+        {
+            cts.Cancel();
+            cts.Dispose();
+        }
+    }
+
+    private void StopCastingFireAndForget()
+    {
+        if (!IsCasting && _casting.State == CastingState.Idle)
+        {
+            return;
+        }
+
+        _casting
+            .StopCastingAsync()
+            .ContinueWith(
+                static t => { _ = t.Exception; },
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted,
+                TaskScheduler.Default);
+    }
+
+    private void OnCastingStateChanged(object? sender, CastingState state)
+        => RunOnUi(() =>
+        {
+            IsCasting = state == CastingState.Streaming;
+            CastDeviceName = _casting.CurrentDevice?.FriendlyName;
+            CastButtonLabel = IsCasting ? $"📺 {CastDeviceName}" : "📺 Transmitir";
+            UpdateNoDevicesFound();
+            CastStatusText = state switch
+            {
+                CastingState.Connecting => "Conectando ao dispositivo...",
+                CastingState.Streaming => $"Transmitindo para {CastDeviceName}",
+                CastingState.Error => _casting.ErrorMessage ?? "Erro na transmissão",
+                _ => string.Empty,
+            };
+
+            if (state == CastingState.Error)
+            {
+                SetError(CastStatusText);
+            }
+
+            if (state == CastingState.Idle)
+            {
+                IsCastPaused = false;
+            }
+
+            TransmitCommand.NotifyCanExecuteChanged();
+        });
+
+    private void OnCastingPositionChanged(object? sender, TimeSpan position)
+        => RunOnUi(() =>
+        {
+            if (!IsCasting)
+            {
+                return;
+            }
+
+            Position = position;
+            PositionSeconds = position.TotalSeconds;
+            if (!string.IsNullOrEmpty(CastDeviceName))
+            {
+                CastStatusText =
+                    $"Transmitindo para {CastDeviceName} [{TimeSpanToStringConverter.Format(position)}]";
+            }
+        });
 
     private void ApplyVolume(double value)
     {
