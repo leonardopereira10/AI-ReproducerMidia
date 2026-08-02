@@ -91,6 +91,13 @@ int SelectHevcTier(int width, int height, double fps)
 #include <AMF/public/include/core/Data.h>
 #include <AMF/public/include/components/VideoEncoderHEVC.h>
 
+// Every AMF interface/type (AMFFactory, AMFContextPtr, AMFComponentPtr,
+// AMFSurfacePtr, AMFBufferPtr, AMFDataPtr, AMF_SURFACE_NV12, the
+// AMF_VIDEO_ENCODER_HEVC_* enums...) lives in namespace amf. The result codes
+// (AMF_RESULT/AMF_OK/...), the amf_* scalar typedefs and the property-ID macros
+// are global. Pull the namespace in once so the rest of this TU reads cleanly.
+using namespace amf;
+
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -101,10 +108,9 @@ namespace {
 
 using Microsoft::WRL::ComPtr;
 
-// Signature of the driver-exported factory creator (resolved by name from
-// amfrt64.dll so we never link an AMF import lib).
-using AmfCreateFactoryFn = AMF_RESULT(AMF_CDECL_CALL*)(amf_uint64 version,
-                                                       AMFFactory** ppFactory);
+// The factory creator is the SDK-declared AMFInit_Fn (Factory.h): the driver
+// exports it by the name AMF_INIT_FUNCTION_NAME ("AMFInit"), resolved at runtime
+// from amfrt64.dll so we never link an AMF import lib.
 
 // RAII guard for the CONSUMER half of the keyed-mutex ping-pong (ST-14/15 fix
 // pattern — identical to upscale_fsr4.cpp). The shared input texture is co-owned
@@ -143,8 +149,9 @@ struct KeyedMutexGuard
 struct AmfEncoder::Impl
 {
     HMODULE amfDll = nullptr; // amfrt64.dll (driver-provided); FreeLibrary'd last
-    AMFFactoryPtr factory;
+    AMFFactory* factory = nullptr; // AMF singleton: NOT refcounted, owned by the DLL
     AMFContextPtr context;
+    AMFContext2Ptr context2; // QI'd from context; carries the DX12 entry points
     AMFComponentPtr encoder;
 
     // Context-owned staging buffer for the most recent Encode packet (or the
@@ -172,8 +179,9 @@ struct AmfEncoder::Impl
         {
             context->Terminate();
         }
-        // factory / context / encoder smart pointers release here (reverse
-        // declaration order: encoder, context, factory).
+        // context / encoder smart pointers release here (reverse declaration
+        // order: encoder, context2, context). `factory` is a non-refcounted AMF
+        // singleton — nothing to Release; it is torn down with the DLL below.
         if (amfDll != nullptr)
         {
             FreeLibrary(amfDll);
@@ -268,19 +276,19 @@ int AmfEncoder::Create(ID3D12Device* device12,
                    "driver installed?", AMF_DLL_NAME);
         return CATRA_ERR_DEVICE;
     }
-    auto createFactory = reinterpret_cast<AmfCreateFactoryFn>(
-        GetProcAddress(d.amfDll, "AMFCreateFactory"));
+    auto createFactory = reinterpret_cast<AMFInit_Fn>(
+        GetProcAddress(d.amfDll, AMF_INIT_FUNCTION_NAME));
     if (createFactory == nullptr)
     {
-        BackendLog(CATRA_LOG_ERROR, "encode_amf: AMFCreateFactory export missing");
+        BackendLog(CATRA_LOG_ERROR, "encode_amf: %s export missing", AMF_INIT_FUNCTION_NAME);
         return CATRA_ERR_DEVICE;
     }
 
     // --- 2. Factory --------------------------------------------------------
-    AMF_RESULT res = createFactory(AMF_VERSION, &d.factory);
+    AMF_RESULT res = createFactory(AMF_FULL_VERSION, &d.factory);
     if (res != AMF_OK || d.factory == nullptr)
     {
-        BackendLog(CATRA_LOG_ERROR, "encode_amf: AMFCreateFactory failed (res=%d)",
+        BackendLog(CATRA_LOG_ERROR, "encode_amf: AMFInit failed (res=%d)",
                    static_cast<int>(res));
         return CATRA_ERR_DEVICE;
     }
@@ -293,21 +301,33 @@ int AmfEncoder::Create(ID3D12Device* device12,
                    static_cast<int>(res));
         return CATRA_ERR_DEVICE;
     }
-    res = d.context->InitDX12(device12);
+    // The DX12 entry points (InitDX12 / CreateSurfaceFromDX12Native) are declared
+    // on AMFContext2, not the base AMFContext returned by CreateContext — QI for it.
+    d.context2 = AMFContext2Ptr(d.context);
+    if (d.context2 == nullptr)
+    {
+        BackendLog(CATRA_LOG_ERROR,
+                   "encode_amf: AMFContext2 QI failed — AMF runtime too old for DX12");
+        return CATRA_ERR_DEVICE;
+    }
+    res = d.context2->InitDX12(device12);
     if (res != AMF_OK)
     {
         BackendLog(CATRA_LOG_ERROR,
-                   "encode_amf: AMFContext::InitDX12 failed (res=%d) — needs an AMD "
+                   "encode_amf: AMFContext2::InitDX12 failed (res=%d) — needs an AMD "
                    "DX12 device with encode support", static_cast<int>(res));
         return CATRA_ERR_DEVICE;
     }
 
     // --- 4. Component (HEVC Main encoder) ----------------------------------
-    res = d.factory->CreateComponent(d.context, AMFVideoEncoderUVD_H265_MAIN, &d.encoder);
+    // AMFVideoEncoder_HEVC ("AMFVideoEncoderHW_HEVC") is the HW HEVC component;
+    // the Main profile is selected via the AMF_VIDEO_ENCODER_HEVC_PROFILE property
+    // set below (there is no per-profile component ID in this SDK revision).
+    res = d.factory->CreateComponent(d.context, AMFVideoEncoder_HEVC, &d.encoder);
     if (res != AMF_OK || d.encoder == nullptr)
     {
         BackendLog(CATRA_LOG_ERROR,
-                   "encode_amf: CreateComponent(AMFVideoEncoderUVD_H265_MAIN) failed "
+                   "encode_amf: CreateComponent(AMFVideoEncoder_HEVC) failed "
                    "(res=%d)", static_cast<int>(res));
         return CATRA_ERR_DEVICE;
     }
@@ -437,7 +457,7 @@ int AmfEncoder::Encode(ID3D12Resource* texture, uint8_t** outBuf, int* outSize)
     // needed; AMF's encoder holds the surface reference in its internal input
     // queue (the 4-8 deep "surface pool" under USAGE_TRANSCONDING).
     AMFSurfacePtr surface;
-    AMF_RESULT res = d.context->CreateSurfaceFromDX12Native(texture, &surface, nullptr);
+    AMF_RESULT res = d.context2->CreateSurfaceFromDX12Native(texture, &surface, nullptr);
     if (res != AMF_OK || surface == nullptr)
     {
         BackendLog(CATRA_LOG_ERROR,
