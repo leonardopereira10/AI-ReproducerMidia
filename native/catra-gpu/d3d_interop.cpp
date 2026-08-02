@@ -410,8 +410,8 @@ int interop_init(ID3D11Device* d3d11_device,
     if (SUCCEEDED(hr))
     {
         hr = device->CreateCommandList(
-            D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
-            reinterpret_cast<ID3D12CommandList**>(cmdList.GetAddressOf()));
+            0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+            IID_PPV_ARGS(cmdList.GetAddressOf()));
         if (SUCCEEDED(hr))
         {
             cmdList->Close(); // parked; backends reset their own lists
