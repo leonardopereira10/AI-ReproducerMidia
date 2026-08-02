@@ -189,6 +189,8 @@ else {
 # When omitted, RIFE compiles to a stub (build still succeeds).
 $onnxArgs = @()
 if (-not [string]::IsNullOrWhiteSpace($OnnxRuntimeRoot)) {
+    # Resolve to absolute path (CMake resolves relative to CMAKE_CURRENT_SOURCE_DIR)
+    $OnnxRuntimeRoot = (Resolve-Path $OnnxRuntimeRoot -ErrorAction Stop).Path
     Write-Host "build-native: ONNX Runtime root = $OnnxRuntimeRoot"
     $onnxArgs += "-DCATRA_ONNXRUNTIME_ROOT=$OnnxRuntimeRoot"
 }

@@ -38,7 +38,7 @@
 #include <d3d11.h>
 #include <d3d12.h>
 #include <d3dcompiler.h>
-#include <d3dx12.h> // CD3DX12_* root-signature helpers (directx-headers / Windows SDK)
+#include <directx/d3dx12.h> // CD3DX12_* root-signature helpers (vcpkg directx-headers)
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 

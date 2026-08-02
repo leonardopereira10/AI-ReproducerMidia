@@ -51,6 +51,7 @@
 #include "catra_gpu.h"
 
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>

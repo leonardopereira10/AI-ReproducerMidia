@@ -11,7 +11,9 @@
 // / P-Invoke boundary (undefined behaviour). Stray exceptions (std::bad_alloc
 // from tensor buffers, mutex failures, ...) surface as CATRA_ERR_UNKNOWN.
 
+#ifndef CATRA_GPU_BUILDING
 #define CATRA_GPU_BUILDING // export the CATRA_API symbols from this TU
+#endif
 #include "catra_gpu.h"
 #include "d3d_interop.h"
 #include "encode_amf.h"
