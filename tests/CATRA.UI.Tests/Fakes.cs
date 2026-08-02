@@ -663,3 +663,30 @@ internal sealed class FakeProcessJobRepository : IProcessJobRepository
             .ToList();
     }
 }
+
+/// <summary>
+/// Scriptable <see cref="IMediaFileResolver"/> fake (ST-20). Records every resolve
+/// call and returns either the configured <see cref="Handler"/> result or a silent
+/// original fallback (no processed file, no fallback dialog).
+/// </summary>
+internal sealed class FakeMediaFileResolver : IMediaFileResolver
+{
+    public List<(int EpisodeId, ProcessProfile Profile)> Calls { get; } = new();
+
+    /// <summary>Custom resolution logic; takes precedence over <see cref="Default"/>.</summary>
+    public Func<int, ProcessProfile, ResolvedMedia>? Handler { get; set; }
+
+    /// <summary>Fallback result when no <see cref="Handler"/> is set.</summary>
+    public ResolvedMedia? Default { get; set; }
+
+    public Task<ResolvedMedia> ResolveAsync(int episodeId, ProcessProfile profile)
+    {
+        Calls.Add((episodeId, profile));
+        if (Handler is not null)
+        {
+            return Task.FromResult(Handler(episodeId, profile));
+        }
+
+        return Task.FromResult(Default ?? new ResolvedMedia(string.Empty, false, null, "📄 Original"));
+    }
+}

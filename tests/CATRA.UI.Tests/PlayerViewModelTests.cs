@@ -1,4 +1,5 @@
 using CATRA.Core.Enums;
+using CATRA.Core.Interfaces;
 using CATRA.Core.Models;
 using CATRA.UI.ViewModels;
 using FluentAssertions;
@@ -30,6 +31,7 @@ public sealed class PlayerViewModelTests
         public FakeDialogService Dialogs { get; } = new();
         public FakeNavigator Navigator { get; } = new();
         public FakeCastingService Casting { get; } = new();
+        public FakeMediaFileResolver Resolver { get; } = new();
         public PlayerViewModel ViewModel { get; }
 
         public Fixture(double skipIntroSec = 85.0)
@@ -54,8 +56,17 @@ public sealed class PlayerViewModelTests
                 DisplayTitle = "Piloto",
             });
 
+            // ST-20: by default resolve to the original episode file (no processed
+            // output, no fallback dialog) so the pre-existing transport tests keep
+            // opening @"C:\media\s01e01.mkv" unchanged.
+            Resolver.Handler = (id, _) =>
+            {
+                var ep = Episodes.GetById(id);
+                return new ResolvedMedia(ep?.FilePath ?? string.Empty, false, null, "📄 Original");
+            };
+
             ViewModel = new PlayerViewModel(
-                Engine, Episodes, MediaItems, WatchStates, WatchStateService, Dialogs, Navigator, Casting);
+                Engine, Episodes, MediaItems, WatchStates, WatchStateService, Dialogs, Navigator, Casting, Resolver);
         }
 
         public void SetWatchState(double progressPct, double lastPositionSec, bool watched = false)
@@ -519,5 +530,150 @@ public sealed class PlayerViewModelTests
         f.Engine.RaisePositionChanged(TimeSpan.FromSeconds(99));
         f.ViewModel.PositionSeconds.Should().Be(42,
             "Dispose must unsubscribe from the singleton engine so no further updates arrive");
+    }
+
+    // ------------------------------------------------------------------
+    // ST-20 — resolved media file (processed vs original) + profile indicator
+    // ------------------------------------------------------------------
+
+    private static readonly DlnaDeviceInfo CastDevice = new()
+    {
+        FriendlyName = "Samsung TV",
+        Udn = "uuid:1",
+        AvTransportControlUrl = "http://192.168.0.42/upnp/control/avt1",
+        RenderingControlUrl = "http://192.168.0.42/upnp/control/rc1",
+    };
+
+    [Fact]
+    public async Task Open_ResolvesLocalProfile_AndOpensProcessedPath()
+    {
+        var f = new Fixture();
+        f.Resolver.Handler = (_, _) =>
+            new ResolvedMedia(@"C:\media\s01e01_local.mp4", true, ProcessProfile.Local, "🖥 1080p135");
+
+        await f.ViewModel.OpenAsync(EpisodeId);
+
+        f.Resolver.Calls.Should().ContainSingle()
+            .Which.Should().Be((EpisodeId, ProcessProfile.Local));
+        f.Engine.OpenedPaths.Should().ContainSingle()
+            .Which.Should().Be(@"C:\media\s01e01_local.mp4");
+        f.ViewModel.ProfileLabel.Should().Be("🖥 1080p135");
+        f.ViewModel.IsProcessedProfile.Should().BeTrue();
+        f.ViewModel.ProfileTooltip.Should().Be("Arquivo processado (RIFE + FSR 4)");
+    }
+
+    [Fact]
+    public async Task Open_OriginalResolved_ShowsOriginalIndicator()
+    {
+        var f = new Fixture(); // default handler resolves to the original
+
+        await f.ViewModel.OpenAsync(EpisodeId);
+
+        f.ViewModel.ProfileLabel.Should().Be("📄 Original");
+        f.ViewModel.IsProcessedProfile.Should().BeFalse();
+        f.ViewModel.ProfileTooltip.Should().Be("Arquivo original");
+        f.Engine.OpenedPaths.Should().ContainSingle()
+            .Which.Should().Be(@"C:\media\s01e01.mkv");
+    }
+
+    [Fact]
+    public async Task Open_FellBackFromProcessed_OffersFallbackDialog_AndPlaysOriginalWhenConfirmed()
+    {
+        var f = new Fixture();
+        f.Resolver.Handler = (_, _) =>
+            new ResolvedMedia(@"C:\media\s01e01.mkv", false, null, "📄 Original")
+            {
+                FellBackFromProcessed = true,
+            };
+        f.Dialogs.ConfirmResults.Enqueue(true); // "Reproduzir Original"
+
+        await f.ViewModel.OpenAsync(EpisodeId);
+
+        f.Dialogs.ConfirmCalls.Should().ContainSingle();
+        f.Dialogs.ConfirmCalls[0].Accept.Should().Be("Reproduzir Original");
+        f.Dialogs.ConfirmCalls[0].Cancel.Should().Be("Cancelar");
+        f.Engine.PlayCount.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task Open_FellBackFromProcessed_UserCancels_AbortsOpen()
+    {
+        var f = new Fixture();
+        f.Resolver.Handler = (_, _) =>
+            new ResolvedMedia(@"C:\media\s01e01.mkv", false, null, "📄 Original")
+            {
+                FellBackFromProcessed = true,
+            };
+        f.Dialogs.ConfirmResults.Enqueue(false); // "Cancelar"
+
+        await f.ViewModel.OpenAsync(EpisodeId);
+
+        f.Engine.OpenedPaths.Should().BeEmpty();
+        f.Engine.PlayCount.Should().Be(0);
+    }
+
+    [Fact]
+    public async Task Open_NeverProcessed_NoFallbackDialog()
+    {
+        var f = new Fixture(); // FellBackFromProcessed == false
+
+        await f.ViewModel.OpenAsync(EpisodeId);
+
+        f.Dialogs.ConfirmCalls.Should().BeEmpty();
+        f.Engine.PlayCount.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task CastToDevice_ResolvesDlnaProfile_AndCastsResolvedPath()
+    {
+        var f = new Fixture();
+        f.Resolver.Handler = (_, prof) => prof == ProcessProfile.Dlna
+            ? new ResolvedMedia(@"C:\media\s01e01_dlna.mp4", true, ProcessProfile.Dlna, "📺 4K55")
+            : new ResolvedMedia(@"C:\media\s01e01.mkv", false, null, "📄 Original");
+        await f.ViewModel.OpenAsync(EpisodeId);
+
+        await f.ViewModel.CastToDeviceCommand.ExecuteAsync(CastDevice);
+
+        f.Resolver.Calls.Should().Contain((EpisodeId, ProcessProfile.Dlna));
+        f.Casting.StartCalls.Should().ContainSingle()
+            .Which.FilePath.Should().Be(@"C:\media\s01e01_dlna.mp4");
+    }
+
+    [Fact]
+    public async Task CastToDevice_FellBackFromProcessed_OffersFallbackDialog()
+    {
+        var f = new Fixture();
+        f.Resolver.Handler = (_, prof) => prof == ProcessProfile.Dlna
+            ? new ResolvedMedia(@"C:\media\s01e01.mkv", false, null, "📄 Original")
+            {
+                FellBackFromProcessed = true,
+            }
+            : new ResolvedMedia(@"C:\media\s01e01.mkv", false, null, "📄 Original");
+        await f.ViewModel.OpenAsync(EpisodeId);
+        f.Dialogs.ConfirmResults.Enqueue(true); // "Transmitir Original"
+
+        await f.ViewModel.CastToDeviceCommand.ExecuteAsync(CastDevice);
+
+        f.Dialogs.ConfirmCalls.Should().ContainSingle()
+            .Which.Accept.Should().Be("Transmitir Original");
+        f.Casting.StartCalls.Should().HaveCount(1);
+    }
+
+    [Fact]
+    public async Task CastToDevice_FellBackFromProcessed_UserCancels_DoesNotCast()
+    {
+        var f = new Fixture();
+        f.Resolver.Handler = (_, prof) => prof == ProcessProfile.Dlna
+            ? new ResolvedMedia(@"C:\media\s01e01.mkv", false, null, "📄 Original")
+            {
+                FellBackFromProcessed = true,
+            }
+            : new ResolvedMedia(@"C:\media\s01e01.mkv", false, null, "📄 Original");
+        await f.ViewModel.OpenAsync(EpisodeId);
+        f.Dialogs.ConfirmResults.Enqueue(false); // "Cancelar"
+
+        await f.ViewModel.CastToDeviceCommand.ExecuteAsync(CastDevice);
+
+        f.Casting.StartCalls.Should().BeEmpty();
     }
 }

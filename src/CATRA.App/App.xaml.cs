@@ -68,6 +68,12 @@ public partial class App : Application
                     () => sp.GetRequiredService<IVideoRenderer>(),
                     () => sp.GetRequiredService<IAudioRenderer>()));
 
+                // Media file resolution (ST-20, RF-05/RF-06): picks the processed
+                // output (per profile) when usable, with RN-09 stale detection and
+                // fallback to the original. Shared by the player (Local) and the
+                // DLNA caster (Dlna).
+                services.AddSingleton<IMediaFileResolver, MediaFileResolver>();
+
                 // DLNA casting (ST-08): SSDP discovery, embedded Kestrel media
                 // server (Range requests), AVTransport/RenderingControl SOAP clients
                 // and the orchestrator (1s position polling by default).

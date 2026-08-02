@@ -39,6 +39,13 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
     /// <summary>RF-05: progress is persisted on this interval (seconds).</summary>
     public const double ProgressSaveIntervalSec = 5.0;
 
+    /// <summary>
+    /// RN-08: processed and original durations must match within this tolerance
+    /// (seconds). Interpolation changes fps/resolution but never the total time,
+    /// so the position mapping is 1:1; a larger gap is logged for diagnosis.
+    /// </summary>
+    public const double DurationMatchToleranceSec = 1.0;
+
     /// <summary>ST-08: discovery retry cadence while the device dropdown is open.</summary>
     public const double CastDiscoveryRetrySec = 10.0;
 
@@ -50,10 +57,12 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
     private readonly IDialogService _dialogs;
     private readonly IAppNavigator _navigator;
     private readonly ICastingService _casting;
+    private readonly IMediaFileResolver _mediaFileResolver;
     private readonly SynchronizationContext? _uiContext;
 
     private Episode? _episode;
     private string? _filePath;
+    private string _castProfileLabel = string.Empty;
     private double _skipIntroSec = DefaultSkipIntroSec;
     private double _volumeBeforeMute = 100.0;
     private bool _applyingVolume;
@@ -71,7 +80,8 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
         IWatchStateService watchStateService,
         IDialogService dialogs,
         IAppNavigator navigator,
-        ICastingService casting)
+        ICastingService casting,
+        IMediaFileResolver mediaFileResolver)
     {
         _engine = engine ?? throw new ArgumentNullException(nameof(engine));
         _episodes = episodes ?? throw new ArgumentNullException(nameof(episodes));
@@ -81,6 +91,7 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
         _dialogs = dialogs ?? throw new ArgumentNullException(nameof(dialogs));
         _navigator = navigator ?? throw new ArgumentNullException(nameof(navigator));
         _casting = casting ?? throw new ArgumentNullException(nameof(casting));
+        _mediaFileResolver = mediaFileResolver ?? throw new ArgumentNullException(nameof(mediaFileResolver));
 
         _uiContext = SynchronizationContext.Current;
 
@@ -133,9 +144,21 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     private string _title = string.Empty;
 
-    /// <summary>Playing-profile indicator (placeholder until ST-20).</summary>
+    /// <summary>Playing-profile indicator (metadata-derived; transport bar).</summary>
     [ObservableProperty]
     private string _profileIndicator = "🖥 —";
+
+    /// <summary>ST-20: resolved playing-profile label ("🖥 1080p135" / "📄 Original").</summary>
+    [ObservableProperty]
+    private string _profileLabel = string.Empty;
+
+    /// <summary>ST-20: tooltip for the profile indicator.</summary>
+    [ObservableProperty]
+    private string _profileTooltip = "Arquivo original";
+
+    /// <summary>ST-20: true when playing a processed file (drives the green indicator).</summary>
+    [ObservableProperty]
+    private bool _isProcessedProfile;
 
     /// <summary>Skip-intro button tooltip ("Pular +1:25").</summary>
     [ObservableProperty]
@@ -220,18 +243,40 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
             _engine.Stop();
         }
 
+        // ST-20 (RF-05): prefer the processed local file, falling back to the
+        // original. When a processed output was expected but is unusable (RN-09
+        // stale / missing file) the user confirms the fallback to the original.
+        var resolved = await _mediaFileResolver.ResolveAsync(episodeId, ProcessProfile.Local);
+        if (!resolved.IsProcessed && resolved.FellBackFromProcessed)
+        {
+            bool useOriginal = _dialogs.Confirm(
+                "Arquivo processado indisponível",
+                "Arquivo processado não disponível. Reproduzir original?",
+                "Reproduzir Original",
+                "Cancelar");
+            if (!useOriginal)
+            {
+                return;
+            }
+        }
+
         _episode = episode;
-        _filePath = episode.FilePath;
+        _filePath = resolved.FilePath;
         _skipIntroSec = mediaItem?.SkipIntroSec ?? DefaultSkipIntroSec;
         SkipIntroTooltip = $"Pular +{TimeSpanToStringConverter.Format(TimeSpan.FromSeconds(_skipIntroSec))}";
         Title = string.IsNullOrWhiteSpace(episode.DisplayTitle) ? episode.FileName : episode.DisplayTitle;
         ErrorMessage = null;
         HasError = false;
+        ProfileLabel = resolved.DisplayLabel;
+        IsProcessedProfile = resolved.IsProcessed;
+        ProfileTooltip = resolved.IsProcessed
+            ? "Arquivo processado (RIFE + FSR 4)"
+            : "Arquivo original";
 
         VideoMetadata metadata;
         try
         {
-            metadata = await _engine.OpenAsync(episode.FilePath);
+            metadata = await _engine.OpenAsync(resolved.FilePath);
         }
         catch (Exception ex)
         {
@@ -243,6 +288,7 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
         DurationSeconds = metadata.Duration.TotalSeconds;
         AspectRatio = metadata.Height > 0 ? (double)metadata.Width / metadata.Height : 16.0 / 9.0;
         ProfileIndicator = BuildProfileIndicator(metadata);
+        ValidateDurationMatch(episode, metadata.Duration);
 
         double resumeAtSec = ResolveResumePosition(watchState);
 
@@ -528,17 +574,35 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
     [RelayCommand]
     private async Task CastToDeviceAsync(DlnaDeviceInfo? device)
     {
-        if (device is null || _filePath is null)
+        if (device is null || _filePath is null || _episode is null)
         {
             return;
         }
 
+        // ST-20 (RF-06): prefer the processed DLNA file, falling back to the
+        // original. When a processed output was expected but is unusable the
+        // user confirms the fallback before the transmission starts.
+        var resolved = await _mediaFileResolver.ResolveAsync(_episode.Id, ProcessProfile.Dlna);
+        if (!resolved.IsProcessed && resolved.FellBackFromProcessed)
+        {
+            bool useOriginal = _dialogs.Confirm(
+                "Transmissão",
+                "Arquivo processado (4K 55fps) não disponível. Transmitir original?",
+                "Transmitir Original",
+                "Cancelar");
+            if (!useOriginal)
+            {
+                return;
+            }
+        }
+
+        _castProfileLabel = resolved.DisplayLabel;
         IsCastDropdownOpen = false;
         _engine.Pause(); // RF-06: local playback pauses, not stops.
 
         try
         {
-            await _casting.StartCastingAsync(device, _filePath, Title);
+            await _casting.StartCastingAsync(device, resolved.FilePath, Title);
             IsCastPaused = false;
         }
         catch (Exception ex)
@@ -729,7 +793,7 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
             CastStatusText = state switch
             {
                 CastingState.Connecting => "Conectando ao dispositivo...",
-                CastingState.Streaming => $"Transmitindo para {CastDeviceName}",
+                CastingState.Streaming => BuildCastStatusText(CastDeviceName, null),
                 CastingState.Error => _casting.ErrorMessage ?? "Erro na transmissão",
                 _ => string.Empty,
             };
@@ -759,8 +823,7 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
             PositionSeconds = position.TotalSeconds;
             if (!string.IsNullOrEmpty(CastDeviceName))
             {
-                CastStatusText =
-                    $"Transmitindo para {CastDeviceName} [{TimeSpanToStringConverter.Format(position)}]";
+                CastStatusText = BuildCastStatusText(CastDeviceName, position);
             }
         });
 
@@ -910,5 +973,48 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
         // Placeholder format (real profile indicator: ST-20).
         string fps = metadata.Fps > 0d ? ((int)Math.Round(metadata.Fps)).ToString() : "?";
         return metadata.Height > 0 ? $"🖥 {metadata.Height}p{fps}" : "🖥 —";
+    }
+
+    /// <summary>
+    /// ST-20: builds the DLNA status-bar text, appending the resolved profile
+    /// label ("Transmitindo para {device} | {label} [position]").
+    /// </summary>
+    private string BuildCastStatusText(string? deviceName, TimeSpan? position)
+    {
+        string text = $"Transmitindo para {deviceName}";
+        if (!string.IsNullOrEmpty(_castProfileLabel))
+        {
+            text += $" | {_castProfileLabel}";
+        }
+
+        if (position is TimeSpan pos)
+        {
+            text += $" [{TimeSpanToStringConverter.Format(pos)}]";
+        }
+
+        return text;
+    }
+
+    /// <summary>
+    /// RN-08: the processed file shares the original's total duration (interpolation
+    /// adds frames, never time), so the position mapping is 1:1 and no conversion is
+    /// needed. When the library knows the original duration, a gap beyond
+    /// <see cref="DurationMatchToleranceSec"/> is logged for diagnosis.
+    /// </summary>
+    private static void ValidateDurationMatch(Episode episode, TimeSpan openedDuration)
+    {
+        if (episode.DurationSec is not double expectedSec || expectedSec <= 0d)
+        {
+            return; // Unknown original duration: nothing to validate against.
+        }
+
+        double delta = Math.Abs(openedDuration.TotalSeconds - expectedSec);
+        if (delta > DurationMatchToleranceSec)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"[PlayerViewModel] RN-08 duration mismatch for episode {episode.Id}: " +
+                $"original {expectedSec:F1}s vs opened {openedDuration.TotalSeconds:F1}s " +
+                $"(delta {delta:F1}s > {DurationMatchToleranceSec:F1}s); timestamp mapping may drift.");
+        }
     }
 }
