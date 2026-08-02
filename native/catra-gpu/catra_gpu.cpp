@@ -408,6 +408,47 @@ void catra_set_log_callback(catra_log_callback cb)
 }
 
 // ===========================================================================
+// Resource ownership / release helpers
+// ===========================================================================
+//
+// Matched deallocators for the caller-owned resources the bridge hands back
+// (upscale destinations, interpolation intermediate arrays + textures). Both
+// are null-safe no-ops and route through GuardCabi so no C++ exception can
+// unwind into the P/Invoke frame.
+
+int catra_release_texture(void* texture)
+{
+    return GuardCabi([&]() -> int {
+        if (texture == nullptr)
+        {
+            return CATRA_OK; // null-safe no-op
+        }
+
+        // ID3D11Texture2D and ID3D12Resource both derive from IUnknown, so the
+        // refcount release goes through the common base regardless of which API
+        // produced the texture (passthrough/interp -> D3D11, FSR 1/4 -> D3D12).
+        static_cast<IUnknown*>(texture)->Release();
+        return CATRA_OK;
+    });
+}
+
+int catra_free(void* ptr)
+{
+    return GuardCabi([&]() -> int {
+        if (ptr == nullptr)
+        {
+            return CATRA_OK; // null-safe no-op
+        }
+
+        // Matches the `new void*[N]` allocation in interp_rife.cpp (CRT heap).
+        // The contained textures must already have been released by the caller
+        // (catra_release_texture); this only frees the pointer array itself.
+        delete[] static_cast<void**>(ptr);
+        return CATRA_OK;
+    });
+}
+
+// ===========================================================================
 // Frame interpolation — RIFE v4 backend (ST-13)
 // ===========================================================================
 

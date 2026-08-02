@@ -13,6 +13,11 @@
 //     integers; 0 is a valid handle, negative is never a handle.
 //   * GPU resources cross the boundary as raw `void*` (ID3D11Texture2D* /
 //     ID3D12Resource*). Ownership stays with the caller unless documented.
+//     Textures handed BACK to the caller by the bridge (catra_upscale_process
+//     dst, each catra_interp_process frame) are caller-owned and must be
+//     released with catra_release_texture; the native frame array returned by
+//     catra_interp_process is caller-owned and must be freed with catra_free.
+//     The encoder never releases its input texture (zero-copy read).
 //   * The log callback is invoked on whatever thread produced the message;
 //     the callee must be thread-safe and must not call back into the bridge.
 //
@@ -125,6 +130,34 @@ CATRA_API int  catra_get_interp_method(void);
 CATRA_API void catra_set_log_callback(catra_log_callback cb);
 
 // ===========================================================================
+// Resource ownership / release helpers
+// ===========================================================================
+//
+// The bridge hands some resources back to the caller (caller-owned):
+//   * catra_upscale_process writes a fresh destination texture to *dst_texture.
+//   * catra_interp_process writes an array of AddRef'd intermediate textures.
+// The encoder reads its input texture zero-copy and NEVER releases it, so the
+// pipeline must release every caller-owned texture itself once it is done with
+// it (after encode). These two helpers are the single, matched way to do that.
+
+// Releases one caller-owned GPU texture previously handed back by the bridge
+// (an upscale destination or an interpolation intermediate). Works for BOTH
+// ID3D11Texture2D* and ID3D12Resource* — each derives from IUnknown, so the
+// release goes through the common refcounted base. Null-safe (NULL is a no-op).
+// Returns CATRA_OK. Must NOT be called on a decoder-owned frame (those are
+// released by the decoder, not the bridge).
+CATRA_API int  catra_release_texture(void* texture);
+
+// Frees a caller-owned native array previously handed back by the bridge —
+// specifically the `void**` frame array from catra_interp_process, which the
+// backend allocates with `new void*[N]` (CRT heap). This is the MATCHING
+// deallocator (`delete[] void**`); freeing it any other way (e.g. CoTaskMemFree
+// / the managed Marshal.FreeHGlobal, which use a different heap) is undefined
+// behaviour. Release each contained texture FIRST (catra_release_texture), then
+// free the array. Null-safe (NULL is a no-op). Returns CATRA_OK.
+CATRA_API int  catra_free(void* ptr);
+
+// ===========================================================================
 // Frame interpolation — RIFE v4 backend (ST-13); FSR 3 FG is a later ST
 // ===========================================================================
 
@@ -137,6 +170,12 @@ CATRA_API int  catra_interp_create(int src_w, int src_h,
 // produces the intermediate frames. On success writes the output frame array
 // to *out_frames and its length to *out_count, and returns the frame count
 // (>= 0). Negative return is a CATRA_ERR_* code.
+//
+// OWNERSHIP: on success the caller owns BOTH the array and every texture in it.
+// The array is allocated with `new void*[N]` — free it with catra_free (NOT
+// CoTaskMemFree / Marshal.FreeHGlobal). Each texture is AddRef'd (refcount 1) —
+// release each with catra_release_texture BEFORE freeing the array. *out_frames
+// stays null on every failure path (nothing to free then).
 CATRA_API int  catra_interp_process(int ctx,
                                     void* frame_a, void* frame_b,
                                     void** out_frames, int* out_count);
@@ -161,8 +200,9 @@ CATRA_API int  catra_upscale_create(int src_w, int src_h,
 // On success writes the destination texture to *dst_texture and returns
 // CATRA_OK. For passthrough the destination is an ID3D11Texture2D*; for
 // FSR 1 / FSR 4 it is an ID3D12Resource* (shared back to D3D11 by the caller).
-// The caller owns the returned texture (Release). *dst_texture stays null on
-// every failure path.
+// OWNERSHIP: the caller owns the returned texture and must release it with
+// catra_release_texture once done (the encoder reads it zero-copy and never
+// releases it). *dst_texture stays null on every failure path.
 CATRA_API int  catra_upscale_process(int ctx,
                                      void* src_texture,
                                      void** dst_texture);

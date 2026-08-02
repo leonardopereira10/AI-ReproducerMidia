@@ -90,6 +90,17 @@ public partial class App : Application
                 // gracefully when the native DLL has not been built yet.
                 services.AddSingleton<INativeBridge, NativeBridge>();
 
+                // Pre-processing pipeline (ST-17): decode → interp → upscale → encode
+                // → mux orchestrator over the native bridge + injectable decoder/muxer.
+                // The decoder is transient (a fresh FFmpeg decoder per episode); the
+                // pipeline is a singleton that creates one via the factory per episode.
+                services.AddTransient<IFrameDecoder, FrameDecoder>();
+                services.AddSingleton<IAudioMuxer, AudioMuxer>();
+                services.AddSingleton<IProcessingPipeline>(sp => new ProcessingPipeline(
+                    sp.GetRequiredService<INativeBridge>(),
+                    () => sp.GetRequiredService<IFrameDecoder>(),
+                    sp.GetRequiredService<IAudioMuxer>()));
+
                 // Thumbnails / covers (ST-09, RF-08, RN-05): ffmpeg CLI frame
                 // grabber behind an injectable extractor + caching service. The
                 // binary is not bundled yet, so extraction degrades to the UI

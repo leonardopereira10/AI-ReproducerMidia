@@ -40,6 +40,9 @@ internal sealed class FakeNativeLibrary : INativeLibrary
     public IntPtr EncodeBuffer { get; set; }
     public int EncodeSize { get; set; }
 
+    public int ReleaseTextureResult { get; set; }
+    public int FreeArrayResult { get; set; }
+
     // Call capture.
     public int InitCallCount { get; private set; }
     public IntPtr LastInitDevice { get; private set; }
@@ -81,6 +84,10 @@ internal sealed class FakeNativeLibrary : INativeLibrary
     public int LastEncodeDestroyContext { get; private set; }
     public int SetLogCallbackCallCount { get; private set; }
     public NativeLogCallback? LastLogCallback { get; private set; }
+    public int ReleaseTextureCallCount { get; private set; }
+    public IntPtr LastReleaseTexturePtr { get; private set; }
+    public int FreeArrayCallCount { get; private set; }
+    public IntPtr LastFreeArrayPtr { get; private set; }
 
     public int Init(IntPtr d3d11Device)
     {
@@ -193,6 +200,20 @@ internal sealed class FakeNativeLibrary : INativeLibrary
     {
         EncodeDestroyCallCount++;
         LastEncodeDestroyContext = context;
+    }
+
+    public int ReleaseTexture(IntPtr texture)
+    {
+        ReleaseTextureCallCount++;
+        LastReleaseTexturePtr = texture;
+        return ReleaseTextureResult;
+    }
+
+    public int FreeArray(IntPtr ptr)
+    {
+        FreeArrayCallCount++;
+        LastFreeArrayPtr = ptr;
+        return FreeArrayResult;
     }
 }
 
@@ -1005,6 +1026,131 @@ public class NativeBridgeEncodeTests
 }
 
 /// <summary>
+/// ST-17 resource-release coverage for <see cref="NativeBridge"/>: the best-effort
+/// <see cref="NativeBridge.ReleaseTexture"/> / <see cref="NativeBridge.FreeNativeArray"/>
+/// helpers forward to the native ABI, are null-safe no-ops, never throw (they run in
+/// cleanup paths), and degrade when the library is unavailable. Driven through
+/// <see cref="FakeNativeLibrary"/> — no DLL.
+/// </summary>
+public class NativeBridgeReleaseTests
+{
+    [Fact]
+    public void ReleaseTexture_ForwardsPointerToNative()
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = true, ReleaseTextureResult = 0 };
+        var bridge = new NativeBridge(lib);
+        var texture = new IntPtr(0x7E57);
+
+        bridge.ReleaseTexture(texture);
+
+        lib.ReleaseTextureCallCount.Should().Be(1);
+        lib.LastReleaseTexturePtr.Should().Be(texture);
+    }
+
+    [Fact]
+    public void ReleaseTexture_NullPointer_IsNoOp()
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = true };
+        var bridge = new NativeBridge(lib);
+
+        bridge.ReleaseTexture(IntPtr.Zero);
+
+        lib.ReleaseTextureCallCount.Should().Be(0, "a null texture is a no-op (native is null-safe too)");
+    }
+
+    [Fact]
+    public void ReleaseTexture_NativeError_DoesNotThrow()
+    {
+        // Cleanup must never surface an error: a negative native code is swallowed (logged).
+        var lib = new FakeNativeLibrary { IsAvailable = true, ReleaseTextureResult = -4 };
+        var bridge = new NativeBridge(lib);
+
+        var act = () => bridge.ReleaseTexture(new IntPtr(1));
+
+        act.Should().NotThrow();
+        lib.ReleaseTextureCallCount.Should().Be(1);
+    }
+
+    [Fact]
+    public void ReleaseTexture_Unavailable_IsNoOp()
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = false };
+        var bridge = new NativeBridge(lib);
+
+        var act = () => bridge.ReleaseTexture(new IntPtr(1));
+
+        act.Should().NotThrow();
+        lib.ReleaseTextureCallCount.Should().Be(0);
+    }
+
+    [Fact]
+    public void FreeNativeArray_ForwardsPointerToNative()
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = true, FreeArrayResult = 0 };
+        var bridge = new NativeBridge(lib);
+        var ptr = new IntPtr(0xB0F0);
+
+        bridge.FreeNativeArray(ptr);
+
+        lib.FreeArrayCallCount.Should().Be(1);
+        lib.LastFreeArrayPtr.Should().Be(ptr);
+    }
+
+    [Fact]
+    public void FreeNativeArray_NullPointer_IsNoOp()
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = true };
+        var bridge = new NativeBridge(lib);
+
+        bridge.FreeNativeArray(IntPtr.Zero);
+
+        lib.FreeArrayCallCount.Should().Be(0);
+    }
+
+    [Fact]
+    public void FreeNativeArray_NativeError_DoesNotThrow()
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = true, FreeArrayResult = -6 };
+        var bridge = new NativeBridge(lib);
+
+        var act = () => bridge.FreeNativeArray(new IntPtr(1));
+
+        act.Should().NotThrow();
+        lib.FreeArrayCallCount.Should().Be(1);
+    }
+
+    [Fact]
+    public void FreeNativeArray_Unavailable_IsNoOp()
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = false };
+        var bridge = new NativeBridge(lib);
+
+        var act = () => bridge.FreeNativeArray(new IntPtr(1));
+
+        act.Should().NotThrow();
+        lib.FreeArrayCallCount.Should().Be(0);
+    }
+
+    [Fact]
+    public void AfterDispose_ReleaseHelpers_AreNoOps()
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = true };
+        var bridge = new NativeBridge(lib);
+        bridge.Dispose();
+
+        var act = () =>
+        {
+            bridge.ReleaseTexture(new IntPtr(1));
+            bridge.FreeNativeArray(new IntPtr(2));
+        };
+
+        act.Should().NotThrow("release helpers are best-effort cleanup and never throw");
+        lib.ReleaseTextureCallCount.Should().Be(0);
+        lib.FreeArrayCallCount.Should().Be(0);
+    }
+}
+
+/// <summary>
 /// Verifies the P/Invoke surface by reflection (no native calls): every entry
 /// point exists, targets <c>catra-gpu.dll</c>, uses <c>Cdecl</c>, and is private
 /// (so it stays invisible to analyzers/consumers).
@@ -1033,6 +1179,8 @@ public class NativeBridgePInvokeSignatureTests
             "catra_encode_frame",
             "catra_encode_flush",
             "catra_encode_destroy",
+            "catra_release_texture",
+            "catra_free",
         };
 
         return names.Select(name => new object[] { name });
@@ -1062,7 +1210,7 @@ public class NativeBridgePInvokeSignatureTests
             .Where(m => m.GetCustomAttribute<DllImportAttribute>() is not null)
             .ToList();
 
-        imports.Should().HaveCount(16, "the full catra_gpu.h C ABI must be declared");
+        imports.Should().HaveCount(18, "the full catra_gpu.h C ABI must be declared");
         imports.Should().OnlyContain(m => m.IsPrivate);
     }
 

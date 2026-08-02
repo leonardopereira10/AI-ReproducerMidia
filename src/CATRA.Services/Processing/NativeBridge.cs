@@ -64,6 +64,9 @@ internal interface INativeLibrary
     int EncodeFrame(int context, IntPtr texture, out IntPtr packetBuffer, out int packetSize);
     int EncodeFlush(int context, out IntPtr packetBuffer, out int packetSize);
     void EncodeDestroy(int context);
+
+    int ReleaseTexture(IntPtr texture);
+    int FreeArray(IntPtr ptr);
 }
 
 /// <summary>
@@ -143,6 +146,10 @@ internal sealed class NativeLibraryLoader : INativeLibrary
 
     public void EncodeDestroy(int context) => catra_encode_destroy(context);
 
+    public int ReleaseTexture(IntPtr texture) => catra_release_texture(texture);
+
+    public int FreeArray(IntPtr ptr) => catra_free(ptr);
+
     // --- P/Invoke surface (private so CA1401 "P/Invokes should not be visible" stays silent) ---
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
@@ -192,6 +199,12 @@ internal sealed class NativeLibraryLoader : INativeLibrary
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     private static extern void catra_encode_destroy(int context);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int catra_release_texture(IntPtr texture);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int catra_free(IntPtr ptr);
 }
 
 /// <summary>
@@ -402,6 +415,42 @@ public sealed class NativeBridge : INativeBridge
         }
 
         _library.EncodeDestroy(ToInt32(context));
+    }
+
+    /// <inheritdoc />
+    public void ReleaseTexture(IntPtr texture)
+    {
+        // Best-effort cleanup: never throw. Null / unavailable / disposed are no-ops;
+        // a negative native code is logged (error level) rather than surfaced, because
+        // this runs inside per-frame finally blocks where an exception would mask the
+        // original outcome and could leak the remaining resources.
+        if (_disposed || !_library.IsAvailable || texture == IntPtr.Zero)
+        {
+            return;
+        }
+
+        int resultCode = _library.ReleaseTexture(texture);
+        if (resultCode < 0)
+        {
+            OnNativeLog($"catra_release_texture failed with error code {resultCode}.", level: 3);
+        }
+    }
+
+    /// <inheritdoc />
+    public void FreeNativeArray(IntPtr ptr)
+    {
+        // Best-effort cleanup (see ReleaseTexture): the array is native `new[]`, so it
+        // must be freed through catra_free — never Marshal.FreeHGlobal (cross-heap UB).
+        if (_disposed || !_library.IsAvailable || ptr == IntPtr.Zero)
+        {
+            return;
+        }
+
+        int resultCode = _library.FreeArray(ptr);
+        if (resultCode < 0)
+        {
+            OnNativeLog($"catra_free failed with error code {resultCode}.", level: 3);
+        }
     }
 
     /// <summary>Releases native resources and detaches the log sink. Idempotent.</summary>

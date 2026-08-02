@@ -671,7 +671,10 @@ int InterpRifeProcess(int ctxHandle,
     const int64_t h = ctx->srcH;
     const std::array<int64_t, 4> frameShape{1, 3, h, w};
 
-    // Output array (caller frees with delete[] + Release on each texture).
+    // Output array (caller-owned): allocated with `new void*[N]` (CRT heap) and
+    // freed by the caller via catra_free (`delete[] void**`); each contained
+    // texture is AddRef'd (refcount 1) and released by the caller via
+    // catra_release_texture BEFORE the array is freed.
     std::unique_ptr<void*[]> results(new void*[static_cast<size_t>(N)]);
     int produced = 0;
 

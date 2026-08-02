@@ -141,4 +141,32 @@ public interface INativeBridge : IDisposable
 
     /// <summary>Destroys an encoder. No-op when unavailable.</summary>
     void DestroyEncoder(IntPtr context);
+
+    // --- Resource release helpers (ST-17 ownership fix) --------------------
+
+    /// <summary>
+    /// Releases a caller-owned GPU texture previously handed back by the bridge
+    /// (an upscale destination from <see cref="ProcessUpscale"/> or an interpolation
+    /// intermediate from <see cref="ProcessInterpolation"/>).
+    /// </summary>
+    /// <remarks>
+    /// Works for both <c>ID3D11Texture2D*</c> and <c>ID3D12Resource*</c> (both are
+    /// <c>IUnknown</c>). Null-safe (<see cref="IntPtr.Zero"/> is a no-op). Best-effort:
+    /// never throws &mdash; a native failure is logged, not surfaced, because this runs
+    /// in cleanup paths. Must NOT be called on decoder-owned frames (those are released
+    /// by <see cref="IFrameDecoder.ReleaseFrame"/>).
+    /// </remarks>
+    void ReleaseTexture(IntPtr texture);
+
+    /// <summary>
+    /// Frees a caller-owned native frame array previously handed back by
+    /// <see cref="ProcessInterpolation"/>.
+    /// </summary>
+    /// <remarks>
+    /// The array is allocated natively with <c>new void*[N]</c> (CRT heap); this is the
+    /// matching deallocator. Release each contained texture with <see cref="ReleaseTexture"/>
+    /// FIRST, then free the array. Null-safe. Best-effort: never throws. Do NOT free this
+    /// buffer with <c>Marshal.FreeHGlobal</c> (different heap &rarr; undefined behaviour).
+    /// </remarks>
+    void FreeNativeArray(IntPtr ptr);
 }
