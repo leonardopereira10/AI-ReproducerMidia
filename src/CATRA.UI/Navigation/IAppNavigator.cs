@@ -16,6 +16,9 @@ public interface IAppNavigator
     /// <summary>Navigates to the player screen (Tela 4) for the given episode.</summary>
     void GoToPlayer(int episodeId);
 
+    /// <summary>Navigates to the settings screen (Tela 6).</summary>
+    void GoToSettings();
+
     /// <summary>Goes back in the navigation stack; falls back to Home.</summary>
     void GoBack();
 }

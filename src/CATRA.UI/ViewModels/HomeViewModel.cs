@@ -2,7 +2,6 @@ using System.Collections.ObjectModel;
 using System.Windows;
 using CATRA.Core.Library;
 using CATRA.UI.Navigation;
-using CATRA.UI.Services;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 
@@ -24,7 +23,6 @@ public sealed partial class HomeViewModel : ObservableObject, IDisposable
 {
     private readonly ILibraryService _library;
     private readonly IAppNavigator _navigator;
-    private readonly IDialogService _dialogs;
 
     private IReadOnlyList<MediaItemSummary> _allItems = [];
     private bool _isLoading;
@@ -35,11 +33,10 @@ public sealed partial class HomeViewModel : ObservableObject, IDisposable
     private bool _disposed;
 
     /// <summary>Creates the view model with its dependencies.</summary>
-    public HomeViewModel(ILibraryService library, IAppNavigator navigator, IDialogService dialogs)
+    public HomeViewModel(ILibraryService library, IAppNavigator navigator)
     {
         _library = library ?? throw new ArgumentNullException(nameof(library));
         _navigator = navigator ?? throw new ArgumentNullException(nameof(navigator));
-        _dialogs = dialogs ?? throw new ArgumentNullException(nameof(dialogs));
         _library.LibraryUpdated += OnLibraryUpdated;
     }
 
@@ -140,10 +137,9 @@ public sealed partial class HomeViewModel : ObservableObject, IDisposable
         }
     }
 
-    /// <summary>Settings placeholder (real settings screen is ST-11).</summary>
+    /// <summary>Opens the settings screen (Tela 6, ST-11).</summary>
     [RelayCommand]
-    private void OpenSettings() =>
-        _dialogs.ShowMessage("Configurações", "A tela de configurações chega em ST-11.");
+    private void OpenSettings() => _navigator.GoToSettings();
 
     async partial void OnSelectedCategoryChanged(CategoryTab? value)
     {

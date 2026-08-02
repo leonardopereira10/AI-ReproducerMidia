@@ -1,0 +1,215 @@
+<Page x:Class="CATRA.UI.Views.SettingsView"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      xmlns:converters="clr-namespace:CATRA.UI.Converters"
+      Background="{DynamicResource WindowBackgroundBrush}"
+      KeepAlive="True"
+      Title="CATRA — Configurações">
+    <Page.Resources>
+        <converters:AppThemeToLabelConverter x:Key="AppThemeToLabel" />
+
+        <Style x:Key="SectionTitle" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="18" />
+            <Setter Property="FontWeight" Value="Bold" />
+            <Setter Property="Margin" Value="0,16,0,8" />
+            <Setter Property="Foreground" Value="{DynamicResource WindowForegroundBrush}" />
+        </Style>
+
+        <Style x:Key="FieldLabel" TargetType="TextBlock">
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Setter Property="Margin" Value="0,0,8,0" />
+            <Setter Property="Foreground" Value="{DynamicResource WindowForegroundBrush}" />
+        </Style>
+
+        <Style x:Key="ErrorLabel" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="{DynamicResource ErrorForegroundBrush}" />
+            <Setter Property="Margin" Value="120,2,0,0" />
+            <Setter Property="FontSize" Value="11" />
+        </Style>
+
+        <Style x:Key="Row" TargetType="DockPanel">
+            <Setter Property="Margin" Value="0,4" />
+            <Setter Property="LastChildFill" Value="False" />
+        </Style>
+    </Page.Resources>
+
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <!-- Header: back + title -->
+        <StackPanel Grid.Row="0" Orientation="Horizontal">
+            <Button VerticalAlignment="Center"
+                    Command="{Binding GoBackCommand}"
+                    Content="← Voltar"
+                    Style="{StaticResource BaseButtonStyle}" />
+            <TextBlock Margin="16,0,0,0"
+                       VerticalAlignment="Center"
+                       FontSize="22"
+                       FontWeight="Bold"
+                       Foreground="{DynamicResource WindowForegroundBrush}"
+                       Text="⚙️ Configurações" />
+        </StackPanel>
+
+        <ScrollViewer Grid.Row="1"
+                      Margin="0,8,0,0"
+                      HorizontalScrollBarVisibility="Disabled"
+                      VerticalScrollBarVisibility="Auto">
+            <StackPanel MaxWidth="640" HorizontalAlignment="Left">
+
+                <!-- ===================== Biblioteca ===================== -->
+                <TextBlock Style="{StaticResource SectionTitle}" Text="Biblioteca" />
+                <DockPanel Style="{StaticResource Row}">
+                    <TextBlock Style="{StaticResource FieldLabel}" Text="Pasta raiz:" />
+                    <Button DockPanel.Dock="Right"
+                            Command="{Binding BrowseRootFolderCommand}"
+                            Content="Browse"
+                            Style="{StaticResource BaseButtonStyle}" />
+                    <TextBox Margin="0,0,8,0"
+                             Padding="6,4"
+                             VerticalContentAlignment="Center"
+                             Text="{Binding RootFolder, UpdateSourceTrigger=PropertyChanged}" />
+                </DockPanel>
+                <TextBlock Style="{StaticResource ErrorLabel}" Text="{Binding RootFolderError}" />
+                <CheckBox Margin="0,4"
+                          Content="Auto-scan"
+                          Foreground="{DynamicResource WindowForegroundBrush}"
+                          IsChecked="{Binding AutoScan}" />
+
+                <!-- ===================== Player ===================== -->
+                <TextBlock Style="{StaticResource SectionTitle}" Text="Player" />
+                <DockPanel Style="{StaticResource Row}">
+                    <TextBlock Style="{StaticResource FieldLabel}" Text="Skip intro padrão (s):" />
+                    <TextBlock DockPanel.Dock="Right"
+                               Margin="8,0,0,0"
+                               VerticalAlignment="Center"
+                               Foreground="{DynamicResource SectionHeaderForegroundBrush}"
+                               Text="{Binding SkipIntroDisplay}" />
+                    <TextBox Width="80"
+                             Padding="6,4"
+                             VerticalContentAlignment="Center"
+                             Text="{Binding SkipIntroSec, UpdateSourceTrigger=PropertyChanged}" />
+                </DockPanel>
+                <TextBlock Style="{StaticResource ErrorLabel}" Text="{Binding SkipIntroError}" />
+                <DockPanel Style="{StaticResource Row}">
+                    <TextBlock Style="{StaticResource FieldLabel}" Text="Tema:" />
+                    <ComboBox Width="180"
+                              ItemsSource="{Binding ThemeOptions}"
+                              SelectedItem="{Binding SelectedTheme}">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding Converter={StaticResource AppThemeToLabel}}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
+                </DockPanel>
+
+                <!-- ===================== DLNA ===================== -->
+                <TextBlock Style="{StaticResource SectionTitle}" Text="DLNA" />
+                <DockPanel Style="{StaticResource Row}">
+                    <TextBlock Style="{StaticResource FieldLabel}" Text="Porta HTTP:" />
+                    <TextBox Width="120"
+                             Padding="6,4"
+                             VerticalContentAlignment="Center"
+                             Text="{Binding DlnaHttpPort, UpdateSourceTrigger=PropertyChanged}" />
+                </DockPanel>
+                <TextBlock Style="{StaticResource ErrorLabel}" Text="{Binding PortError}" />
+                <CheckBox Margin="0,4"
+                          Content="Transmitir processado por padrão"
+                          Foreground="{DynamicResource WindowForegroundBrush}"
+                          IsChecked="{Binding DlnaTransmitProcessed}" />
+
+                <!-- ===================== Armazenamento ===================== -->
+                <TextBlock Style="{StaticResource SectionTitle}" Text="Armazenamento" />
+                <DockPanel Style="{StaticResource Row}">
+                    <TextBlock Style="{StaticResource FieldLabel}" Text="Pasta processados:" />
+                    <Button DockPanel.Dock="Right"
+                            Command="{Binding BrowseProcessedFolderCommand}"
+                            Content="Browse"
+                            Style="{StaticResource BaseButtonStyle}" />
+                    <TextBox Margin="0,0,8,0"
+                             Padding="6,4"
+                             VerticalContentAlignment="Center"
+                             Text="{Binding ProcessedFolder, UpdateSourceTrigger=PropertyChanged}" />
+                </DockPanel>
+                <CheckBox Margin="0,4"
+                          Content="Limpar ao fechar (recomendado)"
+                          Foreground="{DynamicResource WindowForegroundBrush}"
+                          IsChecked="{Binding CleanupOnClose}" />
+                <DockPanel Style="{StaticResource Row}">
+                    <TextBlock Style="{StaticResource FieldLabel}" Text="Uso atual:" />
+                    <Button DockPanel.Dock="Right"
+                            Command="{Binding CleanNowCommand}"
+                            Content="Limpar agora"
+                            Style="{StaticResource AccentButtonStyle}" />
+                    <TextBlock VerticalAlignment="Center"
+                               Foreground="{DynamicResource WindowForegroundBrush}"
+                               Text="{Binding UsageText}" />
+                </DockPanel>
+
+                <!-- ============ Processamento (Fase 2 — disabled) ============ -->
+                <StackPanel IsEnabled="False" Opacity="0.6">
+                    <TextBlock Style="{StaticResource SectionTitle}" Text="Processamento (Fase 2)" />
+                    <DockPanel Style="{StaticResource Row}">
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="Janela de episódios:" />
+                        <TextBox Width="80"
+                                 Padding="6,4"
+                                 Text="{Binding WindowSize, UpdateSourceTrigger=PropertyChanged}" />
+                    </DockPanel>
+                    <DockPanel Style="{StaticResource Row}">
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="Método interpolação:" />
+                        <ComboBox Width="160"
+                                  ItemsSource="{Binding InterpOptions}"
+                                  SelectedItem="{Binding InterpMethod}" />
+                    </DockPanel>
+                    <DockPanel Style="{StaticResource Row}">
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="Método upscale:" />
+                        <ComboBox Width="160"
+                                  ItemsSource="{Binding UpscaleOptions}"
+                                  SelectedItem="{Binding UpscaleMethod}" />
+                    </DockPanel>
+
+                    <TextBlock Margin="0,8,0,4"
+                               FontWeight="SemiBold"
+                               Foreground="{DynamicResource SectionHeaderForegroundBrush}"
+                               Text="Perfil Local" />
+                    <DockPanel Style="{StaticResource Row}">
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="Resolução:" />
+                        <TextBox Width="70" Padding="6,4" Text="{Binding LocalWidth, UpdateSourceTrigger=PropertyChanged}" />
+                        <TextBlock Margin="6,0" VerticalAlignment="Center" Text="x" />
+                        <TextBox Width="70" Padding="6,4" Text="{Binding LocalHeight, UpdateSourceTrigger=PropertyChanged}" />
+                        <TextBlock Margin="12,0,0,0" Style="{StaticResource FieldLabel}" Text="FPS:" />
+                        <TextBox Width="70" Padding="6,4" Text="{Binding LocalFps, UpdateSourceTrigger=PropertyChanged}" />
+                        <TextBlock Margin="12,0,0,0" Style="{StaticResource FieldLabel}" Text="Bitrate:" />
+                        <TextBox Width="90" Padding="6,4" Text="{Binding LocalBitrate, UpdateSourceTrigger=PropertyChanged}" />
+                    </DockPanel>
+
+                    <TextBlock Margin="0,8,0,4"
+                               FontWeight="SemiBold"
+                               Foreground="{DynamicResource SectionHeaderForegroundBrush}"
+                               Text="Perfil DLNA" />
+                    <DockPanel Style="{StaticResource Row}">
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="Resolução:" />
+                        <TextBox Width="70" Padding="6,4" Text="{Binding DlnaWidth, UpdateSourceTrigger=PropertyChanged}" />
+                        <TextBlock Margin="6,0" VerticalAlignment="Center" Text="x" />
+                        <TextBox Width="70" Padding="6,4" Text="{Binding DlnaHeight, UpdateSourceTrigger=PropertyChanged}" />
+                        <TextBlock Margin="12,0,0,0" Style="{StaticResource FieldLabel}" Text="FPS:" />
+                        <TextBox Width="70" Padding="6,4" Text="{Binding DlnaFps, UpdateSourceTrigger=PropertyChanged}" />
+                        <TextBlock Margin="12,0,0,0" Style="{StaticResource FieldLabel}" Text="Bitrate:" />
+                        <TextBox Width="90" Padding="6,4" Text="{Binding DlnaBitrate, UpdateSourceTrigger=PropertyChanged}" />
+                    </DockPanel>
+                </StackPanel>
+            </StackPanel>
+        </ScrollViewer>
+
+        <!-- Status bar -->
+        <TextBlock Grid.Row="2"
+                   Margin="0,8,0,0"
+                   Foreground="{DynamicResource SectionHeaderForegroundBrush}"
+                   Text="{Binding StatusMessage}"
+                   TextTrimming="CharacterEllipsis" />
+    </Grid>
+</Page>

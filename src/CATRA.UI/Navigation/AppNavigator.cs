@@ -29,6 +29,9 @@ public sealed class AppNavigator : IAppNavigator
         _navigation.Navigate(typeof(PlayerView), episodeId);
 
     /// <inheritdoc />
+    public void GoToSettings() => _navigation.Navigate(typeof(SettingsView));
+
+    /// <inheritdoc />
     public void GoBack()
     {
         if (_navigation.CanGoBack)

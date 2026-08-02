@@ -19,6 +19,7 @@
     <Color x:Key="BadgeBackgroundColor">#60CDFF</Color>
     <Color x:Key="BadgeForegroundColor">#1E1E1E</Color>
     <Color x:Key="PlayerBackgroundColor">#000000</Color>
+    <Color x:Key="ErrorForegroundColor">#FF6B5B</Color>
 
     <!-- Dark Theme Brushes -->
     <SolidColorBrush x:Key="WindowBackgroundBrush" Color="{StaticResource WindowBackgroundColor}" />
@@ -38,5 +39,6 @@
     <SolidColorBrush x:Key="BadgeBackgroundBrush" Color="{StaticResource BadgeBackgroundColor}" />
     <SolidColorBrush x:Key="BadgeForegroundBrush" Color="{StaticResource BadgeForegroundColor}" />
     <SolidColorBrush x:Key="PlayerBackgroundBrush" Color="{StaticResource PlayerBackgroundColor}" />
+    <SolidColorBrush x:Key="ErrorForegroundBrush" Color="{StaticResource ErrorForegroundColor}" />
 
 </ResourceDictionary>

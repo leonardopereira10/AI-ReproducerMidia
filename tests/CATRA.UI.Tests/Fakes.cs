@@ -255,6 +255,8 @@ internal sealed class FakeNavigator : IAppNavigator
 
     public int BackCount { get; private set; }
 
+    public int SettingsCount { get; private set; }
+
     public List<int> DetailIds { get; } = new();
 
     public List<int> PlayerIds { get; } = new();
@@ -264,6 +266,8 @@ internal sealed class FakeNavigator : IAppNavigator
     public void GoToMediaDetail(int mediaItemId) => DetailIds.Add(mediaItemId);
 
     public void GoToPlayer(int episodeId) => PlayerIds.Add(episodeId);
+
+    public void GoToSettings() => SettingsCount++;
 
     public void GoBack() => BackCount++;
 }
@@ -389,4 +393,97 @@ internal sealed class FakeWatchStateRepository : IWatchStateRepository
 
     public IReadOnlyList<WatchState> GetInProgress()
         => _byId.Values.Where(s => !s.Watched && s.ProgressPct > 0d).ToList();
+}
+
+/// <summary>In-memory <see cref="IAppSettingsRepository"/> (records writes).</summary>
+internal sealed class FakeAppSettingsRepository : IAppSettingsRepository
+{
+    private readonly Dictionary<string, string> _values = new();
+
+    public FakeAppSettingsRepository()
+    {
+    }
+
+    public FakeAppSettingsRepository(IDictionary<string, string> seed)
+    {
+        foreach (var kv in seed)
+        {
+            _values[kv.Key] = kv.Value;
+        }
+    }
+
+    public List<(string Key, string Value)> SetCalls { get; } = new();
+
+    public string? Get(string key) => _values.GetValueOrDefault(key);
+
+    public void Set(string key, string value)
+    {
+        _values[key] = value;
+        SetCalls.Add((key, value));
+    }
+
+    public IReadOnlyDictionary<string, string> GetAll() => _values;
+}
+
+/// <summary>Recording <see cref="IThemeService"/> fake (no polling/persistence).</summary>
+internal sealed class FakeThemeService : IThemeService
+{
+    public AppTheme CurrentTheme { get; private set; } = AppTheme.Dark;
+
+    public AppTheme Override { get; private set; } = AppTheme.System;
+
+    public List<AppTheme> OverrideCalls { get; } = new();
+
+    public int StartCount { get; private set; }
+
+    public int StopCount { get; private set; }
+
+    public event EventHandler<AppTheme>? ThemeChanged;
+
+    public void SetOverride(AppTheme theme)
+    {
+        Override = theme;
+        OverrideCalls.Add(theme);
+        ThemeChanged?.Invoke(this, theme);
+    }
+
+    public void Start() => StartCount++;
+
+    public void Stop() => StopCount++;
+}
+
+/// <summary>Recording <see cref="ILibraryScanner"/> fake (no filesystem scan).</summary>
+internal sealed class FakeLibraryScanner : ILibraryScanner
+{
+    public List<string?> ScanCalls { get; } = new();
+
+    public Exception? ThrowOnScan { get; set; }
+
+    public Task<LibraryScanSummary> ScanAsync(
+        string? rootFolder = null,
+        IProgress<ScanProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        ScanCalls.Add(rootFolder);
+        if (ThrowOnScan is not null)
+        {
+            throw ThrowOnScan;
+        }
+
+        return Task.FromResult(new LibraryScanSummary());
+    }
+}
+
+/// <summary>Scriptable <see cref="IFolderPicker"/> fake (no Win32 dialog).</summary>
+internal sealed class FakeFolderPicker : IFolderPicker
+{
+    public string? Result { get; set; }
+
+    public List<string> Titles { get; } = new();
+
+    public string? PickFolder(string title)
+    {
+        Titles.Add(title);
+        return Result;
+    }
 }

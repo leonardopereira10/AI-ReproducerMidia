@@ -90,9 +90,11 @@ public partial class App : Application
 
                 // UI services + view models (ST-04: Home / Detail, ST-06: Player)
                 services.AddSingleton<IDialogService, DialogService>();
+                services.AddSingleton<IFolderPicker, FolderPicker>();
                 services.AddTransient<HomeViewModel>();
                 services.AddTransient<MediaDetailViewModel>();
                 services.AddTransient<PlayerViewModel>();
+                services.AddTransient<SettingsViewModel>();
 
                 // Theme
                 services.AddSingleton<ISystemThemeDetector, SystemThemeDetector>();
