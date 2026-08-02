@@ -27,4 +27,11 @@
     <ProjectReference Include="..\CATRA.Data\CATRA.Data.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- ST-12: let NativeBridgeTests drive the internal INativeLibrary seam
+         (fake loader) so the P/Invoke wrapper logic is testable without the
+         native catra-gpu.dll. -->
+    <InternalsVisibleTo Include="CATRA.Services.Tests" />
+  </ItemGroup>
+
 </Project>

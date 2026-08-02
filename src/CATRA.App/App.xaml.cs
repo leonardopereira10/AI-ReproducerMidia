@@ -11,6 +11,7 @@ using CATRA.Services.Casting;
 using CATRA.Services.Library;
 using CATRA.Services.Metadata;
 using CATRA.Services.Playback;
+using CATRA.Services.Processing;
 using CATRA.UI.Navigation;
 using CATRA.UI.Services;
 using CATRA.UI.ViewModels;
@@ -83,6 +84,11 @@ public partial class App : Application
                 services.AddSingleton<IMediaProbeService, FfprobeMediaProbeService>();
                 services.AddSingleton<ILibraryScanner, LibraryScanner>();
                 services.AddSingleton<ILibraryWatcher, LibraryWatcher>();
+
+                // Native GPU bridge (ST-12): P/Invoke wrapper over catra-gpu.dll
+                // (FSR 4 / RIFE / AMF, delivered in ST-13..ST-16). Degrades
+                // gracefully when the native DLL has not been built yet.
+                services.AddSingleton<INativeBridge, NativeBridge>();
 
                 // Thumbnails / covers (ST-09, RF-08, RN-05): ffmpeg CLI frame
                 // grabber behind an injectable extractor + caching service. The

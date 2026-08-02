@@ -15,4 +15,18 @@
     <ProjectReference Include="..\CATRA.UI\CATRA.UI.csproj" />
   </ItemGroup>
 
+  <!-- ST-12: deploy the native bridge DLL when it has been built.
+       scripts/build-native.ps1 installs it under native/catra-gpu/install/
+       runtimes/win-x64/native/. Copying it to the same relative path in the
+       output dir puts it on the .NET native probe path, so DllImport(
+       "catra-gpu.dll") resolves it. The Condition keeps `dotnet build` green
+       on machines where the native toolchain has not run (NativeBridge then
+       degrades to "unavailable"). -->
+  <PropertyGroup>
+    <CatraNativeDll>$(MSBuildThisFileDirectory)..\..\native\catra-gpu\install\runtimes\win-x64\native\catra-gpu.dll</CatraNativeDll>
+  </PropertyGroup>
+  <ItemGroup Condition="Exists('$(CatraNativeDll)')">
+    <None Include="$(CatraNativeDll)" CopyToOutputDirectory="PreserveNewest" Link="runtimes\win-x64\native\catra-gpu.dll" Visible="false" />
+  </ItemGroup>
+
 </Project>
