@@ -13,4 +13,7 @@ public interface IProcessedFileRepository : IRepository<ProcessedFile>
 
     /// <summary>Returns all processed files for an episode.</summary>
     IReadOnlyList<ProcessedFile> GetByEpisode(int episodeId);
+
+    /// <summary>Deletes every row. Returns the number of rows removed (ST-21).</summary>
+    int DeleteAll();
 }

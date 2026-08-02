@@ -629,6 +629,13 @@ internal sealed class FakeProcessedFileRepository : IProcessedFileRepository
 
     public IReadOnlyList<ProcessedFile> GetByEpisode(int episodeId)
         => _byId.Values.Where(f => f.EpisodeId == episodeId).ToList();
+
+    public int DeleteAll()
+    {
+        int count = _byId.Count;
+        _byId.Clear();
+        return count;
+    }
 }
 
 /// <summary>In-memory <see cref="IProcessJobRepository"/>.</summary>
@@ -661,6 +668,13 @@ internal sealed class FakeProcessJobRepository : IProcessJobRepository
             .Where(j => ids.Contains(j.EpisodeId)
                 && (j.Status == JobStatus.Queued || j.Status == JobStatus.Processing))
             .ToList();
+    }
+
+    public int DeleteAll()
+    {
+        int count = _byId.Count;
+        _byId.Clear();
+        return count;
     }
 }
 

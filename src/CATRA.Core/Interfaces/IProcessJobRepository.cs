@@ -12,4 +12,7 @@ public interface IProcessJobRepository : IRepository<ProcessJob>
     /// ordered by priority descending then creation ascending.
     /// </summary>
     IReadOnlyList<ProcessJob> GetActiveByMediaItem(int mediaItemId);
+
+    /// <summary>Deletes every row. Returns the number of rows removed (ST-21).</summary>
+    int DeleteAll();
 }

@@ -3,6 +3,7 @@ using System.Windows;
 using CATRA.Core.Enums;
 using CATRA.Core.Interfaces;
 using CATRA.Core.Library;
+using CATRA.Core.Models;
 using CATRA.Core.Navigation;
 using CATRA.Data.Database;
 using CATRA.Data.Repositories;
@@ -12,6 +13,7 @@ using CATRA.Services.Library;
 using CATRA.Services.Metadata;
 using CATRA.Services.Playback;
 using CATRA.Services.Processing;
+using CATRA.Services.Storage;
 using CATRA.UI.Navigation;
 using CATRA.UI.Services;
 using CATRA.UI.ViewModels;
@@ -117,6 +119,11 @@ public partial class App : Application
                 services.AddSingleton<IProcessingQueueService, ProcessingQueueService>();
                 services.AddSingleton<ISlidingWindowService, SlidingWindowService>();
 
+                // Cleanup on close + startup (ST-21, RF-04, RN-10): deletes every
+                // processed file on shutdown (cleanup_on_close) and removes crash
+                // orphans on startup. Never force-deletes an in-use/locked file.
+                services.AddSingleton<ICleanupService, CleanupService>();
+
                 // Thumbnails / covers (ST-09, RF-08, RN-05): ffmpeg CLI frame
                 // grabber behind an injectable extractor + caching service. The
                 // binary is not bundled yet, so extraction degrades to the UI
@@ -160,6 +167,11 @@ public partial class App : Application
         // Create/migrate the SQLite schema and seed default settings.
         _host.Services.GetRequiredService<DatabaseInitializer>().Initialize();
 
+        // Startup crash-recovery cleanup (ST-21): removes orphan processed files
+        // left behind by a previous crash. Fire-and-forget so startup never blocks.
+        var startupCleanup = _host.Services.GetRequiredService<ICleanupService>();
+        _ = Task.Run(() => startupCleanup.CleanupOrphansAsync());
+
         // Start the pre-processing queue worker (ST-18): runs crash recovery
         // (processing → failed) then the background processing loop.
         await _host.Services.GetRequiredService<IProcessingQueueService>().StartAsync();
@@ -192,6 +204,22 @@ public partial class App : Application
                 await queue.StopAsync();
             }
 
+            // Cleanup processed files on close (ST-21, RF-04): honours the
+            // cleanup_on_close setting (default true) and is capped at 10s so
+            // shutdown is never blocked by a locked file.
+            var cleanup = _host.Services.GetService<ICleanupService>();
+            if (cleanup is not null && IsCleanupOnClose(_host.Services))
+            {
+                try
+                {
+                    await cleanup.CleanupAllAsync().WaitAsync(TimeSpan.FromSeconds(10));
+                }
+                catch (TimeoutException)
+                {
+                    // Give up waiting — the remaining files become startup orphans.
+                }
+            }
+
             // Stop the DLNA media server before tearing down the host (ST-08).
             var mediaServer = _host.Services.GetService<IMediaHttpServer>();
             if (mediaServer is not null)
@@ -212,6 +240,17 @@ public partial class App : Application
         }
 
         base.OnExit(e);
+    }
+
+    /// <summary>
+    /// Reads the <c>cleanup_on_close</c> setting (ST-21). Defaults to <c>true</c>
+    /// when the key is absent or unparseable.
+    /// </summary>
+    private static bool IsCleanupOnClose(IServiceProvider services)
+    {
+        var settings = services.GetService<IAppSettingsRepository>();
+        string? raw = settings?.Get(AppSettingsModel.CleanupOnCloseKey);
+        return !bool.TryParse(raw, out bool parsed) || parsed;
     }
 
     /// <summary>

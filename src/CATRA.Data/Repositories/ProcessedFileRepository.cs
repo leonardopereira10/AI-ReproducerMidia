@@ -102,6 +102,15 @@ public sealed class ProcessedFileRepository : IProcessedFileRepository
         }
     }
 
+    /// <inheritdoc />
+    public int DeleteAll()
+    {
+        lock (_database.SyncRoot)
+        {
+            return _database.Connection.DeleteAll<ProcessedFileEntity>();
+        }
+    }
+
     private static ProcessedFile ToModel(ProcessedFileEntity e) => new()
     {
         Id = e.Id,

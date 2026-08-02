@@ -93,6 +93,15 @@ public sealed class ProcessJobRepository : IProcessJobRepository
         }
     }
 
+    /// <inheritdoc />
+    public int DeleteAll()
+    {
+        lock (_database.SyncRoot)
+        {
+            return _database.Connection.DeleteAll<ProcessJobEntity>();
+        }
+    }
+
     private static ProcessJob ToModel(ProcessJobEntity e) => new()
     {
         Id = e.Id,
