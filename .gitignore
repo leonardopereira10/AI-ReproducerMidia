@@ -84,3 +84,4 @@ lib/fsr-sdk/
 # the headers the encode backend compiles to a CATRA_ERR_NOT_IMPL stub.
 lib/amf/
 native/catra-gpu/vcpkg_installed/
+native/catra-gpu/build/

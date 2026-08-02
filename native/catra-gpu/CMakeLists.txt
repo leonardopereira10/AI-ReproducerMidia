@@ -45,6 +45,7 @@ if(CATRA_WITH_RIFE)
     if(TARGET onnxruntime::onnxruntime)
         set(CATRA_ONNXRUNTIME_TARGET onnxruntime::onnxruntime)
     elseif(DEFINED CATRA_ONNXRUNTIME_ROOT)
+        get_filename_component(CATRA_ONNXRUNTIME_ROOT "${CATRA_ONNXRUNTIME_ROOT}" ABSOLUTE)
         add_library(catra_onnxruntime_import SHARED IMPORTED)
         set_target_properties(catra_onnxruntime_import PROPERTIES
             INTERFACE_INCLUDE_DIRECTORIES "${CATRA_ONNXRUNTIME_ROOT}/include"
