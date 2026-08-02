@@ -227,6 +227,48 @@ internal sealed class FakeMediaItemRepository : IMediaItemRepository
         => _byId.Values.Where(i => i.CategoryId == categoryId).ToList();
 }
 
+/// <summary>Recording <see cref="IWatchStateService"/> fake (no database).</summary>
+internal sealed class FakeWatchStateService : IWatchStateService
+{
+    public List<(int EpisodeId, double PositionSec, double DurationSec)> SaveProgressCalls { get; } = new();
+
+    public List<(int EpisodeId, double PositionSec, double DurationSec)> CheckAndMarkCalls { get; } = new();
+
+    public List<int> ToggleCalls { get; } = new();
+
+    public List<(int EpisodeId, bool Watched)> MarkCalls { get; } = new();
+
+    public Task SaveProgressAsync(int episodeId, double positionSec, double durationSec)
+    {
+        SaveProgressCalls.Add((episodeId, positionSec, durationSec));
+        return Task.CompletedTask;
+    }
+
+    public Task CheckAndMarkWatchedAsync(int episodeId, double positionSec, double durationSec)
+    {
+        CheckAndMarkCalls.Add((episodeId, positionSec, durationSec));
+        return Task.CompletedTask;
+    }
+
+    public Task ToggleWatchedAsync(int episodeId)
+    {
+        ToggleCalls.Add(episodeId);
+        return Task.CompletedTask;
+    }
+
+    public Task MarkWatchedAsync(int episodeId, bool watched)
+    {
+        MarkCalls.Add((episodeId, watched));
+        return Task.CompletedTask;
+    }
+
+    public Task<WatchState?> GetStateAsync(int episodeId) => Task.FromResult<WatchState?>(null);
+
+    public Task<List<Episode>> GetContinueWatchingAsync() => Task.FromResult(new List<Episode>());
+
+    public Task<bool> ShouldOfferContinueAsync(int episodeId) => Task.FromResult(false);
+}
+
 /// <summary>In-memory <see cref="IWatchStateRepository"/>.</summary>
 internal sealed class FakeWatchStateRepository : IWatchStateRepository
 {

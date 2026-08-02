@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using CATRA.Core.Interfaces;
 using CATRA.Core.Library;
 using CATRA.UI.Navigation;
 using CATRA.UI.Services;
@@ -15,15 +16,21 @@ namespace CATRA.UI.ViewModels;
 public sealed partial class MediaDetailViewModel : ObservableObject
 {
     private readonly ILibraryService _library;
+    private readonly IWatchStateService _watchStateService;
     private readonly IAppNavigator _navigator;
     private readonly IDialogService _dialogs;
 
     private int _mediaItemId;
 
     /// <summary>Creates the view model with its dependencies.</summary>
-    public MediaDetailViewModel(ILibraryService library, IAppNavigator navigator, IDialogService dialogs)
+    public MediaDetailViewModel(
+        ILibraryService library,
+        IWatchStateService watchStateService,
+        IAppNavigator navigator,
+        IDialogService dialogs)
     {
         _library = library ?? throw new ArgumentNullException(nameof(library));
+        _watchStateService = watchStateService ?? throw new ArgumentNullException(nameof(watchStateService));
         _navigator = navigator ?? throw new ArgumentNullException(nameof(navigator));
         _dialogs = dialogs ?? throw new ArgumentNullException(nameof(dialogs));
     }
@@ -121,7 +128,8 @@ public sealed partial class MediaDetailViewModel : ObservableObject
             return;
         }
 
-        await _library.ToggleWatchedAsync(episode.Id);
+        // ST-07: route the manual toggle through the watch-state business layer.
+        await _watchStateService.ToggleWatchedAsync(episode.Id);
         await LoadAsync(_mediaItemId);
     }
 

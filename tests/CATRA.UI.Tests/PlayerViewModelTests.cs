@@ -26,6 +26,7 @@ public sealed class PlayerViewModelTests
         public FakeEpisodeRepository Episodes { get; } = new();
         public FakeMediaItemRepository MediaItems { get; } = new();
         public FakeWatchStateRepository WatchStates { get; } = new();
+        public FakeWatchStateService WatchStateService { get; } = new();
         public FakeDialogService Dialogs { get; } = new();
         public FakeNavigator Navigator { get; } = new();
         public PlayerViewModel ViewModel { get; }
@@ -53,7 +54,7 @@ public sealed class PlayerViewModelTests
             });
 
             ViewModel = new PlayerViewModel(
-                Engine, Episodes, MediaItems, WatchStates, Dialogs, Navigator);
+                Engine, Episodes, MediaItems, WatchStates, WatchStateService, Dialogs, Navigator);
         }
 
         public void SetWatchState(double progressPct, double lastPositionSec, bool watched = false)
@@ -456,5 +457,48 @@ public sealed class PlayerViewModelTests
 
         f.ViewModel.ToggleFullscreenCommand.Execute(null);
         f.ViewModel.IsFullscreen.Should().BeFalse();
+    }
+
+    // ------------------------------------------------------------------
+    // RF-05 / RN-08 — progress persistence (final save)
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task Stop_PersistsFinalProgress()
+    {
+        var f = new Fixture();
+        await f.ViewModel.OpenAsync(EpisodeId);
+        f.Engine.RaisePositionChanged(TimeSpan.FromSeconds(300));
+
+        f.ViewModel.StopCommand.Execute(null);
+
+        f.WatchStateService.SaveProgressCalls.Should().ContainSingle()
+            .Which.Should().Be((EpisodeId, 300d, Duration.TotalSeconds));
+    }
+
+    [Fact]
+    public async Task Close_PersistsFinalProgress()
+    {
+        var f = new Fixture();
+        await f.ViewModel.OpenAsync(EpisodeId);
+        f.Engine.RaisePositionChanged(TimeSpan.FromSeconds(660));
+
+        f.ViewModel.CloseCommand.Execute(null);
+
+        f.WatchStateService.SaveProgressCalls.Should().ContainSingle()
+            .Which.Should().Be((EpisodeId, 660d, Duration.TotalSeconds));
+    }
+
+    [Fact]
+    public async Task MediaEnded_PersistsProgressAtDuration()
+    {
+        var f = new Fixture();
+        await f.ViewModel.OpenAsync(EpisodeId);
+
+        f.Engine.RaiseMediaEnded();
+
+        // Natural end saves position == duration, which the service maps to watched.
+        f.WatchStateService.SaveProgressCalls.Should().ContainSingle()
+            .Which.Should().Be((EpisodeId, Duration.TotalSeconds, Duration.TotalSeconds));
     }
 }

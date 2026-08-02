@@ -35,10 +35,14 @@ public sealed partial class PlayerViewModel : ObservableObject
     /// <summary>RN-04: skip intro is disabled this close to the end (seconds).</summary>
     public const double SkipIntroEndGuardSec = 30.0;
 
+    /// <summary>RF-05: progress is persisted on this interval (seconds).</summary>
+    public const double ProgressSaveIntervalSec = 5.0;
+
     private readonly IPlaybackEngine _engine;
     private readonly IEpisodeRepository _episodes;
     private readonly IMediaItemRepository _mediaItems;
     private readonly IWatchStateRepository _watchStates;
+    private readonly IWatchStateService _watchStateService;
     private readonly IDialogService _dialogs;
     private readonly IAppNavigator _navigator;
     private readonly SynchronizationContext? _uiContext;
@@ -50,6 +54,7 @@ public sealed partial class PlayerViewModel : ObservableObject
     private bool _applyingVolume;
     private bool _closed;
     private bool _detached;
+    private CancellationTokenSource? _progressSaverCts;
 
     /// <summary>Creates the view model and subscribes to the engine events.</summary>
     public PlayerViewModel(
@@ -57,6 +62,7 @@ public sealed partial class PlayerViewModel : ObservableObject
         IEpisodeRepository episodes,
         IMediaItemRepository mediaItems,
         IWatchStateRepository watchStates,
+        IWatchStateService watchStateService,
         IDialogService dialogs,
         IAppNavigator navigator)
     {
@@ -64,6 +70,7 @@ public sealed partial class PlayerViewModel : ObservableObject
         _episodes = episodes ?? throw new ArgumentNullException(nameof(episodes));
         _mediaItems = mediaItems ?? throw new ArgumentNullException(nameof(mediaItems));
         _watchStates = watchStates ?? throw new ArgumentNullException(nameof(watchStates));
+        _watchStateService = watchStateService ?? throw new ArgumentNullException(nameof(watchStateService));
         _dialogs = dialogs ?? throw new ArgumentNullException(nameof(dialogs));
         _navigator = navigator ?? throw new ArgumentNullException(nameof(navigator));
 
@@ -198,6 +205,7 @@ public sealed partial class PlayerViewModel : ObservableObject
             PositionSeconds = resumeAtSec;
         }
 
+        StartProgressSaver();
         SkipIntroCommand.NotifyCanExecuteChanged();
     }
 
@@ -297,6 +305,8 @@ public sealed partial class PlayerViewModel : ObservableObject
     [RelayCommand]
     private void Stop()
     {
+        SaveCurrentProgress(); // RF-05: persist final progress before the position resets.
+        StopProgressSaver();
         _engine.Stop();
         Position = TimeSpan.Zero;
         PositionSeconds = 0d;
@@ -390,6 +400,7 @@ public sealed partial class PlayerViewModel : ObservableObject
         }
 
         _closed = true;
+        SaveCurrentProgress(); // RF-05: persist final progress on close.
         _engine.Stop();
         Detach();
         _navigator.GoBack();
@@ -406,6 +417,7 @@ public sealed partial class PlayerViewModel : ObservableObject
             return;
         }
 
+        SaveCurrentProgress(); // RF-05: persist final progress on release.
         _engine.Stop();
         Detach();
     }
@@ -419,6 +431,7 @@ public sealed partial class PlayerViewModel : ObservableObject
         }
 
         _detached = true;
+        StopProgressSaver();
         _engine.PositionChanged -= OnEnginePositionChanged;
         _engine.StateChanged -= OnEngineStateChanged;
         _engine.MediaEnded -= OnEngineMediaEnded;
@@ -481,6 +494,9 @@ public sealed partial class PlayerViewModel : ObservableObject
                 Position = Duration;
                 PositionSeconds = Duration.TotalSeconds;
             }
+
+            StopProgressSaver();
+            SaveCurrentProgress(); // natural end: position == duration -> marks watched (RN-02).
         });
 
     private void OnEngineError(object? sender, PlaybackErrorEventArgs e)
@@ -501,6 +517,80 @@ public sealed partial class PlayerViewModel : ObservableObject
         }
 
         _uiContext.Post(_ => action(), null);
+    }
+
+    /// <summary>
+    /// RF-05: starts the periodic (every <see cref="ProgressSaveIntervalSec"/>) progress
+    /// saver. The loop runs on the thread pool and never throws into the UI.
+    /// </summary>
+    private void StartProgressSaver()
+    {
+        StopProgressSaver();
+        var cts = new CancellationTokenSource();
+        _progressSaverCts = cts;
+        _ = Task.Run(() => ProgressSaveLoopAsync(cts.Token));
+    }
+
+    private async Task ProgressSaveLoopAsync(CancellationToken token)
+    {
+        try
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(ProgressSaveIntervalSec));
+            while (await timer.WaitForNextTickAsync(token).ConfigureAwait(false))
+            {
+                SaveCurrentProgress();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Normal shutdown: the saver was stopped.
+        }
+        catch
+        {
+            // Never let the background saver crash the process.
+        }
+    }
+
+    private void StopProgressSaver()
+    {
+        var cts = _progressSaverCts;
+        _progressSaverCts = null;
+        if (cts is not null)
+        {
+            cts.Cancel();
+            cts.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// RF-05 / RN-08: fire-and-forget persistence of the current position (ORIGINAL-file
+    /// based — the processed file shares the same duration, so the mapping is 1:1). The
+    /// service also auto-marks watched when the RN-02 threshold is crossed. Wrapped so a
+    /// persistence failure can never crash the UI.
+    /// </summary>
+    private void SaveCurrentProgress()
+    {
+        try
+        {
+            var episode = _episode;
+            if (episode is null || DurationSeconds <= 0d)
+            {
+                return;
+            }
+
+            double position = Math.Clamp(PositionSeconds, 0d, DurationSeconds);
+            _watchStateService
+                .SaveProgressAsync(episode.Id, position, DurationSeconds)
+                .ContinueWith(
+                    static t => { _ = t.Exception; },
+                    CancellationToken.None,
+                    TaskContinuationOptions.OnlyOnFaulted,
+                    TaskScheduler.Default);
+        }
+        catch
+        {
+            // Best effort: progress persistence must never crash the UI.
+        }
     }
 
     private static string BuildProfileIndicator(VideoMetadata metadata)

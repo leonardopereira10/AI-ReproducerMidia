@@ -48,6 +48,10 @@ public partial class App : Application
                 // Domain services
                 services.AddSingleton<ILibraryService, LibraryService>();
 
+                // Watch state business layer (ST-07): RN-02 threshold + auto-mark,
+                // RN-03 "Continuar Assistindo", RN-08 original-file timestamps.
+                services.AddSingleton<IWatchStateService, WatchStateService>();
+
                 // Playback pipeline (ST-05): FFmpeg decode + DX11 render + WASAPI audio.
                 // Decoders/renderers are transient so the engine gets fresh instances per
                 // open media; the engine itself is a singleton orchestrator.
