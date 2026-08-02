@@ -1,5 +1,21 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <PropertyGroup>
+    <!-- FFmpeg.AutoGen (VideoDecoder/AudioDecoder) and Vortice (VideoRenderer)
+         expose native pointers; the playback layer manipulates them directly. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- FFmpeg bindings: D3D11VA hw decode + audio decode (ST-05). -->
+    <PackageReference Include="FFmpeg.AutoGen" Version="7.1.1" />
+    <!-- WASAPI output for the audio renderer (ST-05). -->
+    <PackageReference Include="NAudio" Version="2.2.1" />
+    <!-- D3D11/DXGI swapchain rendering into the WPF HwndHost (ST-05). -->
+    <PackageReference Include="Vortice.Direct3D11" Version="3.5.0" />
+    <PackageReference Include="Vortice.DXGI" Version="3.5.0" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\CATRA.Data\CATRA.Data.csproj" />
   </ItemGroup>

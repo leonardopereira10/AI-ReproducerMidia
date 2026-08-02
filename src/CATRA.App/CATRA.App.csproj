@@ -7,6 +7,8 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
+    <!-- FFmpeg.AutoGen: App.xaml.cs configures ffmpeg.RootPath at startup (ST-05). -->
+    <PackageReference Include="FFmpeg.AutoGen" Version="7.1.1" />
   </ItemGroup>
 
   <ItemGroup>

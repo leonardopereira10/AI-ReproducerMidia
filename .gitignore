@@ -60,3 +60,7 @@ Desktop.ini
 *.tmp
 *.cache
 .pi-subagents/
+
+# ---- FFmpeg shared binaries (ST-05) ----
+# Downloaded on demand by scripts/download-ffmpeg.ps1; never committed.
+lib/ffmpeg/

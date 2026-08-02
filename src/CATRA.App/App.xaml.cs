@@ -1,3 +1,4 @@
+using System.IO;
 using System.Windows;
 using CATRA.Core.Enums;
 using CATRA.Core.Interfaces;
@@ -7,6 +8,7 @@ using CATRA.Data.Database;
 using CATRA.Data.Repositories;
 using CATRA.Services;
 using CATRA.Services.Library;
+using CATRA.Services.Playback;
 using CATRA.UI.Navigation;
 using CATRA.UI.Services;
 using CATRA.UI.ViewModels;
@@ -38,11 +40,26 @@ public partial class App : Application
     {
         base.OnStartup(e);
 
+        ConfigureFfmpeg();
+
         _host = Host.CreateDefaultBuilder()
             .ConfigureServices((_, services) =>
             {
                 // Domain services
                 services.AddSingleton<ILibraryService, LibraryService>();
+
+                // Playback pipeline (ST-05): FFmpeg decode + DX11 render + WASAPI audio.
+                // Decoders/renderers are transient so the engine gets fresh instances per
+                // open media; the engine itself is a singleton orchestrator.
+                services.AddTransient<IVideoDecoder, VideoDecoder>();
+                services.AddTransient<IAudioDecoder, AudioDecoder>();
+                services.AddTransient<IVideoRenderer, VideoRenderer>();
+                services.AddTransient<IAudioRenderer, AudioRenderer>();
+                services.AddSingleton<IPlaybackEngine>(sp => new PlaybackEngine(
+                    () => sp.GetRequiredService<IVideoDecoder>(),
+                    () => sp.GetRequiredService<IAudioDecoder>(),
+                    () => sp.GetRequiredService<IVideoRenderer>(),
+                    () => sp.GetRequiredService<IAudioRenderer>()));
 
                 // Library scanning (ST-03): parser, probe, scanner, watcher.
                 // IMediaProbeService is ffprobe-based; the real binary is bundled
@@ -112,6 +129,20 @@ public partial class App : Application
         }
 
         base.OnExit(e);
+    }
+
+    /// <summary>
+    /// Points FFmpeg.AutoGen at the bundled shared libraries (ST-05). When the
+    /// <c>lib/ffmpeg</c> folder is absent (e.g. fresh clone before running
+    /// <c>scripts/download-ffmpeg.ps1</c>) the default loader search path is kept.
+    /// </summary>
+    private static void ConfigureFfmpeg()
+    {
+        string ffmpegDir = Path.Combine(AppContext.BaseDirectory, "lib", "ffmpeg");
+        if (Directory.Exists(ffmpegDir))
+        {
+            FFmpeg.AutoGen.ffmpeg.RootPath = ffmpegDir;
+        }
     }
 
     private void OnThemeChanged(object? sender, AppTheme theme)
