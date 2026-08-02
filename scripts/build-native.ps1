@@ -29,9 +29,11 @@ param(
 
     [string]$VcpkgRoot = $env:VCPKG_ROOT,
 
-    # RIFE v4 arbitrary-timestep ONNX model. Override to point at a specific
-    # Practical-RIFE export. NOT downloaded when the file already exists.
-    [string]$RifeModelUrl = 'https://github.com/hzwer/Practical-RIFE/releases/latest/download/rife-v4.onnx',
+    # RIFE v4 arbitrary-timestep ONNX model. There is NO official ONNX release;
+    # the model must be exported from Practical-RIFE PyTorch weights (see README
+    # in lib/rife/ or pass -SkipModelDownload). NOT downloaded when the file
+    # already exists. Set $env:CATRA_RIFE_MODEL_PATH to point at a local file.
+    [string]$RifeModelUrl = '',
 
     # FSR 4 / FidelityFX SDK root (ST-14). OPTIONAL and license-gated: this
     # script NEVER downloads it. When omitted, FSR 4 is disabled and the bridge
@@ -103,6 +105,10 @@ function Ensure-RifeModel {
     }
     $url = $env:CATRA_RIFE_MODEL_URL
     if ([string]::IsNullOrWhiteSpace($url)) { $url = $RifeModelUrl }
+    if ([string]::IsNullOrWhiteSpace($url)) {
+        Write-Host "build-native: no RIFE model URL configured -> skipping (place rife_v4.onnx in lib/rife/ manually)."
+        return
+    }
     Write-Host "build-native: downloading RIFE model from $url ..."
     try {
         New-Item -ItemType Directory -Force -Path $modelDir | Out-Null
