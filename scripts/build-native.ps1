@@ -6,6 +6,9 @@
 #   * CMake 3.25+ on PATH
 #   * vcpkg: git clone https://github.com/microsoft/vcpkg; .\bootstrap-vcpkg.bat
 #     then set $env:VCPKG_ROOT to the clone root (or pass -VcpkgRoot).
+#   * ONNX Runtime DirectML (optional, for RIFE): NuGet package
+#     Microsoft.ML.OnnxRuntime.DirectML -> pass -OnnxRuntimeRoot <prefix>.
+#     NOT installed via vcpkg (the vcpkg port pulls CUDA, not DirectML).
 #
 # Usage:
 #   pwsh ./scripts/build-native.ps1 [-Configuration Release] [-VcpkgRoot <path>]
@@ -52,6 +55,15 @@ param(
     #   2. Pass -AmfRoot lib/amf  (the repo root containing AMF/public/include/).
     # CMake then defines CATRA_HAS_AMF and lights up the AMF H.265 backend.
     [string]$AmfRoot = $env:CATRA_AMF_ROOT,
+
+    # ONNX Runtime with DirectML (ST-13). OPTIONAL. The vcpkg onnxruntime-gpu
+    # port pulls CUDA (wrong for this project). Instead, download the DirectML
+    # build from NuGet:
+    #   nuget install Microsoft.ML.OnnxRuntime.DirectML -OutputDirectory lib/onnxruntime
+    # Then pass -OnnxRuntimeRoot lib/onnxruntime/<version>/build/native
+    # (the directory containing include/ + lib/ + bin/ with onnxruntime.dll).
+    # When omitted, RIFE compiles to a CATRA_ERR_NOT_IMPL stub (build still succeeds).
+    [string]$OnnxRuntimeRoot = $env:CATRA_ONNXRUNTIME_ROOT,
 
     [switch]$SkipModelDownload
 )
@@ -173,12 +185,24 @@ else {
     Write-Host "build-native: AMF SDK not supplied -> H.265 encode disabled (CATRA_ERR_NOT_IMPL)."
 }
 
+# ONNX Runtime with DirectML (ST-13): forward the optional location.
+# When omitted, RIFE compiles to a stub (build still succeeds).
+$onnxArgs = @()
+if (-not [string]::IsNullOrWhiteSpace($OnnxRuntimeRoot)) {
+    Write-Host "build-native: ONNX Runtime root = $OnnxRuntimeRoot"
+    $onnxArgs += "-DCATRA_ONNXRUNTIME_ROOT=$OnnxRuntimeRoot"
+}
+else {
+    Write-Host "build-native: ONNX Runtime not supplied -> RIFE disabled (CATRA_ERR_NOT_IMPL)."
+}
+
 & cmake -B $buildDir -S $nativeDir `
     -DCMAKE_TOOLCHAIN_FILE="$toolchainFile" `
     -DVCPKG_TARGET_TRIPLET=x64-windows `
     -DCMAKE_BUILD_TYPE=$Configuration `
     @fsrArgs `
-    @amfArgs
+    @amfArgs `
+    @onnxArgs
 if ($LASTEXITCODE -ne 0) { Fail "CMake configure failed (exit $LASTEXITCODE)." }
 
 # --- Build ------------------------------------------------------------------

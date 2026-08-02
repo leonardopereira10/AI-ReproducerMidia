@@ -5,7 +5,6 @@
   "description": "CATRA GPU native bridge (FSR 4, RIFE/FSR3 FG, AMF, DX12).",
   "supports": "windows & x64",
   "dependencies": [
-    "directx-headers",
-    "onnxruntime-gpu"
+    "directx-headers"
   ]
 }
