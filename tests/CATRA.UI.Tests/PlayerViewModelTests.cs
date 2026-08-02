@@ -502,4 +502,22 @@ public sealed class PlayerViewModelTests
         f.WatchStateService.SaveProgressCalls.Should().ContainSingle()
             .Which.Should().Be((EpisodeId, Duration.TotalSeconds, Duration.TotalSeconds));
     }
+
+    [Fact]
+    public void Dispose_DetachesSingletonEngineEvents_AndIsIdempotent()
+    {
+        var f = new Fixture();
+        f.Engine.RaisePositionChanged(TimeSpan.FromSeconds(42));
+        f.ViewModel.PositionSeconds.Should().Be(42);
+
+        // ST-19 follow-up: the navigation service disposes transient VMs when
+        // their page is left; PlayerViewModel.Dispose must detach the singleton
+        // engine events (leak fix) and be safe to call more than once.
+        f.ViewModel.Dispose();
+        f.ViewModel.Dispose();
+
+        f.Engine.RaisePositionChanged(TimeSpan.FromSeconds(99));
+        f.ViewModel.PositionSeconds.Should().Be(42,
+            "Dispose must unsubscribe from the singleton engine so no further updates arrive");
+    }
 }

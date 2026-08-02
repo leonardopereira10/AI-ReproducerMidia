@@ -1,3 +1,4 @@
+using System.Windows;
 using System.Windows.Controls;
 using CATRA.Core.Navigation;
 using Microsoft.Extensions.DependencyInjection;
@@ -38,10 +39,17 @@ public sealed class FrameNavigationService : INavigationService
 
         ArgumentNullException.ThrowIfNull(pageType);
 
+        // Capture the page being left so its (transient) view model can be
+        // disposed once navigation succeeds. Transient VMs subscribe to
+        // singleton service events; without disposal each visit roots a new VM
+        // in those events (growing leak — ST-19 follow-up).
+        var leaving = _frame.Content;
+
         var page = CreatePage(pageType)
             ?? throw new InvalidOperationException($"Cannot create page of type '{pageType.FullName}'.");
 
         _frame.Navigate(page);
+        TryDisposeDataContext(leaving);
 
         if (page is INavigationAware aware)
         {
@@ -53,8 +61,38 @@ public sealed class FrameNavigationService : INavigationService
     {
         if (_frame?.CanGoBack == true)
         {
+            var leaving = _frame.Content;
             _frame.GoBack();
+            TryDisposeDataContext(leaving);
         }
+    }
+
+    /// <summary>
+    /// Disposes the data context (view model) of a page being navigated away
+    /// from, when it is <see cref="IDisposable"/>. Guarded and idempotent: a
+    /// throwing VM never breaks navigation. Extracted as a pure static helper so
+    /// the disposal contract is unit-testable without a real WPF
+    /// <see cref="Frame"/> (which cannot run headless).
+    /// </summary>
+    /// <param name="content">The <see cref="Frame.Content"/> being left.</param>
+    /// <returns><c>true</c> when a disposable data context was disposed.</returns>
+    public static bool TryDisposeDataContext(object? content)
+    {
+        if (content is FrameworkElement { DataContext: IDisposable disposable })
+        {
+            try
+            {
+                disposable.Dispose();
+                return true;
+            }
+            catch
+            {
+                // A faulty VM must never crash navigation; disposal is best effort.
+                return false;
+            }
+        }
+
+        return false;
     }
 
     private object? CreatePage(Type pageType)

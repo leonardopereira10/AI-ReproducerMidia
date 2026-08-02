@@ -22,7 +22,7 @@ namespace CATRA.UI.ViewModels;
 /// captured at construction (the UI dispatcher context in the app, <c>null</c> —
 /// inline execution — in headless tests).
 /// </remarks>
-public sealed partial class PlayerViewModel : ObservableObject
+public sealed partial class PlayerViewModel : ObservableObject, IDisposable
 {
     /// <summary>Global default intro skip length in seconds (RN-04: 1:25).</summary>
     public const double DefaultSkipIntroSec = 85.0;
@@ -629,6 +629,14 @@ public sealed partial class PlayerViewModel : ObservableObject
         _casting.StateChanged -= OnCastingStateChanged;
         _casting.PositionChanged -= OnCastingPositionChanged;
     }
+
+    /// <summary>
+    /// Implements <see cref="IDisposable"/> so the navigation service can detach
+    /// this (transient) VM from the singleton engine/casting events when the
+    /// player page is left (ST-19 follow-up leak fix). Delegates to the
+    /// idempotent <see cref="Detach"/>; safe to call multiple times.
+    /// </summary>
+    public void Dispose() => Detach();
 
     partial void OnVolumeChanged(double value)
     {

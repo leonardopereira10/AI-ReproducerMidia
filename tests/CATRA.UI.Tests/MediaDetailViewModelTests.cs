@@ -24,9 +24,10 @@ public sealed class MediaDetailViewModelTests
     private readonly FakeSlidingWindowService _window = new();
     private readonly FakeProcessedFileRepository _processedFiles = new();
     private readonly FakeProcessJobRepository _jobs = new();
+    private readonly FakeAppSettingsRepository _settings = new();
 
     private MediaDetailViewModel CreateVm() =>
-        new(_library, _watchState, _thumbnails, _navigator, _dialogs, _window, _processedFiles, _jobs);
+        new(_library, _watchState, _thumbnails, _navigator, _dialogs, _window, _processedFiles, _jobs, _settings);
 
     [Fact]
     public async Task SetCover_PickedFile_RoutesThroughThumbnailService_NotRawLibraryPath()
@@ -107,6 +108,35 @@ public sealed class MediaDetailViewModelTests
     }
 
     [Fact]
+    public async Task WindowEstimate_IsSettingsDriven_NotHardcoded()
+    {
+        // ST-19 follow-up minor: the estimate must read window_size +
+        // *_encode_bitrate_kbps from settings (matching ProcessingQueueViewModel),
+        // not the old hardcoded Take(5) / 20k window.
+        _library.MediaItem = new MediaItem { Id = 7, Title = "Série" };
+        for (int i = 1; i <= 4; i++)
+        {
+            _library.Episodes.Add(new EpisodeDetail(
+                new Episode { Id = i, MediaItemId = 7, EpisodeNumber = i, FileName = $"ep{i}.mkv", DurationSec = 1000d },
+                watchState: null));
+        }
+
+        var settings = new FakeAppSettingsRepository(new Dictionary<string, string>
+        {
+            ["window_size"] = "3",
+            ["local_encode_bitrate_kbps"] = "20000",
+        });
+        var vm = new MediaDetailViewModel(
+            _library, _watchState, _thumbnails, _navigator, _dialogs, _window, _processedFiles, _jobs, settings);
+
+        await vm.LoadAsync(7);
+
+        // 3 eps × 1000s × (20000kbps × 1000 / 8) = 7.5e9 bytes → 7.5 GB.
+        vm.WindowEstimateLabel.Should().StartWith("Janela: 3 episódios");
+        vm.WindowEstimateLabel.Should().EndWith("GB estimados");
+    }
+
+    [Fact]
     public async Task OpenQueue_NavigatesToProcessingQueueWithMediaItem()
     {
         _library.MediaItem = new MediaItem { Id = 7, Title = "Série" };
@@ -159,6 +189,8 @@ public sealed class MediaDetailViewModelTests
     {
         public MediaItem? MediaItem { get; set; }
 
+        public List<EpisodeDetail> Episodes { get; } = new();
+
         public List<(int MediaItemId, string? CoverPath)> SetMediaCoverCalls { get; } = new();
 
         public event EventHandler<LibraryScanSummary>? LibraryUpdated;
@@ -172,7 +204,7 @@ public sealed class MediaDetailViewModelTests
             Task.FromResult<IReadOnlyList<MediaItemSummary>>(new List<MediaItemSummary>());
 
         public Task<IReadOnlyList<EpisodeDetail>> GetEpisodesAsync(int mediaItemId) =>
-            Task.FromResult<IReadOnlyList<EpisodeDetail>>(new List<EpisodeDetail>());
+            Task.FromResult<IReadOnlyList<EpisodeDetail>>(Episodes);
 
         public Task ToggleWatchedAsync(int episodeId) => Task.CompletedTask;
 

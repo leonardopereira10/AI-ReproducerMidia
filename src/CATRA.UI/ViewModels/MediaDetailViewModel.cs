@@ -25,6 +25,7 @@ public sealed partial class MediaDetailViewModel : ObservableObject
     private readonly ISlidingWindowService _window;
     private readonly IProcessedFileRepository _processedFiles;
     private readonly IProcessJobRepository _jobs;
+    private readonly IAppSettingsRepository _settings;
 
     private int _mediaItemId;
 
@@ -37,7 +38,8 @@ public sealed partial class MediaDetailViewModel : ObservableObject
         IDialogService dialogs,
         ISlidingWindowService window,
         IProcessedFileRepository processedFiles,
-        IProcessJobRepository jobs)
+        IProcessJobRepository jobs,
+        IAppSettingsRepository settings)
     {
         _library = library ?? throw new ArgumentNullException(nameof(library));
         _watchStateService = watchStateService ?? throw new ArgumentNullException(nameof(watchStateService));
@@ -47,6 +49,7 @@ public sealed partial class MediaDetailViewModel : ObservableObject
         _window = window ?? throw new ArgumentNullException(nameof(window));
         _processedFiles = processedFiles ?? throw new ArgumentNullException(nameof(processedFiles));
         _jobs = jobs ?? throw new ArgumentNullException(nameof(jobs));
+        _settings = settings ?? throw new ArgumentNullException(nameof(settings));
     }
 
     /// <summary>Unwatched episodes (display order).</summary>
@@ -217,8 +220,11 @@ public sealed partial class MediaDetailViewModel : ObservableObject
             ? active
             : SelectedProfile;
 
+        // GroupBy/last-wins: a duplicated EpisodeId must not throw
+        // ArgumentException (defensive — active jobs should be unique per episode).
         var activeJobs = _jobs.GetActiveByMediaItem(_mediaItemId)
-            .ToDictionary(j => j.EpisodeId, j => j);
+            .GroupBy(j => j.EpisodeId)
+            .ToDictionary(g => g.Key, g => g.Last());
 
         foreach (var detail in UnwatchedEpisodes.Concat(WatchedEpisodes))
         {
@@ -241,14 +247,34 @@ public sealed partial class MediaDetailViewModel : ObservableObject
 
     private string BuildEstimateLabel()
     {
-        var candidates = UnwatchedEpisodes.Take(5).Select(e => e.Episode).ToList();
-        int windowSize = candidates.Count;
-        double avgDuration = windowSize > 0 ? candidates.Average(e => e.DurationSec ?? 0d) : 0d;
-        int bitrateKbps = SelectedProfile == ProcessProfile.Dlna ? 45_000 : 20_000;
+        // Settings-driven so the estimate matches ProcessingQueueViewModel
+        // (same window_size + *_encode_bitrate_kbps keys) instead of hardcoded
+        // Take(5) / 20k / 45k values.
+        int windowSize = GetWindowSize();
+        var candidates = UnwatchedEpisodes.Take(windowSize).Select(e => e.Episode).ToList();
+        double avgDuration = candidates.Count > 0 ? candidates.Average(e => e.DurationSec ?? 0d) : 0d;
+        int bitrateKbps = GetBitrateKbps(SelectedProfile);
 
         // bytes = windowSize × avgDurationSec × (bitrateKbps × 1000 / 8).
         double bytes = windowSize * avgDuration * bitrateKbps * 1000d / 8d;
         return $"Janela: {windowSize} episódios | ~{bytes / 1_000_000_000d:F1} GB estimados";
+    }
+
+    private int GetWindowSize()
+    {
+        if (int.TryParse(_settings.Get("window_size"), out int size) && size > 0)
+        {
+            return size;
+        }
+
+        return 5;
+    }
+
+    private int GetBitrateKbps(ProcessProfile profile)
+    {
+        string key = profile == ProcessProfile.Dlna ? "dlna_encode_bitrate_kbps" : "local_encode_bitrate_kbps";
+        int fallback = profile == ProcessProfile.Dlna ? 45_000 : 20_000;
+        return int.TryParse(_settings.Get(key), out int value) ? value : fallback;
     }
 
     /// <summary>Episode click → opens the player (Tela 4) for the episode.</summary>

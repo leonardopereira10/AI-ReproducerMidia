@@ -197,7 +197,11 @@ public sealed partial class ProcessingQueueViewModel : ObservableObject, IDispos
 
     private void RebuildWindowEpisodes()
     {
-        var queuedByEpisode = _queue.QueuedJobs.ToDictionary(j => j.EpisodeId, j => j);
+        // GroupBy/last-wins: a duplicated EpisodeId must not throw
+        // ArgumentException (defensive — queued jobs should be unique per episode).
+        var queuedByEpisode = _queue.QueuedJobs
+            .GroupBy(j => j.EpisodeId)
+            .ToDictionary(g => g.Key, g => g.Last());
         var current = _queue.CurrentJob;
 
         WindowEpisodes.Clear();
