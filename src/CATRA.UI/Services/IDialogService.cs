@@ -10,6 +10,13 @@ public interface IDialogService
     void ShowMessage(string title, string message);
 
     /// <summary>
+    /// Shows a two-choice dialog with custom button labels. Returns <c>true</c>
+    /// when the user picks <paramref name="acceptText"/> (e.g. the RN-03
+    /// "Continuar de MM:SS?" prompt with "Continuar" / "Do início").
+    /// </summary>
+    bool Confirm(string title, string message, string acceptText, string cancelText);
+
+    /// <summary>
     /// Prompts for a single line of text. Returns the entered value, or
     /// <c>null</c> when the user cancels.
     /// </summary>

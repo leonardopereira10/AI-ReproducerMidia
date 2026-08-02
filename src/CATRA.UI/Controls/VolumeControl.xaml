@@ -1,0 +1,99 @@
+<UserControl x:Class="CATRA.UI.Controls.VolumeControl"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Name="Root">
+    <UserControl.Resources>
+
+        <Style x:Key="VolumeTrackSegmentStyle" TargetType="RepeatButton">
+            <Setter Property="IsTabStop" Value="False" />
+            <Setter Property="Focusable" Value="False" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="RepeatButton">
+                        <Border Background="{TemplateBinding Background}" CornerRadius="1.5" />
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="VolumeThumbStyle" TargetType="Thumb">
+            <Setter Property="Width" Value="12" />
+            <Setter Property="Height" Value="12" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Thumb">
+                        <Grid Background="Transparent">
+                            <Ellipse Width="12"
+                                     Height="12"
+                                     Fill="{DynamicResource SeekBarThumbBrush}"
+                                     Opacity="0.30" />
+                            <Ellipse Width="7"
+                                     Height="7"
+                                     Fill="{DynamicResource SeekBarThumbBrush}" />
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="VolumeSliderStyle" TargetType="Slider">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="IsMoveToPointEnabled" Value="True" />
+            <Setter Property="Focusable" Value="False" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Slider">
+                        <Grid Background="Transparent">
+                            <Grid Height="3" VerticalAlignment="Center">
+                                <Track x:Name="PART_Track">
+                                    <Track.DecreaseRepeatButton>
+                                        <RepeatButton Background="{DynamicResource SeekBarProgressBrush}"
+                                                      Command="Slider.DecreaseLarge"
+                                                      Style="{StaticResource VolumeTrackSegmentStyle}" />
+                                    </Track.DecreaseRepeatButton>
+                                    <Track.IncreaseRepeatButton>
+                                        <RepeatButton Background="{DynamicResource SeekBarBackgroundBrush}"
+                                                      Command="Slider.IncreaseLarge"
+                                                      Style="{StaticResource VolumeTrackSegmentStyle}" />
+                                    </Track.IncreaseRepeatButton>
+                                    <Track.Thumb>
+                                        <Thumb Style="{StaticResource VolumeThumbStyle}" />
+                                    </Track.Thumb>
+                                </Track>
+                            </Grid>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </UserControl.Resources>
+
+    <StackPanel VerticalAlignment="Center" Orientation="Horizontal">
+        <Button Width="34"
+                Command="{Binding MuteCommand, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                Padding="4,2"
+                Style="{StaticResource BaseButtonStyle}"
+                ToolTip="Mudo">
+            <TextBlock>
+                <TextBlock.Style>
+                    <Style TargetType="TextBlock">
+                        <Setter Property="Text" Value="🔊" />
+                        <Style.Triggers>
+                            <DataTrigger Binding="{Binding IsMuted, RelativeSource={RelativeSource AncestorType=UserControl}}" Value="True">
+                                <Setter Property="Text" Value="🔇" />
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </TextBlock.Style>
+            </TextBlock>
+        </Button>
+
+        <Slider Width="100"
+                Margin="8,0,0,0"
+                VerticalAlignment="Center"
+                Maximum="100"
+                Minimum="0"
+                Style="{StaticResource VolumeSliderStyle}"
+                Value="{Binding Volume, RelativeSource={RelativeSource AncestorType=UserControl}, Mode=TwoWay}" />
+    </StackPanel>
+</UserControl>

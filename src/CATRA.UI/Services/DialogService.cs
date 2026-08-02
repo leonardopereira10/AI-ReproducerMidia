@@ -15,6 +15,17 @@ public sealed class DialogService : IDialogService
         MessageBox.Show(message, title, MessageBoxButton.OK, MessageBoxImage.Information);
 
     /// <inheritdoc />
+    public bool Confirm(string title, string message, string acceptText, string cancelText)
+    {
+        var dialog = new ConfirmDialog(title, message, acceptText, cancelText)
+        {
+            Owner = Application.Current?.MainWindow,
+        };
+
+        return dialog.ShowDialog() == true;
+    }
+
+    /// <inheritdoc />
     public string? Prompt(string title, string label, string initialValue)
     {
         var dialog = new InputDialog(title, label, initialValue)

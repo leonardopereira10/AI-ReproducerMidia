@@ -1,0 +1,90 @@
+<UserControl x:Class="CATRA.UI.Controls.SeekBarControl"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Name="Root">
+    <UserControl.Resources>
+
+        <!-- Thin filled track segment -->
+        <Style x:Key="SeekTrackSegmentStyle" TargetType="RepeatButton">
+            <Setter Property="IsTabStop" Value="False" />
+            <Setter Property="Focusable" Value="False" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="RepeatButton">
+                        <Border Background="{TemplateBinding Background}" CornerRadius="2" />
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Circular thumb with a soft glow ring (theme brushes only) -->
+        <Style x:Key="SeekThumbStyle" TargetType="Thumb">
+            <Setter Property="Width" Value="16" />
+            <Setter Property="Height" Value="16" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Thumb">
+                        <Grid Background="Transparent">
+                            <Ellipse Width="16"
+                                     Height="16"
+                                     Fill="{DynamicResource SeekBarThumbBrush}"
+                                     Opacity="0.30" />
+                            <Ellipse Width="9"
+                                     Height="9"
+                                     Fill="{DynamicResource SeekBarThumbBrush}" />
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Custom slider: 3px track expanding to 8px on hover -->
+        <Style x:Key="SeekSliderStyle" TargetType="Slider">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="IsMoveToPointEnabled" Value="True" />
+            <Setter Property="Focusable" Value="False" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Slider">
+                        <Grid Background="Transparent">
+                            <Grid x:Name="TrackVisual"
+                                  Height="3"
+                                  VerticalAlignment="Center">
+                                <Track x:Name="PART_Track">
+                                    <Track.DecreaseRepeatButton>
+                                        <RepeatButton Background="{DynamicResource SeekBarProgressBrush}"
+                                                      Command="Slider.DecreaseLarge"
+                                                      Style="{StaticResource SeekTrackSegmentStyle}" />
+                                    </Track.DecreaseRepeatButton>
+                                    <Track.IncreaseRepeatButton>
+                                        <RepeatButton Background="{DynamicResource SeekBarBackgroundBrush}"
+                                                      Command="Slider.IncreaseLarge"
+                                                      Style="{StaticResource SeekTrackSegmentStyle}" />
+                                    </Track.IncreaseRepeatButton>
+                                    <Track.Thumb>
+                                        <Thumb Style="{StaticResource SeekThumbStyle}" />
+                                    </Track.Thumb>
+                                </Track>
+                            </Grid>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="TrackVisual" Property="Height" Value="8" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </UserControl.Resources>
+
+    <Grid Height="18" Background="Transparent">
+        <Slider x:Name="SeekBarSlider"
+                VerticalAlignment="Center"
+                IsEnabled="{Binding IsEnabled, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                Maximum="{Binding Maximum, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                Minimum="0"
+                Style="{StaticResource SeekSliderStyle}"
+                Value="{Binding Value, RelativeSource={RelativeSource AncestorType=UserControl}, Mode=TwoWay}" />
+    </Grid>
+</UserControl>

@@ -7,8 +7,10 @@ namespace CATRA.App;
 
 /// <summary>
 /// Shell window: custom title bar + content region (Frame with back stack).
+/// Implements <see cref="IFullscreenHost"/> so the player (ST-06) can hide
+/// the chrome in fullscreen.
 /// </summary>
-public partial class MainWindow : Window
+public partial class MainWindow : Window, IFullscreenHost
 {
     public MainWindow()
     {
@@ -21,6 +23,13 @@ public partial class MainWindow : Window
         var navigation = App.Services.GetRequiredService<FrameNavigationService>();
         navigation.Attach(ContentFrame);
         navigation.Navigate(typeof(HomeView));
+    }
+
+    /// <inheritdoc />
+    public void SetTitleBarVisible(bool visible)
+    {
+        TitleBarRow.Height = visible ? new GridLength(36) : new GridLength(0);
+        TitleBarBorder.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private void MinimizeButton_Click(object sender, RoutedEventArgs e)

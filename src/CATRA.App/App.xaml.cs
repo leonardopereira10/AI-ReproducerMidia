@@ -74,10 +74,11 @@ public partial class App : Application
                 services.AddSingleton<INavigationService>(sp => sp.GetRequiredService<FrameNavigationService>());
                 services.AddSingleton<IAppNavigator, AppNavigator>();
 
-                // UI services + view models (ST-04: Home / Detail screens)
+                // UI services + view models (ST-04: Home / Detail, ST-06: Player)
                 services.AddSingleton<IDialogService, DialogService>();
                 services.AddTransient<HomeViewModel>();
                 services.AddTransient<MediaDetailViewModel>();
+                services.AddTransient<PlayerViewModel>();
 
                 // Theme
                 services.AddSingleton<ISystemThemeDetector, SystemThemeDetector>();

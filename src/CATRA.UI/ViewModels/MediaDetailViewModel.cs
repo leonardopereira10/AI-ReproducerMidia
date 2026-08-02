@@ -100,7 +100,7 @@ public sealed partial class MediaDetailViewModel : ObservableObject
     [RelayCommand]
     private void GoBack() => _navigator.GoBack();
 
-    /// <summary>Episode click → player placeholder (real player is ST-06).</summary>
+    /// <summary>Episode click → opens the player (Tela 4) for the episode.</summary>
     [RelayCommand]
     private void PlayEpisode(EpisodeDetail? episode)
     {
@@ -109,7 +109,7 @@ public sealed partial class MediaDetailViewModel : ObservableObject
             return;
         }
 
-        _dialogs.ShowMessage("Player", $"Player — ST-06\n{episode.EpisodeLabel} · {episode.Title}");
+        _navigator.GoToPlayer(episode.Id);
     }
 
     /// <summary>Context menu: flips the watched flag and reloads (RF-07).</summary>
