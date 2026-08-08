@@ -1,7 +1,11 @@
+using System.Runtime.InteropServices;
 using CATRA.Core.Interfaces;
 using CATRA.Core.Processing;
 using CATRA.Services.Playback;
 using FFmpeg.AutoGen;
+using Vortice.Direct3D11;
+using Vortice.DXGI;
+using VDX = Vortice.Direct3D11;
 
 namespace CATRA.Services.Processing;
 
@@ -44,6 +48,13 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
     private bool _disposed;
 
     private FrameSourceMetadata? _metadata;
+    private IntPtr _d3d11DevicePtr;
+    private IntPtr _d3d11DeviceContextPtr; // borrowed from AVD3D11VADeviceContext (do NOT Release)
+    private VDX.ID3D11Device? _vorticeDevice;
+    private VDX.ID3D11DeviceContext? _vorticeContext;
+
+    /// <inheritdoc />
+    public IntPtr D3D11DevicePtr => _d3d11DevicePtr;
 
     // Decoded frames are moved into privately-owned AVFrames (one COM texture ref each)
     // tracked here so they stay valid until released. _bufferedTextures holds frames
@@ -123,6 +134,10 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
             }
 
             _metadata = BuildMetadata(stream);
+
+            // Now that the codec is open, the D3D11VA device is initialized.
+            // Extract the device pointer so the pipeline can hand it to the native bridge.
+            ExtractD3D11Device();
         }
         catch
         {
@@ -147,6 +162,57 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
 
         _hwDeviceContext = hw;
         _codecContext->hw_device_ctx = ffmpeg.av_buffer_ref(hw);
+    }
+
+    /// <summary>
+    /// Extracts the ID3D11Device* from the initialized D3D11VA hardware context.
+    /// Must be called AFTER avcodec_open2() which initializes the device.
+    /// </summary>
+    private void ExtractD3D11Device()
+    {
+        if (_hwDeviceContext == null)
+        {
+            System.Diagnostics.Trace.WriteLine("[FrameDecoder] No hw device context (software decode?)");
+            return;
+        }
+
+        try
+        {
+            AVHWDeviceContext* devCtx = (AVHWDeviceContext*)_hwDeviceContext->data;
+            if (devCtx == null)
+            {
+                System.Diagnostics.Trace.WriteLine("[FrameDecoder] devCtx is null");
+                return;
+            }
+
+            if (devCtx->hwctx == null)
+            {
+                System.Diagnostics.Trace.WriteLine("[FrameDecoder] hwctx is null (device not initialized?)");
+                return;
+            }
+
+            AVD3D11VADeviceContext* d3dCtx = (AVD3D11VADeviceContext*)devCtx->hwctx;
+            if (d3dCtx->device == null)
+            {
+                System.Diagnostics.Trace.WriteLine("[FrameDecoder] d3dCtx->device is null");
+                return;
+            }
+
+            _d3d11DevicePtr = (IntPtr)d3dCtx->device;
+            _d3d11DeviceContextPtr = (IntPtr)d3dCtx->device_context;
+
+            // Create persistent Vortice wrappers (AddRef to balance eventual Dispose).
+            Marshal.AddRef(_d3d11DevicePtr);
+            Marshal.AddRef(_d3d11DeviceContextPtr);
+            _vorticeDevice = new VDX.ID3D11Device(_d3d11DevicePtr);
+            _vorticeContext = new VDX.ID3D11DeviceContext(_d3d11DeviceContextPtr);
+
+            System.Diagnostics.Trace.WriteLine($"[FrameDecoder] Extracted D3D11 device: 0x{_d3d11DevicePtr:X}");
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.WriteLine($"[FrameDecoder] ExtractD3D11Device failed: {ex}");
+        }
     }
 
     private static AVPixelFormat OnGetFormat(AVCodecContext* context, AVPixelFormat* formats)
@@ -195,16 +261,21 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
                 if (_bufferedTextures.Count > 0)
                 {
                     texture = _bufferedTextures.Dequeue();
+                    Console.Error.WriteLine($"[TryReadFrame] buffered dequeue, remaining={_bufferedTextures.Count}");
+                    Console.Error.Flush();
                     return true;
                 }
 
                 if (_eofSent)
                 {
-                    // Drain any frames buffered inside the decoder, then signal EOF.
                     return TryReceiveFrame(out texture);
                 }
 
+                Console.Error.WriteLine("[TryReadFrame] av_read_frame...");
+                Console.Error.Flush();
                 int result = ffmpeg.av_read_frame(_formatContext, _packet);
+                Console.Error.WriteLine($"[TryReadFrame] av_read_frame result={result}");
+                Console.Error.Flush();
                 if (result == ffmpeg.AVERROR_EOF)
                 {
                     int flush = SendPacketDraining(null);
@@ -229,17 +300,27 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
                     continue;
                 }
 
+                Console.Error.WriteLine("[TryReadFrame] SendPacketDraining...");
+                Console.Error.Flush();
                 int send = SendPacketDraining(_packet);
+                Console.Error.WriteLine($"[TryReadFrame] SendPacketDraining result={send}");
+                Console.Error.Flush();
                 ffmpeg.av_packet_unref(_packet);
                 if (send < 0 && send != ffmpeg.AVERROR_EOF)
                 {
                     throw new FfmpegException(send, "avcodec_send_packet");
                 }
 
+                Console.Error.WriteLine("[TryReadFrame] TryReceiveFrame...");
+                Console.Error.Flush();
                 if (TryReceiveFrame(out texture))
                 {
+                    Console.Error.WriteLine($"[TryReadFrame] TryReceiveFrame OK texture=0x{texture:X}");
+                    Console.Error.Flush();
                     return true;
                 }
+                Console.Error.WriteLine("[TryReadFrame] TryReceiveFrame returned false, looping");
+                Console.Error.Flush();
             }
         }
     }
@@ -252,9 +333,15 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
     /// </summary>
     private int SendPacketDraining(AVPacket* packet)
     {
+        Console.Error.WriteLine($"[SendPacketDraining] avcodec_send_packet ctx=0x{(IntPtr)_codecContext:X} pkt=0x{(IntPtr)packet:X}");
+        Console.Error.Flush();
         int result = ffmpeg.avcodec_send_packet(_codecContext, packet);
-        while (result == ffmpeg.EAGAIN)
+        Console.Error.WriteLine($"[SendPacketDraining] avcodec_send_packet result={result}");
+        Console.Error.Flush();
+        while (result == -ffmpeg.EAGAIN)
         {
+            Console.Error.WriteLine("[SendPacketDraining] EAGAIN, draining...");
+            Console.Error.Flush();
             while (TryReceiveFrame(out IntPtr drained))
             {
                 _bufferedTextures.Enqueue(drained);
@@ -269,7 +356,7 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
     private bool TryReceiveFrame(out IntPtr texture)
     {
         int result = ffmpeg.avcodec_receive_frame(_codecContext, _frame);
-        if (result == ffmpeg.EAGAIN || result == ffmpeg.AVERROR_EOF)
+        if (result == -ffmpeg.EAGAIN || result == ffmpeg.AVERROR_EOF)
         {
             texture = IntPtr.Zero;
             return false;
@@ -286,8 +373,14 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
 
     /// <summary>
     /// Moves the decoded D3D11 frame into a privately-owned <c>AVFrame</c> so its COM
-    /// texture reference stays valid until <see cref="ReleaseFrame"/>, and returns the
-    /// <c>ID3D11Texture2D*</c>.
+    /// texture reference stays valid until <see cref="ReleaseFrame"/>.
+    ///
+    /// D3D11VA decoders return frames as slices of a shared texture ARRAY
+    /// (ArraySize &gt; 1, one slice per decoder surface). Downstream GPU stages
+    /// (RIFE, FSR, AMF) expect standalone ID3D11Texture2D pointers (ArraySize == 1),
+    /// so we copy the relevant subresource into a fresh texture here. The original
+    /// AVFrame is kept alive (holding a COM ref on the texture array) until
+    /// ReleaseFrame; the standalone copy is tracked separately and Released via COM.
     /// </summary>
     private IntPtr OwnFrame(AVFrame* frame)
     {
@@ -298,8 +391,10 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
                 "avcodec_receive_frame (pipeline requires D3D11VA hardware frames)");
         }
 
-        IntPtr texture = (IntPtr)frame->data[0];
+        IntPtr textureArray = (IntPtr)frame->data[0];
+        int subresource = (int)(long)frame->data[1];
 
+        // Keep the original AVFrame alive so the texture array COM ref is held.
         AVFrame* owned = ffmpeg.av_frame_alloc();
         if (owned == null)
         {
@@ -307,8 +402,85 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
         }
 
         ffmpeg.av_frame_move_ref(owned, frame);
-        _ownedFrames.Add((texture, (IntPtr)owned));
-        return texture;
+
+        // Copy the decoder surface (one array slice) into a standalone texture.
+        IntPtr standalone = CopyToStandaloneTexture(textureArray, subresource);
+
+        _ownedFrames.Add((standalone, (IntPtr)owned));
+        return standalone;
+    }
+
+    /// <summary>
+    /// Copies one array slice from a (possibly array) ID3D11Texture2D into a fresh
+    /// standalone texture (ArraySize == 1) using Vortice.Direct3D11 wrappers.
+    /// Returns an AddRef'd ID3D11Texture2D* that the caller must Release.
+    /// </summary>
+    private IntPtr CopyToStandaloneTexture(IntPtr srcTexture, int arraySlice)
+    {
+        if (_vorticeDevice == null || _vorticeContext == null)
+        {
+            throw new InvalidOperationException(
+                "D3D11 device/context not available; cannot copy decoder frame.");
+        }
+
+        // Wrap the source texture (borrowed — suppress Dispose release).
+        var srcTex = new VDX.ID3D11Texture2D(srcTexture);
+        Texture2DDescription srcDesc = srcTex.Description;
+
+        // Use the actual video dimensions (from metadata) to avoid hardware
+        // alignment padding (e.g. 1088 for 1080p NV12).  The encoder and RIFE
+        // expect the true resolution.
+        int dstW = _metadata?.Width ?? (int)srcDesc.Width;
+        int dstH = _metadata?.Height ?? (int)srcDesc.Height;
+
+        var dstDesc = new Texture2DDescription
+        {
+            Width = dstW,
+            Height = dstH,
+            MipLevels = 1,
+            ArraySize = 1,
+            Format = srcDesc.Format,
+            SampleDescription = new(1, 0),
+            Usage = ResourceUsage.Default,
+            BindFlags = BindFlags.ShaderResource,
+            CPUAccessFlags = CpuAccessFlags.None,
+            MiscFlags = ResourceOptionFlags.None
+        };
+        var dst = _vorticeDevice.CreateTexture2D(dstDesc);
+
+        // FFmpeg D3D11VA: frame->data[1] = array slice index.
+        // Planar formats (NV12, P010) have 2 subresources per slice (Y + UV).
+        var fmt = srcDesc.Format;
+        int numPlanes = (fmt == Format.NV12 || fmt == Format.P010 || fmt == Format.P016) ? 2 : 1;
+        int srcBaseSub = arraySlice * srcDesc.MipLevels * numPlanes;
+
+        if (dstW == (int)srcDesc.Width && dstH == (int)srcDesc.Height)
+        {
+            // No crop needed — full copy.
+            for (int plane = 0; plane < numPlanes; plane++)
+            {
+                _vorticeContext.CopySubresourceRegion(dst, plane, 0, 0, 0, srcTex, srcBaseSub + plane);
+            }
+        }
+        else
+        {
+            // Crop: copy only the valid video region from each plane.
+            // Y plane: full width, dstH rows.
+            var yBox = new Vortice.Mathematics.Box(0, 0, 0, dstW, dstH, 1);
+            _vorticeContext.CopySubresourceRegion(dst, 0, 0, 0, 0, srcTex, srcBaseSub, yBox);
+            if (numPlanes > 1)
+            {
+                // UV plane: full width, dstH/2 rows.
+                var uvBox = new Vortice.Mathematics.Box(0, 0, 0, dstW, dstH / 2, 1);
+                _vorticeContext.CopySubresourceRegion(dst, 1, 0, 0, 0, srcTex, srcBaseSub + 1, uvBox);
+            }
+        }
+
+        // Return the native pointer; caller owns the COM reference via ReleaseFrame.
+        IntPtr result = dst.NativePointer;
+        Marshal.AddRef(result); // caller's reference
+        dst.Dispose();          // releases Vortice's reference
+        return result;
     }
 
     /// <inheritdoc />
@@ -328,6 +500,10 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
                     continue;
                 }
 
+                // Release the standalone texture copy (COM refcount).
+                Marshal.Release(_ownedFrames[i].Texture);
+
+                // Release the original AVFrame (drops the texture array ref).
                 AVFrame* frame = (AVFrame*)_ownedFrames[i].FramePtr;
                 ffmpeg.av_frame_unref(frame);
                 ffmpeg.av_frame_free(&frame);
@@ -371,9 +547,14 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
 
     private void ReleaseNativeResources()
     {
-        // Release every owned frame (drops the COM texture references).
-        foreach ((_, IntPtr framePtr) in _ownedFrames)
+        // Release every owned frame: standalone texture copy (COM) + AVFrame.
+        foreach ((IntPtr texture, IntPtr framePtr) in _ownedFrames)
         {
+            if (texture != IntPtr.Zero)
+            {
+                Marshal.Release(texture);
+            }
+
             AVFrame* frame = (AVFrame*)framePtr;
             ffmpeg.av_frame_unref(frame);
             ffmpeg.av_frame_free(&frame);
@@ -381,6 +562,14 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
 
         _ownedFrames.Clear();
         _bufferedTextures.Clear();
+
+        // Dispose Vortice wrappers (releases the extra AddRef from ExtractD3D11Device).
+        _vorticeDevice?.Dispose();
+        _vorticeDevice = null;
+        _vorticeContext?.Dispose();
+        _vorticeContext = null;
+        _d3d11DevicePtr = IntPtr.Zero;
+        _d3d11DeviceContextPtr = IntPtr.Zero;
 
         if (_frame != null)
         {
@@ -424,4 +613,122 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
             _formatContext = null;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Minimal COM vtable layouts for the D3D11 calls the FrameDecoder needs to
+// copy a decoder surface (one array slice) into a standalone texture.
+// Only the methods actually invoked are declared; earlier vtable slots are
+// represented as IntPtr placeholders to keep the offsets correct.
+// ---------------------------------------------------------------------------
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct D3D11Texture2DDesc
+{
+    public uint Width;
+    public uint Height;
+    public uint MipLevels;
+    public uint ArraySize;
+    public uint Format;   // DXGI_FORMAT
+    public uint SampleCount;
+    public uint SampleQuality;
+    public uint Usage;
+    public uint BindFlags;
+    public uint CPUAccessFlags;
+    public uint MiscFlags;
+}
+
+/// <summary>ID3D11Texture2D vtable (IUnknown + ID3D11DeviceChild + GetDesc).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct ID3D11Texture2DVtbl
+{
+    // IUnknown
+    public IntPtr QueryInterface;
+    public IntPtr AddRef;
+    public IntPtr Release;
+    // ID3D11DeviceChild
+    public IntPtr GetDevice;
+    public IntPtr GetPrivateData;
+    public IntPtr SetPrivateData;
+    public IntPtr SetPrivateDataInterface;
+    // ID3D11Resource
+    public IntPtr GetResourceType;
+    public IntPtr SetEvictionPriority;
+    public IntPtr GetEvictionPriority;
+    // ID3D11Texture2D
+    public delegate* unmanaged[Stdcall]<IntPtr, D3D11Texture2DDesc*, int> GetDesc;
+}
+
+/// <summary>ID3D11Device vtable — CreateTexture2D is slot 5.</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct ID3D11DeviceVtbl
+{
+    // IUnknown (0-2)
+    public IntPtr QueryInterface;          // 0
+    public IntPtr AddRef;                  // 1
+    public IntPtr Release;                 // 2
+    // ID3D11Device
+    public IntPtr CreateBuffer;            // 3
+    public IntPtr CreateTexture1D;         // 4
+    public delegate* unmanaged[Stdcall]<IntPtr, D3D11Texture2DDesc*, void*, IntPtr*, int> CreateTexture2D; // 5
+}
+
+/// <summary>ID3D11DeviceContext vtable — only CopySubresourceRegion (slot 48) is needed.</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct ID3D11DeviceContextVtbl
+{
+    // IUnknown (0-2)
+    public IntPtr QueryInterface;          // 0
+    public IntPtr AddRef;                  // 1
+    public IntPtr Release;                 // 2
+    // ID3D11DeviceChild (3-6)
+    public IntPtr GetDevice;               // 3
+    public IntPtr GetPrivateData;          // 4
+    public IntPtr SetPrivateData;          // 5
+    public IntPtr SetPrivateDataInterface; // 6
+    // ID3D11DeviceContext (7-47): 41 placeholder slots
+    public IntPtr VSSetConstantBuffers;    // 7
+    public IntPtr PSSetShaderResources;    // 8
+    public IntPtr PSSetShader;             // 9
+    public IntPtr PSSetSamplers;           // 10
+    public IntPtr VSSetShader;             // 11
+    public IntPtr DrawIndexed;             // 12
+    public IntPtr Draw;                    // 13
+    public IntPtr Map;                     // 14
+    public IntPtr Unmap;                   // 15
+    public IntPtr PSSetConstantBuffers;    // 16
+    public IntPtr IASetInputLayout;        // 17
+    public IntPtr IASetVertexBuffers;      // 18
+    public IntPtr IASetIndexBuffer;        // 19
+    public IntPtr DrawIndexedInstanced;    // 20
+    public IntPtr DrawInstanced;           // 21
+    public IntPtr GSSetConstantBuffers;    // 22
+    public IntPtr GSSetShader;             // 23
+    public IntPtr IASetPrimitiveTopology;  // 24
+    public IntPtr VSSetShaderResources;    // 25
+    public IntPtr VSSetSamplers;           // 26
+    public IntPtr SetPredication;          // 27
+    public IntPtr GSSetShaderResources;    // 28
+    public IntPtr GSSetSamplers;           // 29
+    public IntPtr OMSetRenderTargets;      // 30
+    public IntPtr OMSetRenderTargetsAndUnorderedAccessViews; // 31
+    public IntPtr OMSetBlendState;         // 32
+    public IntPtr OMSetDepthStencilState;  // 33
+    public IntPtr SOSetTargets;            // 34
+    public IntPtr DrawAuto;                // 35
+    public IntPtr DrawIndexedInstancedIndirect;  // 36
+    public IntPtr DrawInstancedIndirect;   // 37
+    public IntPtr Dispatch;                // 38
+    public IntPtr DispatchIndirect;        // 39
+    public IntPtr RSSetState;              // 40
+    public IntPtr RSSetViewports;          // 41
+    public IntPtr RSSetScissorRects;       // 42
+    public delegate* unmanaged[Stdcall]<IntPtr, IntPtr, uint, uint, uint, uint, IntPtr, uint, void*, void> CopySubresourceRegion; // 43
+    public IntPtr CopyResource;            // 44
+    public IntPtr UpdateSubresource;       // 45
+    public IntPtr CopyStructureCount;      // 46
+    public IntPtr ClearRenderTargetView;   // 47
+    public IntPtr ClearUnorderedAccessViewUint; // 48
+    public IntPtr ClearUnorderedAccessViewFloat; // 49
+    public IntPtr ClearDepthStencilView;   // 50
 }

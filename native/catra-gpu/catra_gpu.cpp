@@ -284,8 +284,18 @@ EncodeContext* LookupEncode(int handle)
 
 void DestroyEncode(int handle)
 {
+    fprintf(stderr, "DestroyEncode: ENTER handle=%d\n", handle);
     std::lock_guard<std::mutex> lock(g_encodeMutex);
-    g_encodeContexts.erase(handle); // unique_ptr frees the AMF encoder (RAII)
+    auto it = g_encodeContexts.find(handle);
+    if (it == g_encodeContexts.end())
+    {
+        fprintf(stderr, "DestroyEncode: unknown handle %d\n", handle);
+        log_msg(CATRA_LOG_WARN, "DestroyEncode: unknown handle %d", handle);
+        return;
+    }
+    fprintf(stderr, "DestroyEncode: erasing handle %d (unique_ptr will free AMF)\n", handle);
+    g_encodeContexts.erase(it); // unique_ptr frees the AMF encoder (RAII)
+    fprintf(stderr, "DestroyEncode: handle %d erased OK\n", handle);
 }
 
 // Called from catra_shutdown BEFORE the bridge releases its D3D12 device, which
@@ -742,7 +752,25 @@ int catra_encode_frame(int ctx, void* texture,
             return CATRA_ERR_INVALID_ARG;
         }
 
-        return c->encoder->Encode(static_cast<ID3D12Resource*>(texture), out_buf, out_size);
+        // The pipeline provides D3D11 textures; the AMF encoder needs D3D12.
+        // Use the pooled interop to share (or copy) the D3D11 texture into a
+        // D3D12 resource on the bridge's shared adapter.
+        ID3D12Resource* d3d12res = nullptr;
+        HANDLE sharedHandle = nullptr;
+        int irc = catra::interop_share_d3d11_to_d3d12(
+            static_cast<ID3D11Texture2D*>(texture), &d3d12res, &sharedHandle);
+        if (irc != CATRA_OK || d3d12res == nullptr)
+        {
+            log_msg(CATRA_LOG_ERROR,
+                    "catra_encode_frame: D3D11->D3D12 interop failed rc=%d", irc);
+            return irc != CATRA_OK ? irc : CATRA_ERR_DEVICE;
+        }
+
+        int enc_rc = c->encoder->Encode(d3d12res, out_buf, out_size);
+
+        // The interop pool owns the D3D12 resource (round-robin slot); do NOT
+        // release it here — the pool recycles it on the next call.
+        return enc_rc;
     });
 }
 
@@ -775,7 +803,11 @@ int catra_encode_flush(int ctx, uint8_t** out_buf, int* out_size)
 
 void catra_encode_destroy(int ctx)
 {
+    fprintf(stderr, "catra_encode_destroy: ENTER ctx=%d\n", ctx);
     GuardCabiVoid([&]() {
-        DestroyEncode(ctx); // no-op for an unknown handle
+        fprintf(stderr, "catra_encode_destroy: inside guard, calling DestroyEncode\n");
+        DestroyEncode(ctx);
+        fprintf(stderr, "catra_encode_destroy: DestroyEncode returned\n");
     });
+    fprintf(stderr, "catra_encode_destroy: EXIT\n");
 }

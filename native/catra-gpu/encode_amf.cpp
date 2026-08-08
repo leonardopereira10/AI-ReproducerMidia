@@ -167,26 +167,33 @@ struct AmfEncoder::Impl
 
     ~Impl()
     {
-        // AMF shutdown order: stop the component, then the context, then drop
-        // the factory, then unload the runtime DLL (reverse of creation). The
-        // smart pointers Release() their interfaces as they destruct; the
-        // explicit Terminate() calls flush AMF's internal state first.
+        fprintf(stderr, "AmfEncoder::Impl::~Impl: BEGIN\n");
         if (encoder != nullptr)
         {
+            fprintf(stderr, "AmfEncoder::Impl::~Impl: encoder->Terminate()\n");
             encoder->Terminate();
+            fprintf(stderr, "AmfEncoder::Impl::~Impl: encoder terminated OK\n");
         }
         if (context != nullptr)
         {
+            fprintf(stderr, "AmfEncoder::Impl::~Impl: context->Terminate()\n");
             context->Terminate();
+            fprintf(stderr, "AmfEncoder::Impl::~Impl: context terminated OK\n");
         }
-        // context / encoder smart pointers release here (reverse declaration
-        // order: encoder, context2, context). `factory` is a non-refcounted AMF
-        // singleton — nothing to Release; it is torn down with the DLL below.
+        // Smart pointers release here (reverse declaration order).
+        fprintf(stderr, "AmfEncoder::Impl::~Impl: smart ptrs releasing\n");
+        encoder = nullptr;
+        context2 = nullptr;
+        context = nullptr;
+        fprintf(stderr, "AmfEncoder::Impl::~Impl: smart ptrs released\n");
         if (amfDll != nullptr)
         {
+            fprintf(stderr, "AmfEncoder::Impl::~Impl: FreeLibrary\n");
             FreeLibrary(amfDll);
             amfDll = nullptr;
+            fprintf(stderr, "AmfEncoder::Impl::~Impl: FreeLibrary OK\n");
         }
+        fprintf(stderr, "AmfEncoder::Impl::~Impl: END\n");
     }
 
     // Copies one AMF output buffer into the staging vector (replacing it) and

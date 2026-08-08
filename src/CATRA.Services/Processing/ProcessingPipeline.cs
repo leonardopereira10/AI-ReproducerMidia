@@ -174,6 +174,24 @@ public sealed class ProcessingPipeline : IProcessingPipeline
             decoder.Open(episode.FilePath);
             FrameSourceMetadata meta = decoder.Metadata;
 
+            // 1b. Initialize the native bridge on the decoder's D3D11 device so
+            //     the GPU backends (upscale, interp, encode) can consume the
+            //     decoder's D3D11 textures. Must happen before any Create* call.
+            if (decoder.D3D11DevicePtr != IntPtr.Zero && !_bridge.IsInitialized)
+            {
+                System.Diagnostics.Trace.WriteLine($"[ProcessingPipeline] Initializing bridge with device 0x{decoder.D3D11DevicePtr:X}");
+                _bridge.Initialize(decoder.D3D11DevicePtr);
+                System.Diagnostics.Trace.WriteLine("[ProcessingPipeline] Bridge initialized successfully");
+            }
+            else if (decoder.D3D11DevicePtr == IntPtr.Zero)
+            {
+                System.Diagnostics.Trace.WriteLine("[ProcessingPipeline] WARNING: decoder has no D3D11 device (software decode?)");
+            }
+            else if (_bridge.IsInitialized)
+            {
+                System.Diagnostics.Trace.WriteLine("[ProcessingPipeline] Bridge already initialized, skipping");
+            }
+
             // 2. RN-07 skip decisions.
             bool needInterp = meta.Fps < config.TargetFps;
             bool needUpscale = meta.Height < config.TargetHeight;
@@ -215,18 +233,23 @@ public sealed class ProcessingPipeline : IProcessingPipeline
             encodeContext = _bridge.CreateEncoder(
                 config.TargetWidth, config.TargetHeight, config.EncodeBitrateKbps, config.TargetFps);
             haveEncode = true;
+            System.Diagnostics.Trace.WriteLine($"[ProcessingPipeline] Encoder created: ctx={encodeContext}");
 
             Directory.CreateDirectory(config.OutputFolder);
 
             // 4–5. Frame loop + flush, writing the H.265 video stream to a temp file.
+            System.Diagnostics.Trace.WriteLine($"[ProcessingPipeline] Opening output file: {tempVideoPath}");
             using (var output = new FileStream(tempVideoPath, FileMode.Create, FileAccess.Write, FileShare.Read))
             {
+                System.Diagnostics.Trace.WriteLine("[ProcessingPipeline] Entering RunFrameLoop");
                 RunFrameLoop(
                     decoder, output, episodeIndex, episodeCount, meta.TotalFrames,
                     needInterp, needUpscale, interpContext, upscaleContext, encodeContext,
                     weights, loopStep, timer, progress, cancellationToken);
+                System.Diagnostics.Trace.WriteLine("[ProcessingPipeline] RunFrameLoop completed");
 
                 // 5. Flush encoder → remaining NALs.
+                System.Diagnostics.Trace.WriteLine("[ProcessingPipeline] Flushing encoder");
                 _bridge.FlushEncoder(encodeContext, out IntPtr flushBuffer, out int flushSize);
                 if (flushSize > 0 && flushBuffer != IntPtr.Zero)
                 {
@@ -256,6 +279,7 @@ public sealed class ProcessingPipeline : IProcessingPipeline
         catch (Exception ex)
         {
             // NativeBridgeException / ffmpeg / IO / timeout → abort with a failed result.
+            System.Diagnostics.Trace.WriteLine($"[ProcessingPipeline] EXCEPTION: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
             return new ProcessResult(false, null, 0, timer.Elapsed, ex.Message);
         }
         finally
@@ -308,12 +332,24 @@ public sealed class ProcessingPipeline : IProcessingPipeline
         IntPtr previous = IntPtr.Zero;
         var frameTimer = new Stopwatch();
 
+        System.Diagnostics.Trace.WriteLine($"[RunFrameLoop] START: needInterp={needInterp}, needUpscale={needUpscale}, totalFrames={totalFrames}");
         ReportLoopProgress(progress, episodeIndex, episodeCount, totalFrames, 0, weights, loopStep, timer.Elapsed);
 
         try
         {
-            while (decoder.TryReadFrame(out IntPtr texture))
+            System.Diagnostics.Trace.WriteLine("[RunFrameLoop] Calling decoder.TryReadFrame");
+            while (true)
             {
+                Console.Error.WriteLine($"[RunFrameLoop] TryReadFrame call #{frameIndex}...");
+                Console.Error.Flush();
+                bool hasFrame = decoder.TryReadFrame(out IntPtr texture);
+                Console.Error.WriteLine($"[RunFrameLoop] TryReadFrame #{frameIndex} returned {hasFrame}, texture=0x{texture:X}");
+                Console.Error.Flush();
+                if (!hasFrame) break;
+                if (frameIndex == 0)
+                {
+                    System.Diagnostics.Trace.WriteLine($"[RunFrameLoop] First frame read: texture=0x{texture:X}");
+                }
                 cancellationToken.ThrowIfCancellationRequested();
                 frameTimer.Restart();
 
@@ -323,7 +359,15 @@ public sealed class ProcessingPipeline : IProcessingPipeline
                     // plus the intermediates generated between it and the current frame.
                     if (previous != IntPtr.Zero)
                     {
+                        if (frameIndex == 1)
+                        {
+                            System.Diagnostics.Trace.WriteLine($"[RunFrameLoop] InterpCall: ctx={interpContext}, prev=0x{previous:X}, cur=0x{texture:X}");
+                        }
+                        Console.Error.WriteLine($"[RunFrameLoop] ProcessInterpolation: frame={frameIndex}");
+                        Console.Error.Flush();
                         int count = _bridge.ProcessInterpolation(interpContext, previous, texture, out IntPtr buffer);
+                        Console.Error.WriteLine($"[RunFrameLoop] ProcessInterpolation done: count={count}");
+                        Console.Error.Flush();
                         try
                         {
                             EncodeSingle(encodeContext, previous, needUpscale, upscaleContext, output);
@@ -420,10 +464,13 @@ public sealed class ProcessingPipeline : IProcessingPipeline
         // finally, so it is freed even when the encode throws. The no-upscale path encodes
         // the decoder-owned source frame directly; that frame is owned/released by the
         // FrameDecoder (ReleaseFrame), so it must NOT be released here.
+        System.Diagnostics.Trace.WriteLine($"[EncodeSingle] needUpscale={needUpscale}, texture=0x{texture:X}");
         IntPtr toEncode = needUpscale ? _bridge.ProcessUpscale(upscaleContext, texture) : texture;
+        System.Diagnostics.Trace.WriteLine($"[EncodeSingle] toEncode=0x{toEncode:X}");
         try
         {
             _bridge.EncodeFrame(encodeContext, toEncode, out IntPtr packetBuffer, out int packetSize);
+            System.Diagnostics.Trace.WriteLine($"[EncodeSingle] EncodeFrame returned: packetSize={packetSize}");
             if (packetSize > 0 && packetBuffer != IntPtr.Zero)
             {
                 WriteBytes(output, packetBuffer, packetSize);

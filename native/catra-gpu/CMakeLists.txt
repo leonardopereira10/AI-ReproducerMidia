@@ -84,41 +84,40 @@ if(CATRA_WITH_RIFE)
 endif()
 
 # --- DirectML execution provider (RIFE GPU acceleration, ST-13) -------------
-# interp_rife.cpp requests the DirectML EP (AppendExecutionProvider_DML) only
-# when USE_DML is defined. IMPORTANT: the vcpkg `onnxruntime-gpu` port is
-# commonly built with the CUDA provider and does NOT expose the DirectML API,
-# so we feature-detect the declaration in the resolved ONNX headers instead of
-# assuming it. If the check fails, USE_DML stays OFF and RIFE falls back to the
-# CPU EP: slow, but correct and always available (offline pipeline, RN-07).
+# interp_rife.cpp requests the DirectML EP (via the C export
+# OrtSessionOptionsAppendExecutionProvider_DML loaded through GetProcAddress)
+# only when USE_DML is defined. The detection below checks for the presence of
+# dml_provider_factory.h in the resolved ONNX headers (file-existence probe);
+# a compile-based probe is not feasible because the header includes <DirectML.h>
+# which requires the Microsoft.AI.DirectML SDK headers (not vendored).
+# If the check fails, USE_DML stays OFF and RIFE falls back to the CPU EP:
+# slow, but correct and always available (offline pipeline, RN-07).
 # For a real DirectML build use the NuGet packages `onnxruntime-directml` /
 # `Microsoft.AI.DirectML` (or a vcpkg overlay port built with --use_dml) and
 # point -DCATRA_ONNXRUNTIME_ROOT at that install; the detection below will then
-# find AppendExecutionProvider_DML and enable the GPU path automatically.
+# find dml_provider_factory.h and enable the GPU path automatically.
 option(CATRA_USE_DML "Request the ONNX Runtime DirectML EP for RIFE when the API is available" ON)
 
 set(CATRA_HAS_DML FALSE)
 if(CATRA_ONNXRUNTIME_TARGET AND CATRA_USE_DML)
     get_target_property(_ort_includes ${CATRA_ONNXRUNTIME_TARGET} INTERFACE_INCLUDE_DIRECTORIES)
     if(_ort_includes)
-        include(CheckCXXSourceCompiles)
-        # Compile-only probe (no link): we only need to know whether the header
-        # declares the DirectML EP entry point, not whether it links.
-        set(_catra_backup_try_compile_type "${CMAKE_TRY_COMPILE_TARGET_TYPE}")
-        set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
-        set(CMAKE_REQUIRED_INCLUDES "${_ort_includes}")
-        check_cxx_source_compiles("
-            #include <onnxruntime_cxx_api.h>
-            #include <type_traits>
-            #include <utility>
-            template <typename T> static auto catra_has_dml(int)
-                -> decltype(std::declval<T>().AppendExecutionProvider_DML(0), std::true_type{});
-            template <typename> static std::false_type catra_has_dml(...);
-            static_assert(decltype(catra_has_dml<Ort::SessionOptions>(0))::value,
-                          \"ONNX Runtime headers lack the DirectML EP API\");
-            int main() { return 0; }
-        " CATRA_DML_EP_AVAILABLE)
-        set(CMAKE_TRY_COMPILE_TARGET_TYPE "${_catra_backup_try_compile_type}")
-        unset(CMAKE_REQUIRED_INCLUDES)
+        # File-existence probe: the DirectML NuGet build ships
+        # dml_provider_factory.h (declaring the C export
+        # OrtSessionOptionsAppendExecutionProvider_DML). The C++ wrapper method
+        # SessionOptions::AppendExecutionProvider_DML does NOT exist in this
+        # package — interp_rife.cpp loads the C export via GetProcAddress.
+        # A compile-based probe would fail because dml_provider_factory.h
+        # includes <DirectML.h> which requires the Microsoft.AI.DirectML SDK
+        # headers (not vendored). File existence is sufficient: the export
+        # lives in onnxruntime.dll and is loaded dynamically at runtime.
+        set(CATRA_DML_EP_AVAILABLE FALSE)
+        foreach(_ort_inc_dir IN LISTS _ort_includes)
+            if(EXISTS "${_ort_inc_dir}/dml_provider_factory.h")
+                set(CATRA_DML_EP_AVAILABLE TRUE)
+                break()
+            endif()
+        endforeach()
         if(CATRA_DML_EP_AVAILABLE)
             set(CATRA_HAS_DML TRUE)
             message(STATUS "catra-gpu: DirectML EP API detected -> RIFE GPU acceleration enabled")

@@ -47,9 +47,17 @@
 #endif
 
 #if defined(CATRA_HAS_ONNXRUNTIME)
+    // ORT_API_MANUAL_INIT: disable the static initialiser in onnxruntime_cxx_api.h
+    // that unconditionally calls GetApi(ORT_API_VERSION). The NuGet
+    // Microsoft.ML.OnnxRuntime.DirectML package can ship headers newer than the
+    // runtime DLL (e.g. header v18 / DLL max API 17), which makes the static
+    // init return nullptr and crash on first use. With manual init we negotiate
+    // the highest mutually-supported API version at runtime (EnsureOrtApiInitialized).
+    #define ORT_API_MANUAL_INIT
     #include <d3d11.h>
     #include <wrl/client.h>
     #include <onnxruntime_cxx_api.h>
+    #undef ORT_API_MANUAL_INIT
 #endif
 
 // log_msg lives in catra_gpu.cpp; redeclare the minimal surface we need. It is
@@ -66,6 +74,44 @@ namespace catra {
 namespace {
 
 using Microsoft::WRL::ComPtr;
+
+// --- ORT API version negotiation -------------------------------------------
+//
+// The ORT C++ header's static initialiser calls GetApi(ORT_API_VERSION) which
+// fails when the loaded onnxruntime.dll is older than the header (the NuGet
+// DirectML package has shipped mismatched header/DLL pairs). We define
+// ORT_API_MANUAL_INIT (above) and call Ort::InitApi() once with the highest
+// API version the DLL actually supports.
+
+void EnsureOrtApiInitialized()
+{
+    static bool initialized = []() -> bool {
+        const OrtApiBase* base = OrtGetApiBase();
+        // Walk down from the header's version to 1; GetApi returns nullptr
+        // for any version the DLL does not support.
+        for (uint32_t v = ORT_API_VERSION; v >= 1; --v)
+        {
+            const OrtApi* api = base->GetApi(v);
+            if (api != nullptr)
+            {
+                Ort::InitApi(api);
+                if (v < ORT_API_VERSION)
+                {
+                    // Log via fprintf — BackendLog may not be wired yet at
+                    // static-init time; by the time InterpRifeCreate calls us
+                    // it is fine, but guard anyway.
+                    fprintf(stderr,
+                            "interp_rife: ORT API negotiated to v%u (header v%d)\n",
+                            v, ORT_API_VERSION);
+                }
+                return true;
+            }
+        }
+        fprintf(stderr, "interp_rife: FATAL — no ORT API version accepted by the DLL\n");
+        return false;
+    }();
+    (void)initialized;
+}
 
 // --- Context registry ------------------------------------------------------
 //
@@ -169,6 +215,8 @@ struct RifeContext
     int srcH = 0;
     int framesPerPair = 0;   // N intermediate frames; 0 == passthrough (RN-07)
     bool passthrough = false;
+    bool stagingReady = false; // lazy init on first Process call
+    DXGI_FORMAT stagingFormat = DXGI_FORMAT_UNKNOWN;
 
     ID3D11Device* device = nullptr;             // borrowed (bridge-owned)
     ID3D11DeviceContext* deviceContext = nullptr; // borrowed
@@ -217,14 +265,14 @@ RifeContext* LookupContext(int handle)
 // --- D3D11 <-> tensor helpers ----------------------------------------------
 
 HRESULT CreateStagingTexture(ID3D11Device* device, int w, int h,
-                             ID3D11Texture2D** out)
+                             DXGI_FORMAT format, ID3D11Texture2D** out)
 {
     D3D11_TEXTURE2D_DESC desc = {};
     desc.Width = static_cast<UINT>(w);
     desc.Height = static_cast<UINT>(h);
     desc.MipLevels = 1;
     desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.Format = format;
     desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_STAGING;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
@@ -233,10 +281,116 @@ HRESULT CreateStagingTexture(ID3D11Device* device, int w, int h,
 
 // Maps a B8G8R8A8/R8G8B8A8 source texture into a planar RGB float32 tensor
 // normalized to [0,1]. Returns a CATRA_* code.
+// Also supports NV12 (hardware decode format): converts YUV -> RGB on the fly.
 int TextureToTensor(ID3D11DeviceContext* dc, ID3D11Texture2D* staging,
                     ID3D11Texture2D* source, int w, int h,
                     std::vector<float>& tensor)
 {
+    D3D11_TEXTURE2D_DESC srcDesc = {};
+    source->GetDesc(&srcDesc);
+
+    if (srcDesc.Format == DXGI_FORMAT_NV12)
+    {
+        // NV12: AMD drivers fail Map() on subresource 1 (UV plane) of NV12
+        // staging textures.  Workaround: copy each plane into a non-planar
+        // staging texture (R8 for Y, R8G8 for UV) and map those instead.
+        D3D11_TEXTURE2D_DESC yDesc = {};
+        yDesc.Width = static_cast<UINT>(w);
+        yDesc.Height = static_cast<UINT>(h);
+        yDesc.MipLevels = 1;
+        yDesc.ArraySize = 1;
+        yDesc.Format = DXGI_FORMAT_R8_UNORM;
+        yDesc.SampleDesc.Count = 1;
+        yDesc.Usage = D3D11_USAGE_STAGING;
+        yDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+        D3D11_TEXTURE2D_DESC uvDesc = {};
+        uvDesc.Width = static_cast<UINT>(w / 2);
+        uvDesc.Height = static_cast<UINT>(h / 2);
+        uvDesc.MipLevels = 1;
+        uvDesc.ArraySize = 1;
+        uvDesc.Format = DXGI_FORMAT_R8G8_UNORM;
+        uvDesc.SampleDesc.Count = 1;
+        uvDesc.Usage = D3D11_USAGE_STAGING;
+        uvDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+        ID3D11Device* dev = nullptr;
+        dc->GetDevice(&dev);
+        ComPtr<ID3D11Texture2D> yStaging, uvStaging;
+        HRESULT hr2 = dev->CreateTexture2D(&yDesc, nullptr, yStaging.GetAddressOf());
+        if (SUCCEEDED(hr2))
+            hr2 = dev->CreateTexture2D(&uvDesc, nullptr, uvStaging.GetAddressOf());
+        if (dev) dev->Release();
+        if (FAILED(hr2))
+        {
+            BackendLog(CATRA_LOG_ERROR, "interp_rife: NV12 plane staging alloc hr=0x%08lX",
+                       static_cast<unsigned long>(hr2));
+            return CATRA_ERR_DEVICE;
+        }
+
+        // Copy planes from source NV12 texture into separate staging textures.
+        dc->CopySubresourceRegion(yStaging.Get(), 0, 0, 0, 0, source, 0, nullptr);  // Y
+        dc->CopySubresourceRegion(uvStaging.Get(), 0, 0, 0, 0, source, 1, nullptr); // UV
+
+        D3D11_MAPPED_SUBRESOURCE mapY = {};
+        HRESULT hr = dc->Map(yStaging.Get(), 0, D3D11_MAP_READ, 0, &mapY);
+        if (FAILED(hr))
+        {
+            BackendLog(CATRA_LOG_ERROR, "interp_rife: Map(Y R8) failed hr=0x%08lX",
+                       static_cast<unsigned long>(hr));
+            return CATRA_ERR_DEVICE;
+        }
+
+        D3D11_MAPPED_SUBRESOURCE mapUV = {};
+        hr = dc->Map(uvStaging.Get(), 0, D3D11_MAP_READ, 0, &mapUV);
+        if (FAILED(hr))
+        {
+            dc->Unmap(yStaging.Get(), 0);
+            BackendLog(CATRA_LOG_ERROR, "interp_rife: Map(UV R8G8) failed hr=0x%08lX",
+                       static_cast<unsigned long>(hr));
+            return CATRA_ERR_DEVICE;
+        }
+        if (FAILED(hr))
+        {
+            dc->Unmap(staging, 0);
+            BackendLog(CATRA_LOG_ERROR, "interp_rife: Map(NV12 UV) failed hr=0x%08lX",
+                       static_cast<unsigned long>(hr));
+            return CATRA_ERR_DEVICE;
+        }
+
+        const size_t plane = static_cast<size_t>(w) * static_cast<size_t>(h);
+        tensor.resize(plane * 3);
+        const uint8_t* yRows = static_cast<const uint8_t*>(mapY.pData);
+        const uint8_t* uvRows = static_cast<const uint8_t*>(mapUV.pData);
+
+        for (int y = 0; y < h; ++y)
+        {
+            const uint8_t* yPx = yRows + static_cast<size_t>(y) * mapY.RowPitch;
+            const uint8_t* uvPx = uvRows + static_cast<size_t>(y / 2) * mapUV.RowPitch;
+            for (int x = 0; x < w; ++x)
+            {
+                size_t i = static_cast<size_t>(y) * static_cast<size_t>(w) + x;
+                float Y = yPx[x] / 255.0f;
+                float U = uvPx[(x / 2) * 2 + 0] / 255.0f - 0.5f;
+                float V = uvPx[(x / 2) * 2 + 1] / 255.0f - 0.5f;
+
+                // BT.601 YUV -> RGB (full range approximation)
+                float R = Y + 1.402f * V;
+                float G = Y - 0.344136f * U - 0.714136f * V;
+                float B = Y + 1.772f * U;
+
+                tensor[0 * plane + i] = R < 0.0f ? 0.0f : (R > 1.0f ? 1.0f : R);
+                tensor[1 * plane + i] = G < 0.0f ? 0.0f : (G > 1.0f ? 1.0f : G);
+                tensor[2 * plane + i] = B < 0.0f ? 0.0f : (B > 1.0f ? 1.0f : B);
+            }
+        }
+
+        dc->Unmap(uvStaging.Get(), 0);
+        dc->Unmap(yStaging.Get(), 0);
+        return CATRA_OK;
+    }
+
+    // BGRA/RGBA path (original)
     dc->CopyResource(staging, source);
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
@@ -277,9 +431,9 @@ int TensorToTexture(ID3D11Device* device, ID3D11DeviceContext* dc,
                     const std::vector<float>& tensor, int w, int h,
                     ID3D11Texture2D** outTexture)
 {
-    // Intermediate CPU-writeable staging texture.
+    // Intermediate CPU-writeable staging texture (output is always BGRA).
     ComPtr<ID3D11Texture2D> staging;
-    HRESULT hr = CreateStagingTexture(device, w, h, staging.GetAddressOf());
+    HRESULT hr = CreateStagingTexture(device, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, staging.GetAddressOf());
     if (FAILED(hr))
     {
         BackendLog(CATRA_LOG_ERROR, "interp_rife: CreateTexture2D(staging) hr=0x%08lX",
@@ -343,7 +497,8 @@ int TensorToTexture(ID3D11Device* device, ID3D11DeviceContext* dc,
     return CATRA_OK;
 }
 
-// Validates a source frame: non-null, 2D, matching dimensions, 32bpp RGBA.
+// Validates a source frame: non-null, 2D, matching dimensions (height may be
+// hardware-aligned, e.g. 1088 for 1080), 32bpp RGBA or NV12.
 int ValidateFrame(ID3D11Texture2D* tex, int w, int h)
 {
     if (tex == nullptr)
@@ -352,19 +507,20 @@ int ValidateFrame(ID3D11Texture2D* tex, int w, int h)
     }
     D3D11_TEXTURE2D_DESC desc = {};
     tex->GetDesc(&desc);
-    if (static_cast<int>(desc.Width) != w || static_cast<int>(desc.Height) != h)
+    // Width must match exactly; height may be aligned (e.g. 1088 for 1080).
+    if (static_cast<int>(desc.Width) != w || static_cast<int>(desc.Height) < h)
     {
         BackendLog(CATRA_LOG_ERROR,
-                   "interp_rife: frame size %ux%u != context %dx%d",
+                   "interp_rife: frame size %ux%u incompatible with context %dx%d",
                    desc.Width, desc.Height, w, h);
         return CATRA_ERR_INVALID_ARG;
     }
     if (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM &&
-        desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM)
+        desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM &&
+        desc.Format != DXGI_FORMAT_NV12)
     {
-        // NV12 decode frames are converted upstream once ST-15/17 interop lands.
         BackendLog(CATRA_LOG_ERROR,
-                   "interp_rife: unsupported frame format %d (need BGRA/RGBA)",
+                   "interp_rife: unsupported frame format %d (need BGRA/RGBA/NV12)",
                    static_cast<int>(desc.Format));
         return CATRA_ERR_INVALID_ARG;
     }
@@ -387,6 +543,9 @@ int InterpRifeCreate(ID3D11Device* device,
                      int method,
                      int* outCtx)
 {
+    // Negotiate the ORT C API version before any Ort:: object is constructed.
+    EnsureOrtApiInitialized();
+
     if (outCtx != nullptr)
     {
         *outCtx = -1;
@@ -448,16 +607,39 @@ int InterpRifeCreate(ID3D11Device* device,
     // --- Execution providers: DirectML first, CPU fallback ----------------
     ctx->sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 #if defined(USE_DML)
-    try
+    // The DirectML EP is registered via the C export from the ORT DirectML
+    // build. The C++ wrapper method (SessionOptions::AppendExecutionProvider_DML)
+    // does NOT exist in the Microsoft.ML.OnnxRuntime.DirectML NuGet package —
+    // only the flat C export does. We load it dynamically so there is no
+    // link-time dependency on the export (graceful fallback if absent).
+    using DmlAppendFn = OrtStatus*(__stdcall*)(OrtSessionOptions*, int);
+    HMODULE ortMod = GetModuleHandleW(L"onnxruntime.dll");
+    auto dmlAppend = ortMod != nullptr
+        ? reinterpret_cast<DmlAppendFn>(
+              GetProcAddress(ortMod, "OrtSessionOptionsAppendExecutionProvider_DML"))
+        : nullptr;
+    if (dmlAppend != nullptr)
     {
-        // Device id 0 == the primary adapter (the bridge's D3D11 adapter).
-        ctx->sessionOptions.AppendExecutionProvider_DML(0);
-        ctx->useDml = true;
+        OrtSessionOptions* rawOpts = ctx->sessionOptions;
+        OrtStatus* st = dmlAppend(rawOpts, 0 /* device_id: primary adapter */);
+        if (st == nullptr)
+        {
+            ctx->useDml = true;
+        }
+        else
+        {
+            const char* msg = Ort::GetApi().GetErrorMessage(st);
+            BackendLog(CATRA_LOG_WARN,
+                       "interp_rife: DirectML EP unavailable (%s) -> CPU fallback",
+                       msg != nullptr ? msg : "unknown");
+            Ort::GetApi().ReleaseStatus(st);
+            ctx->useDml = false;
+        }
     }
-    catch (const Ort::Exception& e)
+    else
     {
         BackendLog(CATRA_LOG_WARN,
-                   "interp_rife: DirectML EP unavailable (%s) -> CPU fallback", e.what());
+                   "interp_rife: DirectML EP export not found in onnxruntime.dll -> CPU fallback");
         ctx->useDml = false;
     }
 #endif
@@ -581,17 +763,9 @@ int InterpRifeCreate(ID3D11Device* device,
     ctx->tensorB.resize(plane * 3);
     ctx->tensorOut.resize(plane * 3);
 
-    HRESULT hr = CreateStagingTexture(device, srcW, srcH, ctx->inStagingA.GetAddressOf());
-    if (SUCCEEDED(hr))
-    {
-        hr = CreateStagingTexture(device, srcW, srcH, ctx->inStagingB.GetAddressOf());
-    }
-    if (FAILED(hr))
-    {
-        BackendLog(CATRA_LOG_ERROR, "interp_rife: staging texture alloc hr=0x%08lX",
-                   static_cast<unsigned long>(hr));
-        return CATRA_ERR_DEVICE;
-    }
+    // Staging textures are created lazily on the first Process call once we
+    // know the actual frame format (NV12 from hardware decode, or BGRA from
+    // software decode / interop).
 
     int handle = RegisterContext(std::move(ctx));
     if (outCtx != nullptr)
@@ -605,6 +779,9 @@ int InterpRifeProcess(int ctxHandle,
                       void* frameA, void* frameB,
                       void** outFrames, int* outCount)
 {
+    fprintf(stderr, "interp_rife: Process ENTER ctx=%d frameA=%p frameB=%p\n",
+            ctxHandle, frameA, frameB);
+    fflush(stderr);
     if (outFrames != nullptr)
     {
         *outFrames = nullptr;
@@ -634,29 +811,74 @@ int InterpRifeProcess(int ctxHandle,
     ID3D11Texture2D* texA = static_cast<ID3D11Texture2D*>(frameA);
     ID3D11Texture2D* texB = static_cast<ID3D11Texture2D*>(frameB);
 
+    fprintf(stderr, "interp_rife: ValidateFrame A...\n"); fflush(stderr);
     int rc = ValidateFrame(texA, ctx->srcW, ctx->srcH);
     if (rc != CATRA_OK)
     {
+        fprintf(stderr, "interp_rife: ValidateFrame A FAILED rc=%d\n", rc); fflush(stderr);
         return rc;
     }
+    fprintf(stderr, "interp_rife: ValidateFrame B...\n"); fflush(stderr);
     rc = ValidateFrame(texB, ctx->srcW, ctx->srcH);
     if (rc != CATRA_OK)
     {
+        fprintf(stderr, "interp_rife: ValidateFrame B FAILED rc=%d\n", rc); fflush(stderr);
         return rc;
     }
+    fprintf(stderr, "interp_rife: frames validated OK\n"); fflush(stderr);
 
+    // Lazy staging texture creation: detect format from the first frame and
+    // create matching staging textures (NV12 for hardware decode, BGRA for
+    // software / interop).
+    if (!ctx->stagingReady)
+    {
+        D3D11_TEXTURE2D_DESC desc = {};
+        texA->GetDesc(&desc);
+        ctx->stagingFormat = desc.Format;
+
+        // Staging textures must match the SOURCE dimensions exactly (hardware-
+        // aligned, e.g. 1920x1088 for 1080p NV12) so CopyResource succeeds.
+        // TextureToTensor only reads srcW x srcH valid pixels.
+        HRESULT hr = CreateStagingTexture(ctx->device,
+                                          static_cast<int>(desc.Width),
+                                          static_cast<int>(desc.Height),
+                                          ctx->stagingFormat, ctx->inStagingA.GetAddressOf());
+        if (SUCCEEDED(hr))
+        {
+            hr = CreateStagingTexture(ctx->device,
+                                      static_cast<int>(desc.Width),
+                                      static_cast<int>(desc.Height),
+                                      ctx->stagingFormat, ctx->inStagingB.GetAddressOf());
+        }
+        if (FAILED(hr))
+        {
+            BackendLog(CATRA_LOG_ERROR, "interp_rife: staging texture alloc hr=0x%08lX (format=%d, %ux%u)",
+                       static_cast<unsigned long>(hr), static_cast<int>(ctx->stagingFormat),
+                       desc.Width, desc.Height);
+            return CATRA_ERR_DEVICE;
+        }
+        ctx->stagingReady = true;
+        fprintf(stderr, "interp_rife: staging textures created (format=%d, %ux%u)\n",
+                static_cast<int>(ctx->stagingFormat), desc.Width, desc.Height);
+    }
+
+    fprintf(stderr, "interp_rife: TextureToTensor A...\n"); fflush(stderr);
     rc = TextureToTensor(ctx->deviceContext, ctx->inStagingA.Get(), texA,
                          ctx->srcW, ctx->srcH, ctx->tensorA);
     if (rc != CATRA_OK)
     {
+        fprintf(stderr, "interp_rife: TextureToTensor A FAILED rc=%d\n", rc); fflush(stderr);
         return rc;
     }
+    fprintf(stderr, "interp_rife: TextureToTensor B...\n"); fflush(stderr);
     rc = TextureToTensor(ctx->deviceContext, ctx->inStagingB.Get(), texB,
                          ctx->srcW, ctx->srcH, ctx->tensorB);
     if (rc != CATRA_OK)
     {
+        fprintf(stderr, "interp_rife: TextureToTensor B FAILED rc=%d\n", rc); fflush(stderr);
         return rc;
     }
+    fprintf(stderr, "interp_rife: tensors ready, starting inference loop N=%d\n", ctx->framesPerPair); fflush(stderr);
 
     const int N = ctx->framesPerPair;
     const int64_t w = ctx->srcW;

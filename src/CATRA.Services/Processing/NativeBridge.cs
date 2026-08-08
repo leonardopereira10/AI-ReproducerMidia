@@ -488,6 +488,8 @@ public sealed class NativeBridge : INativeBridge
 
     private void OnNativeLog(string message, int level)
     {
+        System.Diagnostics.Trace.WriteLine($"[catra-gpu] {message}");
+        Console.Error.WriteLine($"[catra-gpu] {message}");
         LogReceived?.Invoke(this, new NativeLogEventArgs(message, level));
     }
 

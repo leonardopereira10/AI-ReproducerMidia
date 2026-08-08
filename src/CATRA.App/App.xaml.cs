@@ -48,6 +48,22 @@ public partial class App : Application
         // TEMP: route Trace.WriteLine to stderr for diagnostics.
         System.Diagnostics.Trace.Listeners.Add(new System.Diagnostics.ConsoleTraceListener { TraceOutputOptions = System.Diagnostics.TraceOptions.None });
 
+        // Global crash handler: log unhandled exceptions to stderr before the app dies.
+        AppDomain.CurrentDomain.UnhandledException += (_, args) =>
+        {
+            var ex = args.ExceptionObject as Exception;
+            Console.Error.WriteLine($"[FATAL] Unhandled exception (terminating={args.IsTerminating}):\n{ex}");
+        };
+        DispatcherUnhandledException += (_, args) =>
+        {
+            Console.Error.WriteLine($"[FATAL] Dispatcher unhandled exception:\n{args.Exception}");
+            args.Handled = false; // let it crash so we see the full trace
+        };
+        TaskScheduler.UnobservedTaskException += (_, args) =>
+        {
+            Console.Error.WriteLine($"[FATAL] Unobserved task exception:\n{args.Exception}");
+        };
+
         ConfigureFfmpeg();
 
         _host = Host.CreateDefaultBuilder()

@@ -23,10 +23,14 @@
        on machines where the native toolchain has not run (NativeBridge then
        degrades to "unavailable"). -->
   <PropertyGroup>
-    <CatraNativeDll>$(MSBuildThisFileDirectory)..\..\native\catra-gpu\install\runtimes\win-x64\native\catra-gpu.dll</CatraNativeDll>
+    <CatraNativeDir>$(MSBuildThisFileDirectory)..\..\native\catra-gpu\install\runtimes\win-x64\native</CatraNativeDir>
+    <CatraNativeDll>$(CatraNativeDir)\catra-gpu.dll</CatraNativeDll>
   </PropertyGroup>
   <ItemGroup Condition="Exists('$(CatraNativeDll)')">
     <None Include="$(CatraNativeDll)" CopyToOutputDirectory="PreserveNewest" Link="runtimes\win-x64\native\catra-gpu.dll" Visible="false" />
+    <!-- ST-13: deploy ONNX Runtime DLLs next to catra-gpu.dll so the loader
+         finds the matching version (1.18.1) instead of a stale system-wide one. -->
+    <None Include="$(CatraNativeDir)\onnxruntime*.dll" CopyToOutputDirectory="PreserveNewest" Link="runtimes\win-x64\native\%(Filename)%(Extension)" Visible="false" Condition="Exists('$(CatraNativeDir)\onnxruntime.dll')" />
   </ItemGroup>
 
   <!-- ST-05: deploy FFmpeg native DLLs when present in lib/ffmpeg/.

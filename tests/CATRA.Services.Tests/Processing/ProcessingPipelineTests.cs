@@ -44,6 +44,8 @@ internal sealed class FakeFrameDecoder : IFrameDecoder
 
     public FrameSourceMetadata Metadata { get; private set; } = null!;
 
+    public IntPtr D3D11DevicePtr => IntPtr.Zero; // fake: no real GPU device
+
     public string? OpenedPath { get; private set; }
 
     public bool Disposed => _disposed;
@@ -184,12 +186,11 @@ internal sealed class FakeNativeBridge : INativeBridge
 
     public IntPtr CreateInterpolation(int srcWidth, int srcHeight, double srcFps, double targetFps, int method)
     {
+        InterpCreateCount++;
         if (ThrowOnInterpCreate is not null)
         {
             throw ThrowOnInterpCreate;
         }
-
-        InterpCreateCount++;
         LastInterpSrcFps = srcFps;
         LastInterpTargetFps = targetFps;
         Calls.Add("interp_create");
@@ -505,6 +506,39 @@ public class ProcessingPipelineTests : IDisposable
         bridge.LastEncodeHeight.Should().Be(1080);
         bridge.LastEncodeBitrate.Should().Be(20_000);
         bridge.LastEncodeFps.Should().Be(135);
+    }
+
+    // --- graceful degradation: interp unavailable ----------------------------
+
+    [Fact]
+    public async Task GracefulDegradation_InterpCreateFails_PipelineContinuesWithoutInterp()
+    {
+        // Simulates the real-world scenario: RIFE model missing, ORT version
+        // mismatch, or GPU init failure. The pipeline must catch the
+        // NativeBridgeException, skip interpolation, and still produce output
+        // (upscale + encode + mux).
+        string folder = NewTempFolder();
+        var spec = new FakeDecoderSpec
+        {
+            Metadata = new FrameSourceMetadata(24, 1280, 720, TimeSpan.FromSeconds(2), 3),
+            FrameCount = 3,
+        };
+        var (pipeline, bridge, _, _) = Build(spec);
+        bridge.ThrowOnInterpCreate = new NativeBridgeException(
+            "Native call 'catra_interp_create' failed with error code -1.", -1);
+
+        ProcessResult result = await pipeline.ProcessAsync(
+            Ep(1, Path.Combine(folder, "src.mp4")),
+            LocalConfig(folder),
+            new CapturingProgress(),
+            CancellationToken.None);
+
+        result.Success.Should().BeTrue("pipeline degrades gracefully when interp is unavailable");
+        bridge.InterpCreateCount.Should().Be(1, "interp create was attempted");
+        bridge.InterpProcessCount.Should().Be(0, "no interp processing when create failed");
+        bridge.InterpDestroyCount.Should().Be(0, "no interp destroy when create failed");
+        bridge.UpscaleCreateCount.Should().Be(1, "upscale still runs after interp failure");
+        bridge.EncodeCreateCount.Should().Be(1, "encode still runs after interp failure");
     }
 
     // --- full flow orchestration -------------------------------------------

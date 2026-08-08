@@ -28,6 +28,15 @@ public interface IFrameDecoder : IDisposable
     FrameSourceMetadata Metadata { get; }
 
     /// <summary>
+    /// The D3D11 device pointer (<c>ID3D11Device*</c>) used by the hardware decoder.
+    /// Valid after <see cref="Open"/> when D3D11VA is available; <see cref="IntPtr.Zero"/>
+    /// otherwise. The processing pipeline must pass this to
+    /// <see cref="INativeBridge.Initialize"/> so the native bridge shares the same
+    /// device and can consume decoder textures.
+    /// </summary>
+    IntPtr D3D11DevicePtr { get; }
+
+    /// <summary>
     /// Opens <paramref name="filePath"/>, reads stream info and creates the decoder
     /// (preferring D3D11VA, falling back to software). Populates <see cref="Metadata"/>.
     /// </summary>

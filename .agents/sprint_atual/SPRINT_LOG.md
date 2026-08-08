@@ -2,7 +2,7 @@
 
 **Fase 1:** CONCLUÍDA — tag v0.1.0, 11/11 subtasks, arquivada em .agents/Learning/sprints/SPRINT_01/
 **Fase 2 início:** 2026-08-02
-**Testes atuais:** 477 (Core 2 + UI 87 + Data 20 + Services 368) — build 0w/0e
+**Testes atuais:** 542 (Core 2 + UI 124 + Data 20 + Services 396) — build 0w/0e
 
 ## ⚠️ Restrição ambiental (Fase 2)
 - SEM MSVC (cl.exe) / SEM VS2022 / SEM vcpkg → **build nativo C++ NÃO verificável** (validação por INSPEÇÃO + scripts/build-native.ps1 documentado p/ máquina com toolchain)
@@ -21,6 +21,7 @@
 | ST-18 | Janela deslizante | ✅ | ✅ | ✅ | f8a110b | 1 (timeout) |
 | ST-19 | UI pre-processar | ✅ | ✅ (ressalva) | ✅ | 485a06d | 1 (timeout) |
 | (fix) | Dispose VMs on navigation | ✅ | — | — | 9be098a | follow-up leak sistêmico |
+| (fix) | RIFE ORT version negotiation + graceful degradation test | ✅ | — | ✅ (build+test) | pendente | — |
 | ST-20 | Playback/DLNA usar processado | 🔄 EM ANDAMENTO | — | — | — | 0 |
 | ST-21 | Cleanup on close + startup | ⏳ | — | — | — | 0 |
 | ST-22 | Settings processamento | ⏳ | — | — | — | 0 |
@@ -39,3 +40,6 @@
 
 ## Eventos
 - ST-20 iniciou dev (run d7919a7a) — pode estar com working tree não commitado ao retomar.
+- Fix RIFE ORT: version negotiation (API 18→17 fallback) + DML probe fix + graceful degradation test.
+  **Validação real (playback/GPU) = MANUAL** — requer máquina com MSVC + AMD GPU + onnxruntime.dll DirectML.
+  Código nativo validado por INSPEÇÃO; camada C# testada com fakes (542 testes, 0 falhas).

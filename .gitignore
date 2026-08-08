@@ -67,7 +67,7 @@ lib/ffmpeg/
 
 # ---- RIFE model + ONNX Runtime binaries (ST-13) ----
 # Large binaries downloaded on demand by scripts/build-native.ps1; never committed.
-lib/rife/
+lib/rife/*.onnx
 lib/onnxruntime/
 *.onnx
 
