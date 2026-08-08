@@ -24,6 +24,7 @@
 | (fix) | RIFE ORT version negotiation + graceful degradation test | ✅ | — | ✅ (build+test) | eff437e | — |
 | (fix) | DXGI_DEVICE_REMOVED: 4 root causes (AMD timeout quirk, key=0, NV12 out, Flush) | ✅ | — | ✅ (build+test+GPU real) | ab9459a | — |
 | (fix) | Bundle ffmpeg/ffprobe CLI para audio mux | ✅ | — | ✅ (build+test+mux smoke) | 9cf7da1 | — |
+| (fix) | Frames verdes: AMD RDNA4 não compartilha NV12 D3D11→D3D12 (view lê zeros) | ✅ | — | ✅ (diag tool + dump decodificado) | aee1166 | — |
 | ST-20 | Playback/DLNA usar processado | 🔄 EM ANDAMENTO | — | — | — | 0 |
 | ST-21 | Cleanup on close + startup | ⏳ | — | — | — | 0 |
 | ST-22 | Settings processamento | ⏳ | — | — | — | 0 |
@@ -106,3 +107,14 @@
   - **TODOS os critérios de aceite do fix DXGI_DEVICE_REMOVED atendidos**:
     pipeline completa múltiplos frame pairs sem erro, múltiplos ProcessInterpolation
     + EncodeFrame sem falha, dotnet build/test verdes (542), .mp4 na pasta de output.
+
+- **FIX FRAMES VERDES (commit aee1166)**: após o mux funcionar, o MP4 saiu todo
+  verde. Diagnóstico com `native/catra-gpu/tools/interop_readback_test.cpp`
+  (readback do resource D3D12 compartilhado): BGRA=PASS, NV12=zeros. O driver
+  AMD RDNA 4 NÃO compartilha texturas NV12 (planares) criadas no D3D11 para o
+  D3D12 via NT handle (a view D3D12 lê zeros → YUV=0 → verde). Fix: unificar o
+  pipeline em BGRA — interop converte frames NV12 do decoder p/ BGRA antes do
+  pooled copy (CopySubresourceRegion p/ R8/R8G8 + combine CPU BT.601, mesma
+  técnica que o RIFE já usa com sucesso); RIFE volta a emitir BGRA; encoder AMF
+  Init com AMF_SURFACE_BGRA. Dump de diagnóstico decodifica p/ pattern correto
+  (sem verde). 3ª corrida do EP28 em andamento p/ validar o MP4 final.
