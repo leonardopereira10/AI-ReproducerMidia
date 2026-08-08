@@ -368,6 +368,146 @@ HRESULT ShareViaTempCopy(ID3D11Device* d3d11Device,
     return ShareD3D11ToD3D12Direct(d3d12Device, staging.Get(), out, nullptr);
 }
 
+// NV12 -> BGRA conversion on the D3D11 side.
+//
+// The AMD RDNA 4 driver does not correctly share D3D11-CREATED NV12 (planar)
+// textures into D3D12 via NT handles: the opened D3D12 resource reads zeros
+// (verified with tools/interop_readback_test.cpp — BGRA shares cleanly, NV12
+// does not). To keep the pooled share BGRA-only, NV12 decoder frames are
+// converted to BGRA here before the pooled copy.
+//
+// Technique mirrors interp_rife.cpp TextureToTensor (proven on this driver):
+// AMD fails Map() on the NV12 UV subresource, so each plane is first copied
+// into a non-planar staging texture (R8 for Y, R8G8 for UV) and mapped there.
+// The Y/UV bytes are combined on the CPU (BT.601 full-range) into a BGRA
+// staging texture, then copied to a shader-bindable BGRA GPU texture.
+ComPtr<ID3D11Texture2D> ConvertNv12ToBgra11(ID3D11Texture2D* src,
+                                            const D3D11_TEXTURE2D_DESC& srcDesc)
+{
+    const int w = static_cast<int>(srcDesc.Width);
+    const int h = static_cast<int>(srcDesc.Height);
+
+    D3D11_TEXTURE2D_DESC yDesc = {};
+    yDesc.Width = srcDesc.Width;
+    yDesc.Height = srcDesc.Height;
+    yDesc.MipLevels = 1;
+    yDesc.ArraySize = 1;
+    yDesc.Format = DXGI_FORMAT_R8_UNORM;
+    yDesc.SampleDesc.Count = 1;
+    yDesc.Usage = D3D11_USAGE_STAGING;
+    yDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+    D3D11_TEXTURE2D_DESC uvDesc = yDesc;
+    uvDesc.Width = srcDesc.Width / 2;
+    uvDesc.Height = srcDesc.Height / 2;
+    uvDesc.Format = DXGI_FORMAT_R8G8_UNORM;
+
+    ComPtr<ID3D11Texture2D> yStaging, uvStaging;
+    HRESULT hr = g_d3d11Device->CreateTexture2D(&yDesc, nullptr, yStaging.GetAddressOf());
+    if (SUCCEEDED(hr))
+        hr = g_d3d11Device->CreateTexture2D(&uvDesc, nullptr, uvStaging.GetAddressOf());
+    if (FAILED(hr))
+    {
+        catra::BackendLog(CATRA_LOG_ERROR, "interop: NV12 plane staging alloc hr=0x%08lX",
+                   static_cast<unsigned long>(hr));
+        return nullptr;
+    }
+
+    g_d3d11Context->CopySubresourceRegion(yStaging.Get(), 0, 0, 0, 0, src, 0, nullptr);  // Y
+    g_d3d11Context->CopySubresourceRegion(uvStaging.Get(), 0, 0, 0, 0, src, 1, nullptr); // UV
+
+    D3D11_MAPPED_SUBRESOURCE mapY = {}, mapUV = {};
+    hr = g_d3d11Context->Map(yStaging.Get(), 0, D3D11_MAP_READ, 0, &mapY);
+    if (SUCCEEDED(hr))
+        hr = g_d3d11Context->Map(uvStaging.Get(), 0, D3D11_MAP_READ, 0, &mapUV);
+    if (FAILED(hr))
+    {
+        catra::BackendLog(CATRA_LOG_ERROR, "interop: NV12 plane map hr=0x%08lX",
+                   static_cast<unsigned long>(hr));
+        return nullptr;
+    }
+
+    // BGRA staging (CPU write) + destination GPU texture.
+    D3D11_TEXTURE2D_DESC bgraStagingDesc = {};
+    bgraStagingDesc.Width = srcDesc.Width;
+    bgraStagingDesc.Height = srcDesc.Height;
+    bgraStagingDesc.MipLevels = 1;
+    bgraStagingDesc.ArraySize = 1;
+    bgraStagingDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    bgraStagingDesc.SampleDesc.Count = 1;
+    bgraStagingDesc.Usage = D3D11_USAGE_STAGING;
+    bgraStagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+
+    ComPtr<ID3D11Texture2D> bgraStaging;
+    hr = g_d3d11Device->CreateTexture2D(&bgraStagingDesc, nullptr, bgraStaging.GetAddressOf());
+    if (FAILED(hr))
+    {
+        g_d3d11Context->Unmap(uvStaging.Get(), 0);
+        g_d3d11Context->Unmap(yStaging.Get(), 0);
+        catra::BackendLog(CATRA_LOG_ERROR, "interop: BGRA staging alloc hr=0x%08lX",
+                   static_cast<unsigned long>(hr));
+        return nullptr;
+    }
+
+    D3D11_MAPPED_SUBRESOURCE mapB = {};
+    hr = g_d3d11Context->Map(bgraStaging.Get(), 0, D3D11_MAP_WRITE, 0, &mapB);
+    if (FAILED(hr))
+    {
+        g_d3d11Context->Unmap(uvStaging.Get(), 0);
+        g_d3d11Context->Unmap(yStaging.Get(), 0);
+        catra::BackendLog(CATRA_LOG_ERROR, "interop: BGRA staging map hr=0x%08lX",
+                   static_cast<unsigned long>(hr));
+        return nullptr;
+    }
+
+    const uint8_t* yRows = static_cast<const uint8_t*>(mapY.pData);
+    const uint8_t* uvRows = static_cast<const uint8_t*>(mapUV.pData);
+    auto clamp8 = [](float v) -> uint8_t {
+        return v < 0.0f ? 0 : (v > 255.0f ? 255 : static_cast<uint8_t>(v + 0.5f));
+    };
+
+    for (int y = 0; y < h; ++y)
+    {
+        const uint8_t* yPx = yRows + static_cast<size_t>(y) * mapY.RowPitch;
+        const uint8_t* uvPx = uvRows + static_cast<size_t>(y / 2) * mapUV.RowPitch;
+        uint8_t* dst = static_cast<uint8_t*>(mapB.pData) + static_cast<size_t>(y) * mapB.RowPitch;
+        for (int x = 0; x < w; ++x)
+        {
+            float Y = yPx[x];
+            float U = uvPx[(x / 2) * 2 + 0] - 128.0f;
+            float V = uvPx[(x / 2) * 2 + 1] - 128.0f;
+            // BT.601 full-range YUV -> RGB
+            float R = Y + 1.402f * V;
+            float G = Y - 0.344136f * U - 0.714136f * V;
+            float B = Y + 1.772f * U;
+            dst[x * 4 + 0] = clamp8(B);
+            dst[x * 4 + 1] = clamp8(G);
+            dst[x * 4 + 2] = clamp8(R);
+            dst[x * 4 + 3] = 255;
+        }
+    }
+
+    g_d3d11Context->Unmap(bgraStaging.Get(), 0);
+    g_d3d11Context->Unmap(uvStaging.Get(), 0);
+    g_d3d11Context->Unmap(yStaging.Get(), 0);
+
+    D3D11_TEXTURE2D_DESC gpuDesc = bgraStagingDesc;
+    gpuDesc.Usage = D3D11_USAGE_DEFAULT;
+    gpuDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    gpuDesc.CPUAccessFlags = 0;
+
+    ComPtr<ID3D11Texture2D> dst11;
+    hr = g_d3d11Device->CreateTexture2D(&gpuDesc, nullptr, dst11.GetAddressOf());
+    if (FAILED(hr))
+    {
+        catra::BackendLog(CATRA_LOG_ERROR, "interop: BGRA GPU texture hr=0x%08lX",
+                   static_cast<unsigned long>(hr));
+        return nullptr;
+    }
+    g_d3d11Context->CopyResource(dst11.Get(), bgraStaging.Get());
+    return dst11;
+}
+
 } // namespace
 
 namespace catra {
@@ -588,6 +728,25 @@ int interop_share_d3d11_to_d3d12(ID3D11Texture2D* src,
     // POOLED COPY: source is not NT-shareable (typical D3D11VA decoder
     // texture). Copy into the next round-robin shared slot — one GPU-GPU
     // copy, zero CPU traffic, no per-frame allocation.
+    //
+    // NV12 (planar) sources are first converted to BGRA: the AMD RDNA 4
+    // driver does not correctly share D3D11-created NV12 textures into D3D12
+    // (the D3D12 view reads zeros -> green frames). Keeping the pool BGRA-only
+    // also means a single pool format for the whole pipeline (decoder frames
+    // and RIFE intermediates are both BGRA by the time they reach the pool).
+    ComPtr<ID3D11Texture2D> converted;
+    ID3D11Texture2D* copySrc = src;
+    if (desc.Format == DXGI_FORMAT_NV12)
+    {
+        converted = ConvertNv12ToBgra11(src, desc);
+        if (converted == nullptr)
+        {
+            return CATRA_ERR_DEVICE;
+        }
+        copySrc = converted.Get();
+        copySrc->GetDesc(&desc); // pool geometry now matches the BGRA texture
+    }
+
     int rc = EnsurePoolLocked(desc);
     if (rc != CATRA_OK)
     {
@@ -631,7 +790,7 @@ int interop_share_d3d11_to_d3d12(ID3D11Texture2D* src,
         return HrToCatra(ahr);
     }
 
-    rc = interop_copy_d3d11(g_d3d11Context.Get(), src, slot.tex11.Get());
+    rc = interop_copy_d3d11(g_d3d11Context.Get(), copySrc, slot.tex11.Get());
 
     // ROOT-CAUSE FIX — DXGI_ERROR_DEVICE_HUNG/REMOVED (0x887A0001) on the
     // AMF encode after RIFE interpolation:

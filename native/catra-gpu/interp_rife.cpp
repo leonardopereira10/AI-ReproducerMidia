@@ -497,139 +497,6 @@ int TensorToTexture(ID3D11Device* device, ID3D11DeviceContext* dc,
     return CATRA_OK;
 }
 
-// Converts an RGB float32 tensor (CHW layout) into an NV12 D3D11 texture
-// (DXGI_FORMAT_NV12, two-plane Y+UV). The AMF HEVC encoder requires NV12
-// input; feeding BGRA surfaces causes sporadic SubmitInput failures
-// (AMF_FAIL) on RDNA 4 even though CreateSurfaceFromDX12Native accepts them.
-// BT.709 coefficients for full-range [0,255].
-int TensorToNV12Texture(ID3D11Device* device, ID3D11DeviceContext* dc,
-                        const std::vector<float>& tensor, int w, int h,
-                        ID3D11Texture2D** outTexture)
-{
-    const size_t plane = static_cast<size_t>(w) * static_cast<size_t>(h);
-
-    // --- Convert RGB float32 -> NV12 Y and UV planes ----------------------
-    std::vector<uint8_t> yPlane(plane);
-    const size_t uvW = static_cast<size_t>(w) / 2;
-    const size_t uvH = static_cast<size_t>(h) / 2;
-    std::vector<uint8_t> uvPlane(uvW * uvH * 2); // interleaved U, V
-
-    auto clamp8 = [](float v) -> uint8_t {
-        return v < 0.0f ? 0 : (v > 255.0f ? 255 : static_cast<uint8_t>(v + 0.5f));
-    };
-
-    for (int py = 0; py < h; ++py)
-    {
-        for (int px = 0; px < w; ++px)
-        {
-            size_t i = static_cast<size_t>(py) * w + px;
-            float r = tensor[0 * plane + i] * 255.0f;
-            float g = tensor[1 * plane + i] * 255.0f;
-            float b = tensor[2 * plane + i] * 255.0f;
-            // BT.709 full-range luma
-            float Y = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-            yPlane[i] = clamp8(Y);
-        }
-    }
-    for (size_t vy = 0; vy < uvH; ++vy)
-    {
-        for (size_t vx = 0; vx < uvW; ++vx)
-        {
-            // Average the 2x2 block for chroma subsampling
-            size_t baseY = vy * 2;
-            size_t baseX = vx * 2;
-            float sumR = 0, sumG = 0, sumB = 0;
-            for (int dy = 0; dy < 2; ++dy)
-            {
-                for (int dx = 0; dx < 2; ++dx)
-                {
-                    size_t i = (baseY + dy) * w + (baseX + dx);
-                    sumR += tensor[0 * plane + i];
-                    sumG += tensor[1 * plane + i];
-                    sumB += tensor[2 * plane + i];
-                }
-            }
-            float R = (sumR / 4.0f) * 255.0f;
-            float G = (sumG / 4.0f) * 255.0f;
-            float B = (sumB / 4.0f) * 255.0f;
-            // BT.709 full-range chroma
-            float U = -0.1146f * R - 0.3854f * G + 0.5000f * B + 128.0f;
-            float V =  0.5000f * R - 0.4542f * G - 0.0458f * B + 128.0f;
-            size_t uvIdx = (vy * uvW + vx) * 2;
-            uvPlane[uvIdx + 0] = clamp8(U);
-            uvPlane[uvIdx + 1] = clamp8(V);
-        }
-    }
-
-    // --- Create NV12 staging texture and upload ----------------------------
-    D3D11_TEXTURE2D_DESC stagingDesc = {};
-    stagingDesc.Width = static_cast<UINT>(w);
-    stagingDesc.Height = static_cast<UINT>(h);
-    stagingDesc.MipLevels = 1;
-    stagingDesc.ArraySize = 1;
-    stagingDesc.Format = DXGI_FORMAT_NV12;
-    stagingDesc.SampleDesc.Count = 1;
-    stagingDesc.Usage = D3D11_USAGE_STAGING;
-    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-
-    ComPtr<ID3D11Texture2D> staging;
-    HRESULT hr = device->CreateTexture2D(&stagingDesc, nullptr, staging.GetAddressOf());
-    if (FAILED(hr))
-    {
-        BackendLog(CATRA_LOG_ERROR, "interp_rife: NV12 staging CreateTexture2D hr=0x%08lX",
-                   static_cast<unsigned long>(hr));
-        return CATRA_ERR_DEVICE;
-    }
-
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    hr = dc->Map(staging.Get(), 0, D3D11_MAP_WRITE, 0, &mapped);
-    if (FAILED(hr))
-    {
-        BackendLog(CATRA_LOG_ERROR, "interp_rife: NV12 Map hr=0x%08lX",
-                   static_cast<unsigned long>(hr));
-        return CATRA_ERR_DEVICE;
-    }
-
-    // Y plane (subresource 0)
-    uint8_t* dst = static_cast<uint8_t*>(mapped.pData);
-    for (int py = 0; py < h; ++py)
-    {
-        memcpy(dst + static_cast<size_t>(py) * mapped.RowPitch,
-               yPlane.data() + static_cast<size_t>(py) * w, w);
-    }
-    // UV plane (subresource 1, offset by height rows at RowPitch)
-    uint8_t* uvDst = dst + static_cast<size_t>(h) * mapped.RowPitch;
-    for (size_t vy = 0; vy < uvH; ++vy)
-    {
-        memcpy(uvDst + vy * mapped.RowPitch,
-               uvPlane.data() + vy * uvW * 2, uvW * 2);
-    }
-    dc->Unmap(staging.Get(), 0);
-
-    // --- Create GPU-default NV12 texture and copy --------------------------
-    D3D11_TEXTURE2D_DESC gpuDesc = {};
-    gpuDesc.Width = static_cast<UINT>(w);
-    gpuDesc.Height = static_cast<UINT>(h);
-    gpuDesc.MipLevels = 1;
-    gpuDesc.ArraySize = 1;
-    gpuDesc.Format = DXGI_FORMAT_NV12;
-    gpuDesc.SampleDesc.Count = 1;
-    gpuDesc.Usage = D3D11_USAGE_DEFAULT;
-    gpuDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-
-    ComPtr<ID3D11Texture2D> dst11;
-    hr = device->CreateTexture2D(&gpuDesc, nullptr, dst11.GetAddressOf());
-    if (FAILED(hr))
-    {
-        BackendLog(CATRA_LOG_ERROR, "interp_rife: NV12 GPU texture hr=0x%08lX",
-                   static_cast<unsigned long>(hr));
-        return CATRA_ERR_DEVICE;
-    }
-    dc->CopyResource(dst11.Get(), staging.Get());
-    *outTexture = dst11.Detach();
-    return CATRA_OK;
-}
-
 // Validates a source frame: non-null, 2D, matching dimensions (height may be
 // hardware-aligned, e.g. 1088 for 1080), 32bpp RGBA or NV12.
 int ValidateFrame(ID3D11Texture2D* tex, int w, int h)
@@ -1086,10 +953,13 @@ int InterpRifeProcess(int ctxHandle,
             std::copy(outData, outData + pixelCount, ctx->tensorOut.begin());
 
             ID3D11Texture2D* outTex = nullptr;
-            // Output NV12 (required by AMF HEVC encoder) instead of BGRA.
-            // RGB float32 tensor -> NV12 (Y + UV planes, BT.709 full-range).
-            rc = TensorToNV12Texture(ctx->device, ctx->deviceContext, ctx->tensorOut,
-                                     ctx->srcW, ctx->srcH, &outTex);
+            // BGRA output: the AMD RDNA 4 driver does not correctly share
+            // D3D11-created NV12 (planar) textures into D3D12 via NT handles
+            // (verified with tools/interop_readback_test.cpp: the D3D12 view
+            // reads zeros). BGRA shares cleanly, so the whole pipeline runs
+            // BGRA and the AMF encoder is initialized with AMF_SURFACE_BGRA.
+            rc = TensorToTexture(ctx->device, ctx->deviceContext, ctx->tensorOut,
+                                 ctx->srcW, ctx->srcH, &outTex);
             if (rc != CATRA_OK)
             {
                 releaseProduced();

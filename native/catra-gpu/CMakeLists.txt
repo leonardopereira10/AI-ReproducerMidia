@@ -165,6 +165,33 @@ target_link_libraries(catra-gpu PRIVATE
     dxguid
     d3dcompiler)
 
+# --- Diagnostic tool (NOT installed/shipped) -------------------------------
+# Standalone readback test: verifies the D3D11 -> D3D12 pooled share actually
+# transfers pixel data on the current driver (AMD RDNA 4 green-frame issue).
+add_executable(catra-interop-test
+    tools/interop_readback_test.cpp
+    d3d_interop.cpp
+    encode_amf.cpp)
+target_include_directories(catra-interop-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+if(MSVC)
+    target_compile_options(catra-interop-test PRIVATE /W3 /utf-8 /EHsc)
+    target_compile_definitions(catra-interop-test PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+target_link_libraries(catra-interop-test PRIVATE d3d12 dxgi d3d11 dxguid)
+if(TARGET Microsoft::DirectX-Headers)
+    target_link_libraries(catra-interop-test PRIVATE Microsoft::DirectX-Headers)
+endif()
+# The RIFE stage of the diagnostic tool needs ONNX Runtime (+DirectML) just
+# like the main DLL.
+target_sources(catra-interop-test PRIVATE interp_rife.cpp)
+if(CATRA_ONNXRUNTIME_TARGET)
+    target_compile_definitions(catra-interop-test PRIVATE CATRA_HAS_ONNXRUNTIME=1)
+    target_link_libraries(catra-interop-test PRIVATE ${CATRA_ONNXRUNTIME_TARGET})
+endif()
+if(CATRA_HAS_DML)
+    target_compile_definitions(catra-interop-test PRIVATE USE_DML=1)
+endif()
+
 # Optional vcpkg-provided packages (linked when the toolchain resolved them).
 if(TARGET Microsoft::DirectX-Headers)
     target_link_libraries(catra-gpu PRIVATE Microsoft::DirectX-Headers)
@@ -263,6 +290,9 @@ if(CATRA_WITH_AMF AND DEFINED CATRA_AMF_ROOT)
         set(CATRA_HAS_AMF TRUE)
         target_include_directories(catra-gpu PRIVATE "${CATRA_AMF_ROOT}")
         target_compile_definitions(catra-gpu PRIVATE CATRA_HAS_AMF=1)
+        # The diagnostic tool exercises the AMF encode path too.
+        target_include_directories(catra-interop-test PRIVATE "${CATRA_AMF_ROOT}")
+        target_compile_definitions(catra-interop-test PRIVATE CATRA_HAS_AMF=1)
         message(STATUS "catra-gpu: AMF SDK found at ${CATRA_AMF_ROOT} -> AMF H.265 encode enabled")
     else()
         message(WARNING

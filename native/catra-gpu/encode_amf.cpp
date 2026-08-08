@@ -403,12 +403,17 @@ int AmfEncoder::Create(ID3D12Device* device12,
                    static_cast<int>(res));
     }
 
-    // --- 6. Init (input format NV12; the pipeline feeds NV12 frames) -------
-    res = d.encoder->Init(AMF_SURFACE_NV12, width, height);
+    // --- 6. Init (input format BGRA) ---------------------------------------
+    // The pipeline feeds BGRA surfaces: RIFE intermediates are BGRA and NV12
+    // decoder frames are converted to BGRA by the interop pooled path (the
+    // AMD RDNA 4 driver does not correctly share D3D11-created NV12 planar
+    // textures into D3D12 — the D3D12 view reads zeros; BGRA shares cleanly).
+    // AMD VCN HEVC accepts BGRA input (converted on-die).
+    res = d.encoder->Init(AMF_SURFACE_BGRA, width, height);
     if (res != AMF_OK)
     {
         BackendLog(CATRA_LOG_ERROR,
-                   "encode_amf: encoder Init(%dx%d NV12) failed (res=%d)", width, height,
+                   "encode_amf: encoder Init(%dx%d BGRA) failed (res=%d)", width, height,
                    static_cast<int>(res));
         return CATRA_ERR_DEVICE;
     }
