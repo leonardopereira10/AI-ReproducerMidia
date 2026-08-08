@@ -42,6 +42,9 @@
   </PropertyGroup>
   <ItemGroup Condition="Exists('$(FfmpegLibDir)')">
     <None Include="$(FfmpegLibDir)\*.dll" CopyToOutputDirectory="PreserveNewest" Link="lib\ffmpeg\%(Filename)%(Extension)" Visible="false" />
+    <!-- Audio mux (ST-17) shells out to the ffmpeg/ffprobe CLIs; deploy them
+         alongside the shared DLLs when the download script brought them in. -->
+    <None Include="$(FfmpegLibDir)\*.exe" CopyToOutputDirectory="PreserveNewest" Link="lib\ffmpeg\%(Filename)%(Extension)" Visible="false" />
   </ItemGroup>
 
 </Project>

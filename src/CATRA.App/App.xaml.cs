@@ -108,7 +108,11 @@ public partial class App : Application
                 // IMediaProbeService is ffprobe-based; the real binary is bundled
                 // later (ST-05, FFmpeg.AutoGen) — until then probing returns null.
                 services.AddSingleton<IFilenameParser, FilenameParser>();
-                services.AddSingleton<IMediaProbeService, FfprobeMediaProbeService>();
+                // ffprobe CLI probe: prefer the bundled binary (lib/ffmpeg/, deployed
+                // by CATRA.App.csproj from scripts/download-ffmpeg.ps1), fall back to
+                // PATH (the service degrades to null metadata when neither exists).
+                services.AddSingleton<IMediaProbeService>(sp => new FfprobeMediaProbeService(
+                    ResolveBundledFfmpegTool("ffprobe.exe")));
                 services.AddSingleton<ILibraryScanner, LibraryScanner>();
                 services.AddSingleton<ILibraryWatcher, LibraryWatcher>();
 
@@ -122,7 +126,13 @@ public partial class App : Application
                 // The decoder is transient (a fresh FFmpeg decoder per episode); the
                 // pipeline is a singleton that creates one via the factory per episode.
                 services.AddTransient<IFrameDecoder, FrameDecoder>();
-                services.AddSingleton<IAudioMuxer, AudioMuxer>();
+                // Audio mux shells out to the ffmpeg/ffprobe CLIs: prefer the
+                // binaries bundled in lib/ffmpeg/ (deployed next to the app by
+                // CATRA.App.csproj), fall back to PATH when absent (AudioMuxer
+                // throws IOException at mux time, surfaced as a failed job).
+                services.AddSingleton<IAudioMuxer>(sp => new AudioMuxer(
+                    ResolveBundledFfmpegTool("ffmpeg.exe"),
+                    ResolveBundledFfmpegTool("ffprobe.exe")));
                 services.AddSingleton<IProcessingPipeline>(sp => new ProcessingPipeline(
                     sp.GetRequiredService<INativeBridge>(),
                     () => sp.GetRequiredService<IFrameDecoder>(),
@@ -144,10 +154,11 @@ public partial class App : Application
                 services.AddSingleton<ICleanupService, CleanupService>();
 
                 // Thumbnails / covers (ST-09, RF-08, RN-05): ffmpeg CLI frame
-                // grabber behind an injectable extractor + caching service. The
-                // binary is not bundled yet, so extraction degrades to the UI
-                // placeholder until ffmpeg is available.
-                services.AddSingleton<IThumbnailExtractor, FfmpegThumbnailExtractor>();
+                // grabber behind an injectable extractor + caching service.
+                // Prefers the bundled ffmpeg binary; degrades to the UI
+                // placeholder when neither bundled nor PATH ffmpeg exists.
+                services.AddSingleton<IThumbnailExtractor>(sp => new FfmpegThumbnailExtractor(
+                    ResolveBundledFfmpegTool("ffmpeg.exe")));
                 services.AddSingleton<IThumbnailService, ThumbnailService>();
 
                 // Navigation
@@ -340,6 +351,17 @@ public partial class App : Application
             // Restore default search order after init.
             SetDllDirectory(null!);
         }
+    }
+
+    /// <summary>
+    /// Resolves a bundled FFmpeg CLI tool (ffmpeg.exe / ffprobe.exe) from
+    /// <c>AppContext.BaseDirectory/lib/ffmpeg/</c>. Returns <c>null</c> when the
+    /// tool is not bundled so callers fall back to PATH resolution.
+    /// </summary>
+    private static string? ResolveBundledFfmpegTool(string toolFileName)
+    {
+        string path = Path.Combine(AppContext.BaseDirectory, "lib", "ffmpeg", toolFileName);
+        return File.Exists(path) ? path : null;
     }
 
     private void OnThemeChanged(object? sender, AppTheme theme)

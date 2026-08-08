@@ -1,8 +1,9 @@
 # download-ffmpeg.ps1 (ST-05)
 #
 # Downloads the BtbN win64-gpl-shared FFmpeg build, extracts the shared DLLs the
-# player needs (avcodec/avformat/avutil/swscale/swresample) plus the license files,
-# and places them in lib/ffmpeg/ next to the solution.
+# player needs (avcodec/avformat/avutil/swscale/swresample), the ffmpeg/ffprobe
+# CLI executables (audio mux + thumbnails + probe) plus the license files, and
+# places them in lib/ffmpeg/ next to the solution.
 #
 # Idempotent: if the required DLLs are already present the script exits early.
 #
@@ -25,8 +26,9 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $repoRoot = Split-Path -Parent $scriptDir
 $targetDir = Join-Path $repoRoot (Join-Path 'lib' 'ffmpeg')
 
-# The five shared libraries FFmpeg.AutoGen binds to.
-$requiredDllPrefixes = @('avcodec', 'avformat', 'avutil', 'swscale', 'swresample')
+# Shared libraries: the five FFmpeg.AutoGen binds to, plus avfilter/avdevice
+# which ffmpeg.exe/ffprobe.exe (audio mux / probe / thumbnails) link against.
+$requiredDllPrefixes = @('avcodec', 'avformat', 'avutil', 'swscale', 'swresample', 'avfilter', 'avdevice')
 
 function Test-AlreadyPresent {
     if (-not (Test-Path $targetDir)) { return $false }
@@ -34,6 +36,10 @@ function Test-AlreadyPresent {
         if (-not (Get-ChildItem -Path $targetDir -Filter "$prefix-*.dll" -ErrorAction SilentlyContinue)) {
             return $false
         }
+    }
+    # CLI tools must also be present (audio mux / probe / thumbnails).
+    foreach ($tool in @('ffmpeg.exe', 'ffprobe.exe')) {
+        if (-not (Test-Path (Join-Path $targetDir $tool))) { return $false }
     }
     return $true
 }
@@ -77,6 +83,19 @@ try {
             throw "Required library '$prefix-*.dll' was not found in the archive bin folder."
         }
         $dlls | Copy-Item -Destination $targetDir -Force
+    }
+
+    # CLI tools (ST-17 audio mux, ST-09 thumbnails, library probe): shared
+    # builds ship ffmpeg.exe/ffprobe.exe in bin/ next to the DLLs.
+    Write-Host "Copying CLI tools (ffmpeg.exe, ffprobe.exe) ..."
+    foreach ($tool in @('ffmpeg.exe', 'ffprobe.exe')) {
+        $exe = Join-Path $binDir $tool
+        if (Test-Path $exe) {
+            Copy-Item -Path $exe -Destination $targetDir -Force
+        }
+        else {
+            Write-Warning "$tool not found in the archive bin folder — CLI-dependent features will fall back to PATH."
+        }
     }
 
     # License / attribution files (GPL build) - keep for legal compliance.
