@@ -22,6 +22,7 @@
 | ST-19 | UI pre-processar | ✅ | ✅ (ressalva) | ✅ | 485a06d | 1 (timeout) |
 | (fix) | Dispose VMs on navigation | ✅ | — | — | 9be098a | follow-up leak sistêmico |
 | (fix) | RIFE ORT version negotiation + graceful degradation test | ✅ | — | ✅ (build+test) | pendente | — |
+| (fix) | DXGI_DEVICE_REMOVED: handle leak + refcount leak + key desync | ✅ | — | ✅ (build+test) | pendente | — |
 | ST-20 | Playback/DLNA usar processado | 🔄 EM ANDAMENTO | — | — | — | 0 |
 | ST-21 | Cleanup on close + startup | ⏳ | — | — | — | 0 |
 | ST-22 | Settings processamento | ⏳ | — | — | — | 0 |
@@ -53,3 +54,10 @@
   ⚠️ Novo bug descoberto: AMF encoder falha com DXGI_ERROR_DEVICE_REMOVED (0x887A0001) após 1° par de frames.
   Este é um bug SEPARADO (ST-16/encode ou ST-15/interop) — RIFE está 100% funcional.
   Camada C# testada com fakes: 542 testes, 0 falhas.
+- Fix DXGI_DEVICE_REMOVED: 3 bugs no interop D3D11→D3D12 + encode.
+  Causa raiz (diagnóstico engineer subagent):
+  1. NT handle leak em catra_encode_frame (~972k handles/filme)
+  2. D3D12 resource refcount leak (AddRef sem Release)
+  3. g_frameKey não resetado no pool rebuild (deadlock pós-mudança formato)
+  Fix: RAII ShareCleanup (CloseHandle + Release) + g_frameKey=0 no rebuild.
+  Validação real requer rebuild do nativo (MSVC) — código validado por INSPEÇÃO.

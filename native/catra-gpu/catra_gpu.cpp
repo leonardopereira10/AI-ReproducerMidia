@@ -763,13 +763,55 @@ int catra_encode_frame(int ctx, void* texture,
         {
             log_msg(CATRA_LOG_ERROR,
                     "catra_encode_frame: D3D11->D3D12 interop failed rc=%d", irc);
+            // Defensive: the interop contract guarantees null outputs on
+            // failure, but drop any partial handoff so nothing leaks even if
+            // that contract is ever violated.
+            if (sharedHandle != nullptr)
+            {
+                CloseHandle(sharedHandle);
+            }
+            if (d3d12res != nullptr)
+            {
+                d3d12res->Release();
+            }
             return irc != CATRA_OK ? irc : CATRA_ERR_DEVICE;
         }
 
+        // RAII cleanup for the interop handoff (root-cause fix for
+        // DXGI_ERROR_DEVICE_REMOVED): interop_share_d3d11_to_d3d12 hands the
+        // caller (a) a freshly minted NT handle that MUST be CloseHandle'd
+        // (~1 leaked per frame exhausts the process handle table at ~972k
+        // handles over a 2h film) and (b) an AddRef'd D3D12 reference — the
+        // pool keeps its OWN slot reference, so this extra caller ref must be
+        // dropped after Encode consumed the resource. The scope guard runs on
+        // EVERY exit path (success, encode failure, and exception unwinding
+        // caught by GuardCabi above), so neither resource can ever leak.
+        struct ShareCleanup
+        {
+            ID3D12Resource* res = nullptr;
+            HANDLE handle = nullptr;
+
+            ~ShareCleanup()
+            {
+                // Closing the NT handle is safe before releasing the resource:
+                // the opened D3D12 resource (or the pool slot) holds its own
+                // reference to the shared allocation.
+                if (handle != nullptr)
+                {
+                    CloseHandle(handle);
+                }
+                if (res != nullptr)
+                {
+                    res->Release();
+                }
+            }
+        } cleanup{d3d12res, sharedHandle};
+
         int enc_rc = c->encoder->Encode(d3d12res, out_buf, out_size);
 
-        // The interop pool owns the D3D12 resource (round-robin slot); do NOT
-        // release it here — the pool recycles it on the next call.
+        // cleanup's destructor releases the caller's extra D3D12 ref and
+        // closes the NT handle here (after Encode). The pool slot itself
+        // stays intact for round-robin recycling.
         return enc_rc;
     });
 }

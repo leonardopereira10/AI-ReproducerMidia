@@ -294,6 +294,11 @@ int EnsurePoolLocked(const D3D11_TEXTURE2D_DESC& srcDesc)
     g_pool = std::move(fresh);
     g_poolDesc = sharedDesc;
     g_poolIndex = 0;
+    // Fresh slots have zeroed/unowned keyed mutexes. A stale g_frameKey (e.g.
+    // 1 left over from the previous pool) would desync the producer/consumer
+    // ping-pong: the producer would Release(1) while the consumer blocks in
+    // AcquireSync(0) -> timeout -> deadlock after a format change.
+    g_frameKey = 0;
     catra::BackendLog(CATRA_LOG_INFO,
                       "interop: pool rebuilt %ux%u fmt=%u (%u slots)",
                       sharedDesc.Width, sharedDesc.Height,
