@@ -163,6 +163,14 @@ struct AmfEncoder::Impl
     // consumed shared texture, in lockstep with the interop pool producer.
     uint64_t consumerKey = 0;
 
+    // Last interop pool generation observed (d3d_interop). A pool rebuild
+    // (resolution/format change — constant in the interpolation pipeline,
+    // where the encode input alternates NV12/BGRA) mints fresh keyed mutexes
+    // and resets the producer key to 0; when the generation changes the
+    // consumer must reset consumerKey to 0 in lockstep, or its AcquireSync
+    // waits for a Release the rebuilt producer never issues (5 s timeout).
+    uint64_t lastPoolGeneration = 0;
+
     bool drained = false; // set by Flush; Encode afterwards is a usage error
 
     ~Impl()
@@ -444,9 +452,17 @@ int AmfEncoder::Encode(ID3D12Resource* texture, uint8_t** outBuf, int* outSize)
 
     KeyedMutexGuard mutexGuard;
     mutexGuard.nextKey = &d.consumerKey;
-    mutexGuard.key = d.consumerKey;
     if (keyedMutex != nullptr)
     {
+        // Pool-rebuild resync (see Impl::lastPoolGeneration): align the
+        // consumer key with the rebuilt producer BEFORE acquiring.
+        const uint64_t generation = interop_pool_generation();
+        if (generation != d.lastPoolGeneration)
+        {
+            d.consumerKey = 0;
+            d.lastPoolGeneration = generation;
+        }
+        mutexGuard.key = d.consumerKey;
         const int arc = interop_acquire(keyedMutex.Get(), mutexGuard.key, 5000);
         if (arc != CATRA_OK)
         {

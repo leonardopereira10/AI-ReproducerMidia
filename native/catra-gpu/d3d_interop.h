@@ -28,7 +28,7 @@
 //
 // KEYED-MUTEX PROTOCOL (ping-pong, keys alternate 0/1 per frame — spec ST-15)
 //   Producer (D3D11 writer, done internally by the pooled-copy path):
-//       AcquireSync(k, 5000) -> CopyResource -> ReleaseSync(k); k ^= 1
+//       AcquireSync(k, 5000) -> CopyResource -> Flush -> ReleaseSync(k); k ^= 1
 //   Consumer (D3D12 reader, e.g. the FSR dispatch):
 //       interop_acquire(mtx, k, 5000) -> use -> interop_release(mtx, k); k ^= 1
 //   Each AcquireSync(k) blocks until the OTHER party's last ReleaseSync(k)
@@ -38,6 +38,23 @@
 //   party, so the ping-pong is deadlock-free. The consumer obtains the mutex
 //   by QI'ing IDXGIKeyedMutex from the returned resource (shared resources
 //   expose it on both API sides).
+//
+//   SUBMISSION GUARANTEE (root cause of the 0x887A0001 device hang): the
+//   producer MUST Flush() the D3D11 immediate context between CopyResource
+//   and ReleaseSync(k). CopyResource only records the copy; the keyed-mutex
+//   ownership transfer waits exclusively for work already SUBMITTED to the
+//   GPU, so an unflushed copy leaves the D3D12 consumer free to read the
+//   shared allocation mid-copy (cross-API race -> GPU hang -> device
+//   removal). Flush submits without blocking (no CPU stall, no TDR impact).
+//
+//   POOL-REBUILD RESYNC: a resolution/format change rebuilds the pool with
+//   fresh keyed mutexes and resets the producer key to 0. Consumers track the
+//   pool generation (interop_pool_generation) and MUST reset their own key to
+//   0 when it changes, otherwise their next AcquireSync(k) waits for a
+//   Release(k) the rebuilt producer never issues (5 s timeout -> spurious
+//   CATRA_ERR_DEVICE). This matters for the interpolation pipeline, where the
+//   encode input alternates NV12 (decoded source) / BGRA (RIFE intermediate)
+//   and rebuilds the pool every frame.
 //
 // EXCEPTION SAFETY: these are internal C++ helpers, not a C ABI boundary;
 // they do not throw by design (all state is RAII — ComPtr / handle wrappers),
@@ -119,13 +136,26 @@ int interop_share_d3d12_to_d3d11(ID3D12Resource* src,
 // CATRA_ERR_DEVICE on timeout (spec default 5000 ms) / failure.
 int interop_acquire(IDXGIKeyedMutex* mutex, uint64_t key, uint32_t timeout_ms);
 
+// Pool rebuild counter: incremented exactly once whenever the pooled-copy
+// pool is rebuilt (resolution/format change), read under the interop lock.
+// Consumers of pooled slots keep the last generation they saw and reset
+// their keyed-mutex ping-pong key to 0 when it changes — a rebuilt pool has
+// fresh mutexes and a producer key reset to 0, so an unsynchronized consumer
+// key deadlocks against AcquireSync's 5 s timeout (see header banner,
+// POOL-REBUILD RESYNC).
+uint64_t interop_pool_generation();
+
 // IDXGIKeyedMutex::ReleaseSync wrapper. Returns CATRA_OK / CATRA_ERR_*.
 int interop_release(IDXGIKeyedMutex* mutex, uint64_t key);
 
 // GPU-GPU CopyResource with a geometry guard (CopyResource requires matching
 // dimensions/format/array/mips/sample — a mismatch is CATRA_ERR_INVALID_ARG,
 // never a device removal). The copy is issued on `ctx` and completes on the
-// D3D11 timeline; cross-queue consumers synchronize via the keyed mutex.
+// D3D11 timeline. IMPORTANT: the copy is only RECORDED here; when the result
+// feeds a keyed-mutex hand-off, the caller must Flush() `ctx` before
+// ReleaseSync so the copy is SUBMITTED (the pooled-copy path in
+// interop_share_d3d11_to_d3d12 does exactly that); cross-queue consumers
+// then synchronize via the keyed mutex.
 int interop_copy_d3d11(ID3D11DeviceContext* ctx,
                        ID3D11Texture2D* src,
                        ID3D11Texture2D* dst_shared);

@@ -267,6 +267,13 @@ struct Fsr1Upscaler::Impl
     // alternates 0/1 per consumed frame, in lockstep with the pool producer's
     // g_frameKey, so Acquire(k) always waits on the matching Release(k).
     uint64_t consumerKey = 0;
+
+    // Last interop pool generation observed (d3d_interop). A pool rebuild
+    // (resolution/format change) mints fresh keyed mutexes and resets the
+    // producer key to 0; when the generation changes the consumer must reset
+    // consumerKey to 0 in lockstep, or its AcquireSync waits for a Release
+    // the rebuilt producer never issues (5 s timeout).
+    uint64_t lastPoolGeneration = 0;
 };
 
 Fsr1Upscaler::~Fsr1Upscaler() = default;
@@ -511,10 +518,18 @@ int Fsr1Upscaler::Process(ID3D11Texture2D* src, ID3D12Resource** outDst)
     // backpressure. A timeout/failure is a device fault (CATRA_ERR_DEVICE).
     KeyedMutexGuard mutexGuard;
     mutexGuard.nextKey = &d.consumerKey;
-    mutexGuard.key = d.consumerKey;
     srcRes->QueryInterface(IID_PPV_ARGS(&mutexGuard.mutex)); // S_FALSE when absent -> mutex stays null
     if (mutexGuard.mutex != nullptr)
     {
+        // Pool-rebuild resync (see Impl::lastPoolGeneration): align the
+        // consumer key with the rebuilt producer BEFORE acquiring.
+        const uint64_t generation = interop_pool_generation();
+        if (generation != d.lastPoolGeneration)
+        {
+            d.consumerKey = 0;
+            d.lastPoolGeneration = generation;
+        }
+        mutexGuard.key = d.consumerKey;
         int arc = interop_acquire(mutexGuard.mutex, mutexGuard.key, 5000);
         if (arc != CATRA_OK)
         {

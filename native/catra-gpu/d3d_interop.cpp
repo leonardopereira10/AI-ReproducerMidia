@@ -71,7 +71,14 @@ HRESULT CatraToHResult(int rc)
 bool IsAcquireTimeout(HRESULT hr)
 {
     return hr == DXGI_ERROR_WAIT_TIMEOUT ||
-           hr == HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+           hr == HRESULT_FROM_WIN32(WAIT_TIMEOUT) ||
+           // AMD driver quirk: IDXGIKeyedMutex::AcquireSync may return the raw
+           // Win32 WAIT_TIMEOUT (258 / 0x102) as an HRESULT instead of wrapping
+           // it via HRESULT_FROM_WIN32 (0x80070102) or the DXGI-specific code
+           // (0x887B0001). Severity bit is clear -> FAILED() misses it. Observed
+           // on RDNA 4 (Adrenalin 25.x) during the NV12<->BGRA pool-rebuild
+           // sequence in the interpolation pipeline.
+           hr == static_cast<HRESULT>(WAIT_TIMEOUT);
 }
 
 // --- Module state ----------------------------------------------------------
@@ -108,6 +115,16 @@ std::vector<InteropPoolSlot> g_pool;
 D3D11_TEXTURE2D_DESC g_poolDesc = {}; // geometry the pool was built for
 size_t g_poolIndex = 0;               // round-robin cursor
 uint64_t g_frameKey = 0;              // keyed-mutex key, alternates 0/1
+
+// Monotonic pool generation: incremented exactly once per pool rebuild
+// (EnsurePoolLocked). Consumers of pooled slots (FSR dispatch / AMF encode)
+// poll this via interop_pool_generation() and reset their own ping-pong key
+// to 0 whenever it changes: a rebuild mints fresh keyed mutexes and resets
+// the producer key to 0, so a consumer that kept its old key would
+// AcquireSync(k) against a Release(k) the rebuilt producer never issues
+// (5 s timeout -> spurious CATRA_ERR_DEVICE — observed as the NV12->BGRA
+// alternation rebuild in the interpolation pipeline).
+uint64_t g_poolGeneration = 0;
 
 // Derives the DXGI adapter from a D3D11 device and creates a D3D12 device on
 // it (FEATURE_LEVEL_12_0 per spec). Shared handles REQUIRE the same adapter /
@@ -299,6 +316,9 @@ int EnsurePoolLocked(const D3D11_TEXTURE2D_DESC& srcDesc)
     // ping-pong: the producer would Release(1) while the consumer blocks in
     // AcquireSync(0) -> timeout -> deadlock after a format change.
     g_frameKey = 0;
+    // Publish the rebuild so consumers reset their ping-pong key in lockstep
+    // (see g_poolGeneration above).
+    ++g_poolGeneration;
     catra::BackendLog(CATRA_LOG_INFO,
                       "interop: pool rebuilt %ux%u fmt=%u (%u slots)",
                       sharedDesc.Width, sharedDesc.Height,
@@ -338,6 +358,12 @@ HRESULT ShareViaTempCopy(ID3D11Device* d3d11Device,
     ComPtr<ID3D11DeviceContext> context;
     d3d11Device->GetImmediateContext(context.GetAddressOf());
     context->CopyResource(staging.Get(), source);
+    // Same submission guarantee as the pooled path below: without Flush the
+    // copy may still sit in the immediate context's batched command stream
+    // when the D3D12 side opens + reads the shared allocation -> cross-API
+    // race -> GPU hang. This degraded path has no keyed-mutex release, so the
+    // flush is the ONLY sync it gets.
+    context->Flush();
 
     return ShareD3D11ToD3D12Direct(d3d12Device, staging.Get(), out, nullptr);
 }
@@ -504,6 +530,7 @@ void interop_shutdown()
     g_d3d11Device.Reset();
     g_fenceValue = 0;
     g_frameKey = 0;
+    g_poolGeneration = 0;
 }
 
 // ===========================================================================
@@ -570,28 +597,70 @@ int interop_share_d3d11_to_d3d12(ID3D11Texture2D* src,
     InteropPoolSlot& slot = g_pool[g_poolIndex];
     g_poolIndex = (g_poolIndex + 1) % g_pool.size();
 
-    // Producer half of the keyed-mutex ping-pong (keys alternate 0/1 per
-    // frame): Acquire(k) blocks until the consumer's last Release(k) finished
-    // on the GPU timeline (backpressure — never overwrite a live slot), the
-    // copy is issued, then Release(k) unblocks the consumer's Acquire(k).
-    const uint64_t key = g_frameKey;
+    // FIXED KEY STRATEGY (RDNA 4 / AMD driver compatibility):
+    // Each pool slot has its OWN keyed mutex. The producer always uses key=0
+    // because: (a) the AMF encoder (consumer) does NOT participate in the keyed
+    // mutex protocol (it uses CreateSurfaceFromDX12Native zero-copy wrap without
+    // AcquireSync/ReleaseSync), so there is no consumer ReleaseSync to wait on;
+    // (b) the AMD RDNA 4 driver returns non-standard AcquireSync timeouts when
+    // using non-zero keys on freshly-rebuilt mutexes (observed: AcquireSync(1)
+    // returns 0x00000102/WAIT_TIMEOUT on a never-used mutex). With key=0,
+    // AcquireSync succeeds on both unowned mutexes (first use) and released(0)
+    // mutexes (subsequent round-robin reuse). The Flush() after CopyResource
+    // provides the cross-API sync guarantee (submission to GPU before the AMF
+    // reads the shared allocation).
+    const uint64_t key = 0;
     HRESULT ahr = slot.mutex11->AcquireSync(key, kInteropAcquireTimeoutMs);
+    // AMD driver quirk: AcquireSync may return WAIT_TIMEOUT as a raw Win32
+    // error (0x102) with severity bit clear, so FAILED() does not catch it.
+    // Check explicitly for ANY timeout indicator before the FAILED gate.
+    if (IsAcquireTimeout(ahr))
+    {
+        BackendLog(CATRA_LOG_ERROR,
+                   "interop: pool AcquireSync(key=%llu) TIMEOUT hr=0x%08lX",
+                   static_cast<unsigned long long>(key),
+                   static_cast<unsigned long>(ahr));
+        return CATRA_ERR_DEVICE;
+    }
     if (FAILED(ahr))
     {
         BackendLog(CATRA_LOG_ERROR,
-                   "interop: pool AcquireSync(key=%llu) hr=0x%08lX%s",
+                   "interop: pool AcquireSync(key=%llu) hr=0x%08lX",
                    static_cast<unsigned long long>(key),
-                   static_cast<unsigned long>(ahr),
-                   IsAcquireTimeout(ahr) ? " (timeout)" : "");
+                   static_cast<unsigned long>(ahr));
         return HrToCatra(ahr);
     }
 
     rc = interop_copy_d3d11(g_d3d11Context.Get(), src, slot.tex11.Get());
 
+    // ROOT-CAUSE FIX — DXGI_ERROR_DEVICE_HUNG/REMOVED (0x887A0001) on the
+    // AMF encode after RIFE interpolation:
+    //
+    // CopyResource only RECORDS the copy in the immediate context's batched
+    // command stream; it is NOT guaranteed to be submitted to the GPU by the
+    // time ReleaseSync runs below. A keyed-mutex ownership transfer only
+    // waits for work the owning device has SUBMITTED, so without this flush
+    // the D3D12 consumer (FSR dispatch / AMF CreateSurfaceFromDX12Native)
+    // can acquire the slot and read the shared NT resource while the D3D11
+    // copy is still pending -> cross-API write/read race on the same
+    // allocation -> GPU hang -> device removal. Flush() forces every pending
+    // immediate-context command (this copy included) into the GPU queue, so
+    // the copy joins the exact timeline ReleaseSync(k) waits on.
+    //
+    // Chosen over a D3D11On12 cross-API fence (option B) deliberately:
+    // Flush submits but does NOT block (no CPU stall, no extra TDR pressure),
+    // and the keyed mutex IS the cross-API sync object once the work is
+    // submitted — a D3D11On12 fence would require wrapping the D3D11 device
+    // and adds no ordering guarantee the keyed mutex does not already give.
+    if (rc == CATRA_OK)
+    {
+        g_d3d11Context->Flush();
+    }
+
     // Release what was acquired even if the copy failed (a stuck key would
     // deadlock the consumer two frames later).
     HRESULT rhr = slot.mutex11->ReleaseSync(key);
-    g_frameKey ^= 1; // alternate 0/1 (spec)
+    // key stays at 0 (see FIXED KEY STRATEGY above — no ping-pong needed)
     if (FAILED(rhr))
     {
         BackendLog(CATRA_LOG_WARN,
@@ -700,6 +769,12 @@ int interop_share_d3d12_to_d3d11(ID3D12Resource* src,
 // Keyed mutex + copy primitives
 // ===========================================================================
 
+uint64_t interop_pool_generation()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_poolGeneration;
+}
+
 int interop_acquire(IDXGIKeyedMutex* mutex, uint64_t key, uint32_t timeout_ms)
 {
     if (mutex == nullptr)
@@ -707,17 +782,20 @@ int interop_acquire(IDXGIKeyedMutex* mutex, uint64_t key, uint32_t timeout_ms)
         return CATRA_ERR_INVALID_ARG;
     }
     HRESULT hr = mutex->AcquireSync(key, timeout_ms);
-    if (SUCCEEDED(hr))
-    {
-        return CATRA_OK;
-    }
+    // AMD driver quirk: AcquireSync may return raw Win32 WAIT_TIMEOUT (0x102)
+    // with severity=0, so SUCCEEDED(hr) is true. Check timeout FIRST.
     if (IsAcquireTimeout(hr))
     {
         BackendLog(CATRA_LOG_ERROR,
-                   "interop: AcquireSync(key=%llu, %u ms) timed out",
+                   "interop: AcquireSync(key=%llu, %u ms) timed out hr=0x%08lX",
                    static_cast<unsigned long long>(key),
-                   static_cast<unsigned>(timeout_ms));
+                   static_cast<unsigned>(timeout_ms),
+                   static_cast<unsigned long>(hr));
         return CATRA_ERR_DEVICE;
+    }
+    if (SUCCEEDED(hr))
+    {
+        return CATRA_OK;
     }
     return HrToCatra(hr);
 }

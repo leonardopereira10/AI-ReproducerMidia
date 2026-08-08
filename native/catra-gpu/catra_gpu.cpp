@@ -29,6 +29,7 @@
 #include <unordered_map>
 
 #include <d3d11.h>
+#include <d3d12.h>
 #include <wrl/client.h>
 
 namespace {
@@ -752,13 +753,36 @@ int catra_encode_frame(int ctx, void* texture,
             return CATRA_ERR_INVALID_ARG;
         }
 
-        // The pipeline provides D3D11 textures; the AMF encoder needs D3D12.
-        // Use the pooled interop to share (or copy) the D3D11 texture into a
-        // D3D12 resource on the bridge's shared adapter.
+        // The pipeline hands us EITHER a D3D11 texture (decoder frame or RIFE
+        // intermediate, passthrough upscale) or an ALREADY-D3D12 texture (FSR 1
+        // / FSR 4 upscale output). The AMF encoder consumes D3D12, so D3D11
+        // input goes through the pooled interop while D3D12 input is used
+        // zero-copy. The API must be PROBED, never assumed: casting a D3D12
+        // resource to ID3D11Texture2D is vtable UB (ID3D11Texture2D::GetDesc
+        // slot 11 lands on ID3D12Resource::Unmap -> garbage desc -> spurious
+        // CATRA_ERR_DEVICE or a device fault).
         ID3D12Resource* d3d12res = nullptr;
         HANDLE sharedHandle = nullptr;
-        int irc = catra::interop_share_d3d11_to_d3d12(
-            static_cast<ID3D11Texture2D*>(texture), &d3d12res, &sharedHandle);
+        int irc = CATRA_OK;
+
+        ID3D12Resource* probed12 = nullptr;
+        if (SUCCEEDED(static_cast<IUnknown*>(texture)->QueryInterface(
+                IID_PPV_ARGS(&probed12))))
+        {
+            // Already D3D12 (upscale output): zero-copy to AMF, no interop
+            // pool involvement -> no NT handle minted. AmfEncoder::Encode QIs
+            // the keyed mutex itself and skips when the resource is not
+            // shared (the FSR-output case). The QI reference is owned by the
+            // ShareCleanup guard below (released exactly once).
+            d3d12res = probed12;
+        }
+        else
+        {
+            // D3D11 input: share (or pooled-copy) onto the bridge's shared
+            // adapter via the ST-15 interop.
+            irc = catra::interop_share_d3d11_to_d3d12(
+                static_cast<ID3D11Texture2D*>(texture), &d3d12res, &sharedHandle);
+        }
         if (irc != CATRA_OK || d3d12res == nullptr)
         {
             log_msg(CATRA_LOG_ERROR,
