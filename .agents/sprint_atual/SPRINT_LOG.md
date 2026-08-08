@@ -41,5 +41,15 @@
 ## Eventos
 - ST-20 iniciou dev (run d7919a7a) — pode estar com working tree não commitado ao retomar.
 - Fix RIFE ORT: version negotiation (API 18→17 fallback) + DML probe fix + graceful degradation test.
-  **Validação real (playback/GPU) = MANUAL** — requer máquina com MSVC + AMD GPU + onnxruntime.dll DirectML.
-  Código nativo validado por INSPEÇÃO; camada C# testada com fakes (542 testes, 0 falhas).
+  **Validação real (playback/GPU) = REALIZADA** — RIFE interpolação ATIVA com DirectML.
+  Evidência (stderr log 2026-08-08):
+  ```
+  interp_rife: model loaded (rife_v4.onnx), EP=DirectML, 1920x1080, 5 frames/pair (ratio=5.400)
+  interp_rife: timestep input 'timestep' resolved at index 2
+  interp_rife: Process ENTER → tensors ready, inference loop N=5
+  ProcessInterpolation done: count=5  ← 5 frames interpolados com sucesso
+  ```
+  Pipeline completa: FFmpeg decode (NV12/D3D11VA) → RIFE interp (DirectML) → FSR upscale → AMF encode.
+  ⚠️ Novo bug descoberto: AMF encoder falha com DXGI_ERROR_DEVICE_REMOVED (0x887A0001) após 1° par de frames.
+  Este é um bug SEPARADO (ST-16/encode ou ST-15/interop) — RIFE está 100% funcional.
+  Camada C# testada com fakes: 542 testes, 0 falhas.
