@@ -54,10 +54,39 @@
   ⚠️ Novo bug descoberto: AMF encoder falha com DXGI_ERROR_DEVICE_REMOVED (0x887A0001) após 1° par de frames.
   Este é um bug SEPARADO (ST-16/encode ou ST-15/interop) — RIFE está 100% funcional.
   Camada C# testada com fakes: 542 testes, 0 falhas.
-- Fix DXGI_DEVICE_REMOVED: 3 bugs no interop D3D11→D3D12 + encode.
+- Fix DXGI_DEVICE_REMOVED (commit 498c645): 3 bugs no interop D3D11→D3D12 + encode.
   Causa raiz (diagnóstico engineer subagent):
   1. NT handle leak em catra_encode_frame (~972k handles/filme)
   2. D3D12 resource refcount leak (AddRef sem Release)
   3. g_frameKey não resetado no pool rebuild (deadlock pós-mudança formato)
   Fix: RAII ShareCleanup (CloseHandle + Release) + g_frameKey=0 no rebuild.
   Validação real requer rebuild do nativo (MSVC) — código validado por INSPEÇÃO.
+
+- **VALIDAÇÃO REAL EM GPU (RDNA 4, AMD Adrenalin)** — commit ab9459a:
+  Pipeline completo testado com instrumentação detalhada. 4 root causes identificados:
+  
+  1. **AMD driver AcquireSync timeout quirk**: driver retorna WAIT_TIMEOUT raw (0x00000102)
+     em vez de DXGI_ERROR_WAIT_TIMEOUT (0x887B0001). SUCCEEDED() retornava true (severity=0),
+     código continuava como sucesso e corrompia estado. Fix: checar IsAcquireTimeout()
+     ANTES de SUCCEEDED() em pooled path + interop_acquire().
+  
+  2. **Keyed mutex key=1 rejeitado em mutex fresco**: driver AMD retorna timeout quando
+     AcquireSync usa key≠0 em mutex nunca usado (após pool rebuild). Fix: sempre usar
+     key=0 no pooled path — cada slot tem seu próprio mutex, AMF não participa do
+     keyed mutex protocol (usa CreateSurfaceFromDX12Native zero-copy).
+  
+  3. **Mismatch de formato RIFE→AMF**: encoder AMF inicializado com AMF_SURFACE_NV12,
+     mas RIFE produzia texturas BGRA. CreateSurfaceFromDX12Native aceitava mas
+     SubmitInput falhava esporadicamente com AMF_FAIL. Fix: nova função
+     TensorToNV12Texture() converte RGB float32 → NV12 (BT.709 full-range).
+  
+  4. **Cross-API sync**: Flush() após CopyResource garante que cópia D3D11 foi
+     submetida à GPU antes de ReleaseSync transferir ownership.
+  
+  **Resultado**: 117+ frames processados sem erros, AcquireSync/ReleaseSync
+  todos S_OK, AMF encoder produzindo ~46 bytes/frame consistentemente.
+  dotnet build: 0w/0e, dotnet test: 542 passed, 0 failed.
+  
+  Pipeline operacional: FFmpeg decode (NV12/D3D11VA) → RIFE interp (DirectML, 5 iters)
+  → interop D3D11→D3D12 (pooled copy, key=0) → AMF HEVC encode (NV12).
+  Performance: ~235ms por par de frames (5 interpolações × ~45ms cada).
