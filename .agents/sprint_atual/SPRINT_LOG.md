@@ -21,8 +21,9 @@
 | ST-18 | Janela deslizante | ✅ | ✅ | ✅ | f8a110b | 1 (timeout) |
 | ST-19 | UI pre-processar | ✅ | ✅ (ressalva) | ✅ | 485a06d | 1 (timeout) |
 | (fix) | Dispose VMs on navigation | ✅ | — | — | 9be098a | follow-up leak sistêmico |
-| (fix) | RIFE ORT version negotiation + graceful degradation test | ✅ | — | ✅ (build+test) | pendente | — |
-| (fix) | DXGI_DEVICE_REMOVED: handle leak + refcount leak + key desync | ✅ | — | ✅ (build+test) | pendente | — |
+| (fix) | RIFE ORT version negotiation + graceful degradation test | ✅ | — | ✅ (build+test) | eff437e | — |
+| (fix) | DXGI_DEVICE_REMOVED: 4 root causes (AMD timeout quirk, key=0, NV12 out, Flush) | ✅ | — | ✅ (build+test+GPU real) | ab9459a | — |
+| (fix) | Bundle ffmpeg/ffprobe CLI para audio mux | ✅ | — | ✅ (build+test+mux smoke) | 9cf7da1 | — |
 | ST-20 | Playback/DLNA usar processado | 🔄 EM ANDAMENTO | — | — | — | 0 |
 | ST-21 | Cleanup on close + startup | ⏳ | — | — | — | 0 |
 | ST-22 | Settings processamento | ⏳ | — | — | — | 0 |
@@ -90,3 +91,18 @@
   Pipeline operacional: FFmpeg decode (NV12/D3D11VA) → RIFE interp (DirectML, 5 iters)
   → interop D3D11→D3D12 (pooled copy, key=0) → AMF HEVC encode (NV12).
   Performance: ~235ms por par de frames (5 interpolações × ~45ms cada).
+
+- **EPISÓDIO COMPLETO VALIDADO (EP28, 2ª corrida)** — commits ab9459a + 9cf7da1:
+  Corrida de 1h47min sem NENHUM erro do início ao fim:
+  - Encode: crescimento constante ~303KB/4min durante todo o processo, zero stalls
+  - 1ª corrida falhou em 92.3% com "ffmpeg binary not available for audio mux"
+    (escopo separado): muxer usa ffmpeg CLI que nunca foi bundlado. Fix (commit
+    9cf7da1): download-ffmpeg.ps1 extrai ffmpeg.exe/ffprobe.exe + avfilter/avdevice
+    DLLs; csproj deploya exes; App.xaml.cs ResolveBundledFfmpegTool() no DI do
+    muxer/probe/thumbnails (fallback PATH mantido).
+  - **Output final validado**: `D:\MediaPlayer\.cache\53_local.mp4` (26.28 MB)
+    - ffprobe: HEVC 1920x1080 @ **135 fps** + áudio AAC, duração 1199s (~20 min)
+    - DB: ProcessJob status=completed 100%, ProcessedFile criado
+  - **TODOS os critérios de aceite do fix DXGI_DEVICE_REMOVED atendidos**:
+    pipeline completa múltiplos frame pairs sem erro, múltiplos ProcessInterpolation
+    + EncodeFrame sem falha, dotnet build/test verdes (542), .mp4 na pasta de output.
