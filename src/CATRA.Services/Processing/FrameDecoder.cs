@@ -5,6 +5,7 @@ using CATRA.Services.Playback;
 using FFmpeg.AutoGen;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
+using MapFlags = Vortice.Direct3D11.MapFlags;
 using VDX = Vortice.Direct3D11;
 
 namespace CATRA.Services.Processing;
@@ -423,15 +424,103 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
                 "D3D11 device/context not available; cannot copy decoder frame.");
         }
 
-        // Wrap the source texture (borrowed — suppress Dispose release).
+        // AMD RDNA 4 driver bug: ID3D11DeviceContext::CopySubresourceRegion()
+        // reading from an NV12 (planar) source returns ZEROS, which made every
+        // decoded frame solid green downstream. Avoid that op entirely: read the
+        // decoder array slice back to system memory (whole-resource CopyResource
+        // into a staging array + per-subresource Map, which is reliable), convert
+        // NV12 -> BGRA on the CPU, and upload the BGRA into a standalone texture.
         var srcTex = new VDX.ID3D11Texture2D(srcTexture);
         Texture2DDescription srcDesc = srcTex.Description;
 
-        // Use the actual video dimensions (from metadata) to avoid hardware
-        // alignment padding (e.g. 1088 for 1080p NV12).  The encoder and RIFE
-        // expect the true resolution.
         int dstW = _metadata?.Width ?? (int)srcDesc.Width;
         int dstH = _metadata?.Height ?? (int)srcDesc.Height;
+
+        // Staging copy of the WHOLE array (CopyResource of the full resource is
+        // reliable; only the per-plane CopySubresourceRegion read is broken).
+        var stagingDesc = srcDesc;
+        stagingDesc.Usage = ResourceUsage.Staging;
+        stagingDesc.BindFlags = BindFlags.None;
+        stagingDesc.CPUAccessFlags = CpuAccessFlags.Read;
+        stagingDesc.MiscFlags = ResourceOptionFlags.None;
+        var staging = _vorticeDevice.CreateTexture2D(stagingDesc);
+        _vorticeContext.CopyResource(staging, srcTex);
+
+        var fmt = srcDesc.Format;
+        if (fmt != Format.NV12)
+        {
+            staging.Dispose();
+            throw new NotSupportedException(
+                $"FrameDecoder: unsupported decoded format {fmt}; pipeline expects NV12 D3D11VA frames.");
+        }
+
+        int texH = (int)srcDesc.Height; // texture height (may be aligned, e.g. 1088)
+        byte[] bgra = new byte[dstW * dstH * 4];
+        unsafe
+        {
+            // NV12 array slice: subresource index = slice * (MipLevels * 2 planes).
+            // Map ONLY the Y subresource — on this AMD RDNA 4 driver Map() of the
+            // UV subresource fails. D3D11 returns the whole slice contiguously:
+            // Y rows [0, texH) then UV rows starting at texH * RowPitch (same
+            // pattern proven in native interp_rife.cpp / d3d_interop.cpp).
+            int srcBaseSub = arraySlice * srcDesc.MipLevels * 2;
+            var yBox = _vorticeContext.Map(staging, srcBaseSub, MapMode.Read, MapFlags.None);
+            byte* yPtr = (byte*)yBox.DataPointer;
+            int yPitch = yBox.RowPitch;
+            byte* uvPtr = yPtr + (long)texH * yPitch;
+
+            for (int y = 0; y < dstH; y++)
+            {
+                byte* yRow = yPtr + (long)y * yPitch;
+                byte* uvRow = uvPtr + (long)(y / 2) * yPitch;
+                for (int x = 0; x < dstW; x++)
+                {
+                    float Yv = yRow[x];
+                    float U = uvRow[(x / 2) * 2 + 0] - 128f;
+                    float V = uvRow[(x / 2) * 2 + 1] - 128f;
+                    float R = Yv + 1.402f * V;
+                    float G = Yv - 0.344136f * U - 0.714136f * V;
+                    float B = Yv + 1.772f * U;
+                    int o = (y * dstW + x) * 4;
+                    bgra[o + 0] = ClampByte(B);
+                    bgra[o + 1] = ClampByte(G);
+                    bgra[o + 2] = ClampByte(R);
+                    bgra[o + 3] = 255;
+                }
+            }
+
+            _vorticeContext.Unmap(staging, srcBaseSub);
+        }
+        staging.Dispose();
+
+        // Upload the BGRA bytes into a standalone BGRA texture.
+        var bgraStagingDesc = new Texture2DDescription
+        {
+            Width = dstW,
+            Height = dstH,
+            MipLevels = 1,
+            ArraySize = 1,
+            Format = Format.B8G8R8A8_UNorm,
+            SampleDescription = new(1, 0),
+            Usage = ResourceUsage.Staging,
+            BindFlags = BindFlags.None,
+            CPUAccessFlags = CpuAccessFlags.Write,
+            MiscFlags = ResourceOptionFlags.None
+        };
+        var bgraStaging = _vorticeDevice.CreateTexture2D(bgraStagingDesc);
+        unsafe
+        {
+            var box = _vorticeContext.Map(bgraStaging, 0, MapMode.Write, MapFlags.None);
+            byte* dst = (byte*)box.DataPointer;
+            fixed (byte* src = bgra)
+            {
+                for (int y = 0; y < dstH; y++)
+                {
+                    System.Buffer.MemoryCopy(src + (long)y * dstW * 4, dst + (long)y * box.RowPitch, dstW * 4, dstW * 4);
+                }
+            }
+            _vorticeContext.Unmap(bgraStaging, 0);
+        }
 
         var dstDesc = new Texture2DDescription
         {
@@ -439,49 +528,25 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
             Height = dstH,
             MipLevels = 1,
             ArraySize = 1,
-            Format = srcDesc.Format,
+            Format = Format.B8G8R8A8_UNorm,
             SampleDescription = new(1, 0),
             Usage = ResourceUsage.Default,
             BindFlags = BindFlags.ShaderResource,
             CPUAccessFlags = CpuAccessFlags.None,
             MiscFlags = ResourceOptionFlags.None
         };
-        var dst = _vorticeDevice.CreateTexture2D(dstDesc);
+        var dst2 = _vorticeDevice.CreateTexture2D(dstDesc);
+        _vorticeContext.CopyResource(dst2, bgraStaging);
+        bgraStaging.Dispose();
 
-        // FFmpeg D3D11VA: frame->data[1] = array slice index.
-        // Planar formats (NV12, P010) have 2 subresources per slice (Y + UV).
-        var fmt = srcDesc.Format;
-        int numPlanes = (fmt == Format.NV12 || fmt == Format.P010 || fmt == Format.P016) ? 2 : 1;
-        int srcBaseSub = arraySlice * srcDesc.MipLevels * numPlanes;
-
-        if (dstW == (int)srcDesc.Width && dstH == (int)srcDesc.Height)
-        {
-            // No crop needed — full copy.
-            for (int plane = 0; plane < numPlanes; plane++)
-            {
-                _vorticeContext.CopySubresourceRegion(dst, plane, 0, 0, 0, srcTex, srcBaseSub + plane);
-            }
-        }
-        else
-        {
-            // Crop: copy only the valid video region from each plane.
-            // Y plane: full width, dstH rows.
-            var yBox = new Vortice.Mathematics.Box(0, 0, 0, dstW, dstH, 1);
-            _vorticeContext.CopySubresourceRegion(dst, 0, 0, 0, 0, srcTex, srcBaseSub, yBox);
-            if (numPlanes > 1)
-            {
-                // UV plane: full width, dstH/2 rows.
-                var uvBox = new Vortice.Mathematics.Box(0, 0, 0, dstW, dstH / 2, 1);
-                _vorticeContext.CopySubresourceRegion(dst, 1, 0, 0, 0, srcTex, srcBaseSub + 1, uvBox);
-            }
-        }
-
-        // Return the native pointer; caller owns the COM reference via ReleaseFrame.
-        IntPtr result = dst.NativePointer;
+        IntPtr result = dst2.NativePointer;
         Marshal.AddRef(result); // caller's reference
-        dst.Dispose();          // releases Vortice's reference
+        dst2.Dispose();         // releases Vortice's reference
         return result;
     }
+
+    private static byte ClampByte(float v) =>
+        v < 0f ? (byte)0 : v > 255f ? (byte)255 : (byte)(v + 0.5f);
 
     /// <inheritdoc />
     public void ReleaseFrame(IntPtr texture)
@@ -613,122 +678,4 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
             _formatContext = null;
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Minimal COM vtable layouts for the D3D11 calls the FrameDecoder needs to
-// copy a decoder surface (one array slice) into a standalone texture.
-// Only the methods actually invoked are declared; earlier vtable slots are
-// represented as IntPtr placeholders to keep the offsets correct.
-// ---------------------------------------------------------------------------
-
-[StructLayout(LayoutKind.Sequential)]
-internal struct D3D11Texture2DDesc
-{
-    public uint Width;
-    public uint Height;
-    public uint MipLevels;
-    public uint ArraySize;
-    public uint Format;   // DXGI_FORMAT
-    public uint SampleCount;
-    public uint SampleQuality;
-    public uint Usage;
-    public uint BindFlags;
-    public uint CPUAccessFlags;
-    public uint MiscFlags;
-}
-
-/// <summary>ID3D11Texture2D vtable (IUnknown + ID3D11DeviceChild + GetDesc).</summary>
-[StructLayout(LayoutKind.Sequential)]
-internal unsafe struct ID3D11Texture2DVtbl
-{
-    // IUnknown
-    public IntPtr QueryInterface;
-    public IntPtr AddRef;
-    public IntPtr Release;
-    // ID3D11DeviceChild
-    public IntPtr GetDevice;
-    public IntPtr GetPrivateData;
-    public IntPtr SetPrivateData;
-    public IntPtr SetPrivateDataInterface;
-    // ID3D11Resource
-    public IntPtr GetResourceType;
-    public IntPtr SetEvictionPriority;
-    public IntPtr GetEvictionPriority;
-    // ID3D11Texture2D
-    public delegate* unmanaged[Stdcall]<IntPtr, D3D11Texture2DDesc*, int> GetDesc;
-}
-
-/// <summary>ID3D11Device vtable — CreateTexture2D is slot 5.</summary>
-[StructLayout(LayoutKind.Sequential)]
-internal unsafe struct ID3D11DeviceVtbl
-{
-    // IUnknown (0-2)
-    public IntPtr QueryInterface;          // 0
-    public IntPtr AddRef;                  // 1
-    public IntPtr Release;                 // 2
-    // ID3D11Device
-    public IntPtr CreateBuffer;            // 3
-    public IntPtr CreateTexture1D;         // 4
-    public delegate* unmanaged[Stdcall]<IntPtr, D3D11Texture2DDesc*, void*, IntPtr*, int> CreateTexture2D; // 5
-}
-
-/// <summary>ID3D11DeviceContext vtable — only CopySubresourceRegion (slot 48) is needed.</summary>
-[StructLayout(LayoutKind.Sequential)]
-internal unsafe struct ID3D11DeviceContextVtbl
-{
-    // IUnknown (0-2)
-    public IntPtr QueryInterface;          // 0
-    public IntPtr AddRef;                  // 1
-    public IntPtr Release;                 // 2
-    // ID3D11DeviceChild (3-6)
-    public IntPtr GetDevice;               // 3
-    public IntPtr GetPrivateData;          // 4
-    public IntPtr SetPrivateData;          // 5
-    public IntPtr SetPrivateDataInterface; // 6
-    // ID3D11DeviceContext (7-47): 41 placeholder slots
-    public IntPtr VSSetConstantBuffers;    // 7
-    public IntPtr PSSetShaderResources;    // 8
-    public IntPtr PSSetShader;             // 9
-    public IntPtr PSSetSamplers;           // 10
-    public IntPtr VSSetShader;             // 11
-    public IntPtr DrawIndexed;             // 12
-    public IntPtr Draw;                    // 13
-    public IntPtr Map;                     // 14
-    public IntPtr Unmap;                   // 15
-    public IntPtr PSSetConstantBuffers;    // 16
-    public IntPtr IASetInputLayout;        // 17
-    public IntPtr IASetVertexBuffers;      // 18
-    public IntPtr IASetIndexBuffer;        // 19
-    public IntPtr DrawIndexedInstanced;    // 20
-    public IntPtr DrawInstanced;           // 21
-    public IntPtr GSSetConstantBuffers;    // 22
-    public IntPtr GSSetShader;             // 23
-    public IntPtr IASetPrimitiveTopology;  // 24
-    public IntPtr VSSetShaderResources;    // 25
-    public IntPtr VSSetSamplers;           // 26
-    public IntPtr SetPredication;          // 27
-    public IntPtr GSSetShaderResources;    // 28
-    public IntPtr GSSetSamplers;           // 29
-    public IntPtr OMSetRenderTargets;      // 30
-    public IntPtr OMSetRenderTargetsAndUnorderedAccessViews; // 31
-    public IntPtr OMSetBlendState;         // 32
-    public IntPtr OMSetDepthStencilState;  // 33
-    public IntPtr SOSetTargets;            // 34
-    public IntPtr DrawAuto;                // 35
-    public IntPtr DrawIndexedInstancedIndirect;  // 36
-    public IntPtr DrawInstancedIndirect;   // 37
-    public IntPtr Dispatch;                // 38
-    public IntPtr DispatchIndirect;        // 39
-    public IntPtr RSSetState;              // 40
-    public IntPtr RSSetViewports;          // 41
-    public IntPtr RSSetScissorRects;       // 42
-    public delegate* unmanaged[Stdcall]<IntPtr, IntPtr, uint, uint, uint, uint, IntPtr, uint, void*, void> CopySubresourceRegion; // 43
-    public IntPtr CopyResource;            // 44
-    public IntPtr UpdateSubresource;       // 45
-    public IntPtr CopyStructureCount;      // 46
-    public IntPtr ClearRenderTargetView;   // 47
-    public IntPtr ClearUnorderedAccessViewUint; // 48
-    public IntPtr ClearUnorderedAccessViewFloat; // 49
-    public IntPtr ClearDepthStencilView;   // 50
 }
