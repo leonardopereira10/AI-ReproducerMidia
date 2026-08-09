@@ -291,82 +291,52 @@ int TextureToTensor(ID3D11DeviceContext* dc, ID3D11Texture2D* staging,
 
     if (srcDesc.Format == DXGI_FORMAT_NV12)
     {
-        // NV12: AMD drivers fail Map() on subresource 1 (UV plane) of NV12
-        // staging textures.  Workaround: copy each plane into a non-planar
-        // staging texture (R8 for Y, R8G8 for UV) and map those instead.
-        D3D11_TEXTURE2D_DESC yDesc = {};
-        yDesc.Width = static_cast<UINT>(w);
-        yDesc.Height = static_cast<UINT>(h);
-        yDesc.MipLevels = 1;
-        yDesc.ArraySize = 1;
-        yDesc.Format = DXGI_FORMAT_R8_UNORM;
-        yDesc.SampleDesc.Count = 1;
-        yDesc.Usage = D3D11_USAGE_STAGING;
-        yDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-
-        D3D11_TEXTURE2D_DESC uvDesc = {};
-        uvDesc.Width = static_cast<UINT>(w / 2);
-        uvDesc.Height = static_cast<UINT>(h / 2);
-        uvDesc.MipLevels = 1;
-        uvDesc.ArraySize = 1;
-        uvDesc.Format = DXGI_FORMAT_R8G8_UNORM;
-        uvDesc.SampleDesc.Count = 1;
-        uvDesc.Usage = D3D11_USAGE_STAGING;
-        uvDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        // NV12 on this AMD driver: CopySubresourceRegion() from a planar
+        // source yields zeros and Map() of the UV subresource fails. The
+        // reliable read is a whole-texture CopyResource into an NV12 staging
+        // followed by a single Map(subresource 0), whose mapped region spans
+        // Y then UV contiguously (UV begins h*RowPitch bytes in).
+        D3D11_TEXTURE2D_DESC nvDesc = srcDesc;
+        nvDesc.Usage = D3D11_USAGE_STAGING;
+        nvDesc.BindFlags = 0;
+        nvDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        nvDesc.MiscFlags = 0;
 
         ID3D11Device* dev = nullptr;
         dc->GetDevice(&dev);
-        ComPtr<ID3D11Texture2D> yStaging, uvStaging;
-        HRESULT hr2 = dev->CreateTexture2D(&yDesc, nullptr, yStaging.GetAddressOf());
-        if (SUCCEEDED(hr2))
-            hr2 = dev->CreateTexture2D(&uvDesc, nullptr, uvStaging.GetAddressOf());
+        ComPtr<ID3D11Texture2D> nvStaging;
+        HRESULT hr2 = dev->CreateTexture2D(&nvDesc, nullptr, nvStaging.GetAddressOf());
         if (dev) dev->Release();
         if (FAILED(hr2))
         {
-            BackendLog(CATRA_LOG_ERROR, "interp_rife: NV12 plane staging alloc hr=0x%08lX",
+            BackendLog(CATRA_LOG_ERROR, "interp_rife: NV12 staging alloc hr=0x%08lX",
                        static_cast<unsigned long>(hr2));
             return CATRA_ERR_DEVICE;
         }
 
-        // Copy planes from source NV12 texture into separate staging textures.
-        dc->CopySubresourceRegion(yStaging.Get(), 0, 0, 0, 0, source, 0, nullptr);  // Y
-        dc->CopySubresourceRegion(uvStaging.Get(), 0, 0, 0, 0, source, 1, nullptr); // UV
+        // Map(MAP_READ) blocks until the pending CopyResource completes.
+        dc->CopyResource(nvStaging.Get(), source);
 
         D3D11_MAPPED_SUBRESOURCE mapY = {};
-        HRESULT hr = dc->Map(yStaging.Get(), 0, D3D11_MAP_READ, 0, &mapY);
+        HRESULT hr = dc->Map(nvStaging.Get(), 0, D3D11_MAP_READ, 0, &mapY);
         if (FAILED(hr))
         {
-            BackendLog(CATRA_LOG_ERROR, "interp_rife: Map(Y R8) failed hr=0x%08lX",
-                       static_cast<unsigned long>(hr));
-            return CATRA_ERR_DEVICE;
-        }
-
-        D3D11_MAPPED_SUBRESOURCE mapUV = {};
-        hr = dc->Map(uvStaging.Get(), 0, D3D11_MAP_READ, 0, &mapUV);
-        if (FAILED(hr))
-        {
-            dc->Unmap(yStaging.Get(), 0);
-            BackendLog(CATRA_LOG_ERROR, "interp_rife: Map(UV R8G8) failed hr=0x%08lX",
-                       static_cast<unsigned long>(hr));
-            return CATRA_ERR_DEVICE;
-        }
-        if (FAILED(hr))
-        {
-            dc->Unmap(staging, 0);
-            BackendLog(CATRA_LOG_ERROR, "interp_rife: Map(NV12 UV) failed hr=0x%08lX",
+            BackendLog(CATRA_LOG_ERROR, "interp_rife: Map(NV12) failed hr=0x%08lX",
                        static_cast<unsigned long>(hr));
             return CATRA_ERR_DEVICE;
         }
 
         const size_t plane = static_cast<size_t>(w) * static_cast<size_t>(h);
         tensor.resize(plane * 3);
-        const uint8_t* yRows = static_cast<const uint8_t*>(mapY.pData);
-        const uint8_t* uvRows = static_cast<const uint8_t*>(mapUV.pData);
+        const size_t pitch = mapY.RowPitch;
+        const uint8_t* base = static_cast<const uint8_t*>(mapY.pData);
+        const uint8_t* yRows = base;
+        const uint8_t* uvRows = base + static_cast<size_t>(h) * pitch;
 
         for (int y = 0; y < h; ++y)
         {
-            const uint8_t* yPx = yRows + static_cast<size_t>(y) * mapY.RowPitch;
-            const uint8_t* uvPx = uvRows + static_cast<size_t>(y / 2) * mapUV.RowPitch;
+            const uint8_t* yPx = yRows + static_cast<size_t>(y) * pitch;
+            const uint8_t* uvPx = uvRows + static_cast<size_t>(y / 2) * pitch;
             for (int x = 0; x < w; ++x)
             {
                 size_t i = static_cast<size_t>(y) * static_cast<size_t>(w) + x;
@@ -385,8 +355,7 @@ int TextureToTensor(ID3D11DeviceContext* dc, ID3D11Texture2D* staging,
             }
         }
 
-        dc->Unmap(uvStaging.Get(), 0);
-        dc->Unmap(yStaging.Get(), 0);
+        dc->Unmap(nvStaging.Get(), 0);
         return CATRA_OK;
     }
 

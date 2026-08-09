@@ -387,42 +387,35 @@ ComPtr<ID3D11Texture2D> ConvertNv12ToBgra11(ID3D11Texture2D* src,
     const int w = static_cast<int>(srcDesc.Width);
     const int h = static_cast<int>(srcDesc.Height);
 
-    D3D11_TEXTURE2D_DESC yDesc = {};
-    yDesc.Width = srcDesc.Width;
-    yDesc.Height = srcDesc.Height;
-    yDesc.MipLevels = 1;
-    yDesc.ArraySize = 1;
-    yDesc.Format = DXGI_FORMAT_R8_UNORM;
-    yDesc.SampleDesc.Count = 1;
-    yDesc.Usage = D3D11_USAGE_STAGING;
-    yDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    // NOTE: on this driver CopySubresourceRegion() from an NV12 (planar)
+    // source yields zeros, and Map() of the UV subresource fails. The reliable
+    // read is a whole-texture CopyResource into an NV12 staging followed by a
+    // single Map(subresource 0), whose mapped region spans Y then UV
+    // contiguously (UV begins h*RowPitch bytes in).
+    D3D11_TEXTURE2D_DESC stDesc = srcDesc;
+    stDesc.Usage = D3D11_USAGE_STAGING;
+    stDesc.BindFlags = 0;
+    stDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    stDesc.MiscFlags = 0;
 
-    D3D11_TEXTURE2D_DESC uvDesc = yDesc;
-    uvDesc.Width = srcDesc.Width / 2;
-    uvDesc.Height = srcDesc.Height / 2;
-    uvDesc.Format = DXGI_FORMAT_R8G8_UNORM;
-
-    ComPtr<ID3D11Texture2D> yStaging, uvStaging;
-    HRESULT hr = g_d3d11Device->CreateTexture2D(&yDesc, nullptr, yStaging.GetAddressOf());
-    if (SUCCEEDED(hr))
-        hr = g_d3d11Device->CreateTexture2D(&uvDesc, nullptr, uvStaging.GetAddressOf());
+    ComPtr<ID3D11Texture2D> nvStaging;
+    HRESULT hr = g_d3d11Device->CreateTexture2D(&stDesc, nullptr, nvStaging.GetAddressOf());
     if (FAILED(hr))
     {
-        catra::BackendLog(CATRA_LOG_ERROR, "interop: NV12 plane staging alloc hr=0x%08lX",
+        catra::BackendLog(CATRA_LOG_ERROR, "interop: NV12 staging alloc hr=0x%08lX",
                    static_cast<unsigned long>(hr));
         return nullptr;
     }
 
-    g_d3d11Context->CopySubresourceRegion(yStaging.Get(), 0, 0, 0, 0, src, 0, nullptr);  // Y
-    g_d3d11Context->CopySubresourceRegion(uvStaging.Get(), 0, 0, 0, 0, src, 1, nullptr); // UV
+    // Map(MAP_READ) on a staging with a pending CopyResource blocks until the
+    // GPU copy completes, so no explicit flush/wait is needed here.
+    g_d3d11Context->CopyResource(nvStaging.Get(), src);
 
-    D3D11_MAPPED_SUBRESOURCE mapY = {}, mapUV = {};
-    hr = g_d3d11Context->Map(yStaging.Get(), 0, D3D11_MAP_READ, 0, &mapY);
-    if (SUCCEEDED(hr))
-        hr = g_d3d11Context->Map(uvStaging.Get(), 0, D3D11_MAP_READ, 0, &mapUV);
+    D3D11_MAPPED_SUBRESOURCE mapY = {};
+    hr = g_d3d11Context->Map(nvStaging.Get(), 0, D3D11_MAP_READ, 0, &mapY);
     if (FAILED(hr))
     {
-        catra::BackendLog(CATRA_LOG_ERROR, "interop: NV12 plane map hr=0x%08lX",
+        catra::BackendLog(CATRA_LOG_ERROR, "interop: NV12 staging map hr=0x%08lX",
                    static_cast<unsigned long>(hr));
         return nullptr;
     }
@@ -442,8 +435,7 @@ ComPtr<ID3D11Texture2D> ConvertNv12ToBgra11(ID3D11Texture2D* src,
     hr = g_d3d11Device->CreateTexture2D(&bgraStagingDesc, nullptr, bgraStaging.GetAddressOf());
     if (FAILED(hr))
     {
-        g_d3d11Context->Unmap(uvStaging.Get(), 0);
-        g_d3d11Context->Unmap(yStaging.Get(), 0);
+        g_d3d11Context->Unmap(nvStaging.Get(), 0);
         catra::BackendLog(CATRA_LOG_ERROR, "interop: BGRA staging alloc hr=0x%08lX",
                    static_cast<unsigned long>(hr));
         return nullptr;
@@ -453,23 +445,24 @@ ComPtr<ID3D11Texture2D> ConvertNv12ToBgra11(ID3D11Texture2D* src,
     hr = g_d3d11Context->Map(bgraStaging.Get(), 0, D3D11_MAP_WRITE, 0, &mapB);
     if (FAILED(hr))
     {
-        g_d3d11Context->Unmap(uvStaging.Get(), 0);
-        g_d3d11Context->Unmap(yStaging.Get(), 0);
+        g_d3d11Context->Unmap(nvStaging.Get(), 0);
         catra::BackendLog(CATRA_LOG_ERROR, "interop: BGRA staging map hr=0x%08lX",
                    static_cast<unsigned long>(hr));
         return nullptr;
     }
 
-    const uint8_t* yRows = static_cast<const uint8_t*>(mapY.pData);
-    const uint8_t* uvRows = static_cast<const uint8_t*>(mapUV.pData);
+    const uint8_t* base = static_cast<const uint8_t*>(mapY.pData);
+    const size_t pitch = mapY.RowPitch;
+    const uint8_t* yRows = base;                          // Y plane: rows [0, h)
+    const uint8_t* uvRows = base + static_cast<size_t>(h) * pitch; // UV: [h, 1.5h)
     auto clamp8 = [](float v) -> uint8_t {
         return v < 0.0f ? 0 : (v > 255.0f ? 255 : static_cast<uint8_t>(v + 0.5f));
     };
 
     for (int y = 0; y < h; ++y)
     {
-        const uint8_t* yPx = yRows + static_cast<size_t>(y) * mapY.RowPitch;
-        const uint8_t* uvPx = uvRows + static_cast<size_t>(y / 2) * mapUV.RowPitch;
+        const uint8_t* yPx = yRows + static_cast<size_t>(y) * pitch;
+        const uint8_t* uvPx = uvRows + static_cast<size_t>(y / 2) * pitch;
         uint8_t* dst = static_cast<uint8_t*>(mapB.pData) + static_cast<size_t>(y) * mapB.RowPitch;
         for (int x = 0; x < w; ++x)
         {
@@ -487,9 +480,15 @@ ComPtr<ID3D11Texture2D> ConvertNv12ToBgra11(ID3D11Texture2D* src,
         }
     }
 
+    if (getenv("CATRA_INTEROP_DEBUG"))
+    {
+        fprintf(stderr, "[nv12conv] Y(10,0)=%u Y(10,500)=%u U=%u V=%u\n",
+                yRows[10], yRows[500 * pitch + 10], uvRows[0], uvRows[1]);
+        fflush(stderr);
+    }
+
+    g_d3d11Context->Unmap(nvStaging.Get(), 0);
     g_d3d11Context->Unmap(bgraStaging.Get(), 0);
-    g_d3d11Context->Unmap(uvStaging.Get(), 0);
-    g_d3d11Context->Unmap(yStaging.Get(), 0);
 
     D3D11_TEXTURE2D_DESC gpuDesc = bgraStagingDesc;
     gpuDesc.Usage = D3D11_USAGE_DEFAULT;
@@ -506,6 +505,258 @@ ComPtr<ID3D11Texture2D> ConvertNv12ToBgra11(ID3D11Texture2D* src,
     }
     g_d3d11Context->CopyResource(dst11.Get(), bgraStaging.Get());
     return dst11;
+}
+
+// Blocks the CPU until every D3D11 command submitted so far has FINISHED on
+// the GPU (not merely been submitted).
+//
+// Why this is needed (AMD RDNA 4, observed with tools/interop_readback_test):
+// Flush() only pushes the immediate context's batched commands into the GPU
+// queue; it does NOT wait for them to complete. The keyed-mutex ReleaseSync /
+// D3D12-side AcquireSync is supposed to provide the cross-API completion
+// guarantee, but on this driver the D3D12 consumer (AMF hardware encoder)
+// reads the shared allocation while the D3D11 copy is still in flight when
+// the GPU is busy (e.g. right after DirectML inference) -> the encoder sees a
+// partially-written (top band) or zeroed (green) surface. Because this is an
+// OFFLINE transcode pipeline (throughput-bound, not latency-bound), a CPU
+// stall until the copy is verifiably done is the correct, robust trade-off.
+void WaitForD3D11GpuIdle()
+{
+    D3D11_QUERY_DESC qd = {};
+    qd.Query = D3D11_QUERY_EVENT;
+    ComPtr<ID3D11Query> query;
+    HRESULT hr = g_d3d11Device->CreateQuery(&qd, query.GetAddressOf());
+    if (FAILED(hr))
+    {
+        return; // best-effort: fall back to flush-only behaviour
+    }
+    g_d3d11Context->End(query.Get());
+    // Spin with a bounded timeout; GetData returns S_OK once the GPU reached
+    // the End() marker. Sleep to avoid burning a core while we wait.
+    for (int i = 0; i < 2000; ++i) // ~2s ceiling (2000 * 1ms)
+    {
+        BOOL done = FALSE;
+        hr = g_d3d11Context->GetData(query.Get(), &done, sizeof(done), 0);
+        if (hr == S_OK && done)
+        {
+            return;
+        }
+        if (hr != S_OK && hr != S_FALSE)
+        {
+            return; // device error: don't spin forever
+        }
+        Sleep(1);
+    }
+}
+
+// ===========================================================================
+// D3D12-native pool populated via CPU round-trip (robust encode path)
+// ===========================================================================
+//
+// The AMD RDNA 4 driver proves unreliable for cross-API shared surfaces once
+// DirectML has run (the D3D12 view of a D3D11-shared texture reads zeros or a
+// partial top band -> green frames; keyed-mutex AcquireSync also returns
+// non-standard timeouts). Because this is an OFFLINE transcode pipeline
+// (throughput-bound), we trade zero-copy for correctness: read the D3D11
+// source back to system memory, then upload it into a D3D12-NATIVE texture on
+// our own queue. The AMF encoder then consumes a plain same-device D3D12
+// resource — no shared handle, no keyed mutex, no cross-API view.
+
+struct Pool12Slot
+{
+    ComPtr<ID3D12Resource> tex; // D3D12-native, DEFAULT heap
+};
+
+std::vector<Pool12Slot> g_pool12;
+D3D11_TEXTURE2D_DESC g_pool12Desc = {};
+size_t g_pool12Index = 0;
+
+int EnsurePool12Locked(const D3D11_TEXTURE2D_DESC& d)
+{
+    if (!g_pool12.empty() && SameGeometry(g_pool12Desc, d))
+    {
+        return CATRA_OK;
+    }
+    g_pool12.clear();
+
+    for (size_t i = 0; i < kInteropPoolSize; ++i)
+    {
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = d.Width;
+        rd.Height = d.Height;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.Format = d.Format;
+        rd.SampleDesc.Count = 1;
+        rd.SampleDesc.Quality = 0;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        Pool12Slot slot;
+        HRESULT hr = g_d3d12Device->CreateCommittedResource(
+            &hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(slot.tex.GetAddressOf()));
+        if (FAILED(hr))
+        {
+            catra::BackendLog(CATRA_LOG_ERROR,
+                              "interop: pool12 slot create hr=0x%08lX",
+                              static_cast<unsigned long>(hr));
+            g_pool12.clear();
+            return CATRA_ERR_DEVICE;
+        }
+        g_pool12.push_back(std::move(slot));
+    }
+
+    g_pool12Desc = d;
+    g_pool12Index = 0;
+    ++g_poolGeneration;
+    catra::BackendLog(CATRA_LOG_INFO,
+                      "interop: pool12 rebuilt %ux%u fmt=%u (%u slots)",
+                      d.Width, d.Height, static_cast<unsigned>(d.Format),
+                      static_cast<unsigned>(kInteropPoolSize));
+    return CATRA_OK;
+}
+
+// Reads a D3D11 texture back to tightly-packed system memory (BGRA).
+bool ReadBack11ToCpu(ID3D11Texture2D* src, const D3D11_TEXTURE2D_DESC& d,
+                     std::vector<uint8_t>& out, UINT& outPitch)
+{
+    D3D11_TEXTURE2D_DESC sd = d;
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.BindFlags = 0;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    sd.MiscFlags = 0;
+
+    ComPtr<ID3D11Texture2D> staging;
+    HRESULT hr = g_d3d11Device->CreateTexture2D(&sd, nullptr, staging.GetAddressOf());
+    if (FAILED(hr))
+    {
+        return false;
+    }
+
+    g_d3d11Context->CopyResource(staging.Get(), src);
+    g_d3d11Context->Flush();
+    WaitForD3D11GpuIdle();
+
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    hr = g_d3d11Context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m);
+    if (FAILED(hr))
+    {
+        return false;
+    }
+
+    const UINT bpp = 4; // BGRA
+    out.resize(static_cast<size_t>(d.Width) * d.Height * bpp);
+    const uint8_t* srcRows = static_cast<const uint8_t*>(m.pData);
+    for (UINT y = 0; y < d.Height; ++y)
+    {
+        memcpy(out.data() + static_cast<size_t>(y) * d.Width * bpp,
+               srcRows + static_cast<size_t>(y) * m.RowPitch,
+               static_cast<size_t>(d.Width) * bpp);
+    }
+    outPitch = d.Width * bpp;
+    g_d3d11Context->Unmap(staging.Get(), 0);
+    if (getenv("CATRA_INTEROP_DEBUG"))
+    {
+        size_t mid = static_cast<size_t>(d.Height / 2) * d.Width * bpp + 40;
+        fprintf(stderr,
+                "[readback] w=%u h=%u first4=%u,%u,%u,%u mid(row%u,x10)=%u,%u,%u,%u\n",
+                d.Width, d.Height, out[0], out[1], out[2], out[3], d.Height / 2,
+                out[mid], out[mid + 1], out[mid + 2], out[mid + 3]);
+        fflush(stderr);
+    }
+    return true;
+}
+
+// Uploads tightly-packed BGRA bytes into a D3D12-native texture on our queue.
+bool UploadCpuTo12(ID3D12Resource* dst, const D3D11_TEXTURE2D_DESC& d,
+                   const std::vector<uint8_t>& data, UINT srcPitch)
+{
+    D3D12_RESOURCE_DESC rd = dst->GetDesc();
+    UINT numRows = 0;
+    UINT64 rowSize = 0;
+    UINT64 total = 0;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+    g_d3d12Device->GetCopyableFootprints(&rd, 0, 1, 0, &fp, &numRows, &rowSize, &total);
+
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bd = {};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = total;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.Format = DXGI_FORMAT_UNKNOWN;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ComPtr<ID3D12Resource> upload;
+    HRESULT hr = g_d3d12Device->CreateCommittedResource(
+        &hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr, IID_PPV_ARGS(upload.GetAddressOf()));
+    if (FAILED(hr))
+    {
+        return false;
+    }
+
+    uint8_t* mapped = nullptr;
+    hr = upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped));
+    if (FAILED(hr))
+    {
+        return false;
+    }
+    const UINT dstPitch = fp.Footprint.RowPitch;
+    const UINT rowBytes = static_cast<UINT>(srcPitch); // tightly packed = width*4
+    for (UINT y = 0; y < d.Height; ++y)
+    {
+        memcpy(mapped + fp.Offset + static_cast<size_t>(y) * dstPitch,
+               data.data() + static_cast<size_t>(y) * srcPitch,
+               rowBytes);
+    }
+    upload->Unmap(0, nullptr);
+
+    // Record + execute the upload copy on our DIRECT queue, then wait.
+    HRESULT rs = g_cmdAllocator->Reset();
+    if (SUCCEEDED(rs)) rs = g_cmdList->Reset(g_cmdAllocator.Get(), nullptr);
+    if (FAILED(rs)) return false;
+
+    D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+    dstLoc.pResource = dst;
+    // 0 = subresource (SDK …_SUBRESOURCE / directx-headers …_SUBRESOURCE_INDEX).
+    dstLoc.Type = static_cast<D3D12_TEXTURE_COPY_TYPE>(0);
+    dstLoc.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+    srcLoc.pResource = upload.Get();
+    srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    srcLoc.PlacedFootprint = fp;
+    g_cmdList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+
+    D3D12_RESOURCE_BARRIER bar = {};
+    bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bar.Transition.pResource = dst;
+    bar.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    bar.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    g_cmdList->ResourceBarrier(1, &bar);
+    g_cmdList->Close();
+
+    ID3D12CommandList* lists[] = { g_cmdList.Get() };
+    g_d3d12Queue->ExecuteCommandLists(1, lists);
+
+    const UINT64 fv = ++g_fenceValue;
+    g_d3d12Queue->Signal(g_fence.Get(), fv);
+    if (g_fence->GetCompletedValue() < fv)
+    {
+        g_fence->SetEventOnCompletion(fv, g_fenceEvent);
+        WaitForSingleObject(g_fenceEvent, 5000);
+    }
+    return true;
 }
 
 } // namespace
@@ -747,118 +998,37 @@ int interop_share_d3d11_to_d3d12(ID3D11Texture2D* src,
         copySrc->GetDesc(&desc); // pool geometry now matches the BGRA texture
     }
 
-    int rc = EnsurePoolLocked(desc);
+    // CPU ROUND-TRIP into a D3D12-native pool slot (see header comment above
+    // Pool12Slot): avoids the unreliable cross-API shared surface on this
+    // driver. Read the (BGRA) D3D11 source back to system memory, upload into
+    // a same-device D3D12 texture, hand that to the consumer.
+    int rc = EnsurePool12Locked(desc);
     if (rc != CATRA_OK)
     {
         return rc;
     }
 
-    InteropPoolSlot& slot = g_pool[g_poolIndex];
-    g_poolIndex = (g_poolIndex + 1) % g_pool.size();
+    Pool12Slot& slot = g_pool12[g_pool12Index];
+    g_pool12Index = (g_pool12Index + 1) % g_pool12.size();
 
-    // FIXED KEY STRATEGY (RDNA 4 / AMD driver compatibility):
-    // Each pool slot has its OWN keyed mutex. The producer always uses key=0
-    // because: (a) the AMF encoder (consumer) does NOT participate in the keyed
-    // mutex protocol (it uses CreateSurfaceFromDX12Native zero-copy wrap without
-    // AcquireSync/ReleaseSync), so there is no consumer ReleaseSync to wait on;
-    // (b) the AMD RDNA 4 driver returns non-standard AcquireSync timeouts when
-    // using non-zero keys on freshly-rebuilt mutexes (observed: AcquireSync(1)
-    // returns 0x00000102/WAIT_TIMEOUT on a never-used mutex). With key=0,
-    // AcquireSync succeeds on both unowned mutexes (first use) and released(0)
-    // mutexes (subsequent round-robin reuse). The Flush() after CopyResource
-    // provides the cross-API sync guarantee (submission to GPU before the AMF
-    // reads the shared allocation).
-    const uint64_t key = 0;
-    HRESULT ahr = slot.mutex11->AcquireSync(key, kInteropAcquireTimeoutMs);
-    // AMD driver quirk: AcquireSync may return WAIT_TIMEOUT as a raw Win32
-    // error (0x102) with severity bit clear, so FAILED() does not catch it.
-    // Check explicitly for ANY timeout indicator before the FAILED gate.
-    if (IsAcquireTimeout(ahr))
+    std::vector<uint8_t> cpu;
+    UINT srcPitch = 0;
+    if (!ReadBack11ToCpu(copySrc, desc, cpu, srcPitch))
     {
-        BackendLog(CATRA_LOG_ERROR,
-                   "interop: pool AcquireSync(key=%llu) TIMEOUT hr=0x%08lX",
-                   static_cast<unsigned long long>(key),
-                   static_cast<unsigned long>(ahr));
+        BackendLog(CATRA_LOG_ERROR, "interop: pool12 D3D11 readback failed");
         return CATRA_ERR_DEVICE;
     }
-    if (FAILED(ahr))
+    if (!UploadCpuTo12(slot.tex.Get(), desc, cpu, srcPitch))
     {
-        BackendLog(CATRA_LOG_ERROR,
-                   "interop: pool AcquireSync(key=%llu) hr=0x%08lX",
-                   static_cast<unsigned long long>(key),
-                   static_cast<unsigned long>(ahr));
-        return HrToCatra(ahr);
+        BackendLog(CATRA_LOG_ERROR, "interop: pool12 D3D12 upload failed");
+        return CATRA_ERR_DEVICE;
     }
 
-    rc = interop_copy_d3d11(g_d3d11Context.Get(), copySrc, slot.tex11.Get());
-
-    // ROOT-CAUSE FIX — DXGI_ERROR_DEVICE_HUNG/REMOVED (0x887A0001) on the
-    // AMF encode after RIFE interpolation:
-    //
-    // CopyResource only RECORDS the copy in the immediate context's batched
-    // command stream; it is NOT guaranteed to be submitted to the GPU by the
-    // time ReleaseSync runs below. A keyed-mutex ownership transfer only
-    // waits for work the owning device has SUBMITTED, so without this flush
-    // the D3D12 consumer (FSR dispatch / AMF CreateSurfaceFromDX12Native)
-    // can acquire the slot and read the shared NT resource while the D3D11
-    // copy is still pending -> cross-API write/read race on the same
-    // allocation -> GPU hang -> device removal. Flush() forces every pending
-    // immediate-context command (this copy included) into the GPU queue, so
-    // the copy joins the exact timeline ReleaseSync(k) waits on.
-    //
-    // Chosen over a D3D11On12 cross-API fence (option B) deliberately:
-    // Flush submits but does NOT block (no CPU stall, no extra TDR pressure),
-    // and the keyed mutex IS the cross-API sync object once the work is
-    // submitted — a D3D11On12 fence would require wrapping the D3D11 device
-    // and adds no ordering guarantee the keyed mutex does not already give.
-    if (rc == CATRA_OK)
-    {
-        g_d3d11Context->Flush();
-    }
-
-    // Release what was acquired even if the copy failed (a stuck key would
-    // deadlock the consumer two frames later).
-    HRESULT rhr = slot.mutex11->ReleaseSync(key);
-    // key stays at 0 (see FIXED KEY STRATEGY above — no ping-pong needed)
-    if (FAILED(rhr))
-    {
-        BackendLog(CATRA_LOG_WARN,
-                   "interop: pool ReleaseSync(key=%llu) hr=0x%08lX",
-                   static_cast<unsigned long long>(key),
-                   static_cast<unsigned long>(rhr));
-    }
-    if (rc != CATRA_OK)
-    {
-        return rc;
-    }
-
-    // Hand out the slot's D3D12 resource (AddRef'd; the pool keeps its own
-    // reference). The NT handle, when requested, is freshly minted on the
-    // slot texture so the caller can CloseHandle it without disturbing the
-    // pool.
-    if (out_shared_handle != nullptr)
-    {
-        ComPtr<IDXGIResource1> resource1;
-        HRESULT hr = slot.tex11.As(&resource1);
-        if (SUCCEEDED(hr))
-        {
-            hr = resource1->CreateSharedHandle(
-                nullptr,
-                DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
-                nullptr,
-                out_shared_handle);
-        }
-        if (FAILED(hr))
-        {
-            BackendLog(CATRA_LOG_WARN,
-                       "interop: pool handle mint hr=0x%08lX (resource still shared)",
-                       static_cast<unsigned long>(hr));
-            *out_shared_handle = nullptr; // resource share itself succeeded
-        }
-    }
-
-    *out_d3d12_tex = slot.res12.Get();
-    slot.res12->AddRef();
+    // No shared NT handle is minted on this path (the resource never leaves
+    // the D3D12 device); leave *out_shared_handle null so the caller's RAII
+    // cleanup skips CloseHandle.
+    *out_d3d12_tex = slot.tex.Get();
+    slot.tex->AddRef();
     return CATRA_OK;
 }
 
