@@ -213,7 +213,25 @@
   Guia `lib/rife/EXPORT_FP16_GUIDE.md` com passo-a-passo export+deploy+rollback.
   C++ NÃO precisa mudanças — ORT faz cast FP32→FP16 automaticamente.
   
-  **PENDENTE**: Export do modelo na máquina com PyTorch ROCm + validação GPU real.
-  Comando: `python export_onnx.py --preset fast -o rife_v4.onnx`
-  Meta: ≥32fps output no pipeline completo (Martial Master EP72).
-  Build 0w/0e, 543 testes, zero regressões.
+  **VALIDAÇÃO GPU REAL (RX 9070 XT, ROCm, 1920x1080)**:
+  Benchmark com PyTorch ROCm (5 runs, warm-up excluído):
+  - FP32 5-scales (16,8,4,2,1): 67ms/frame → 335ms/par → 17.9fps output
+  - FP16 4-scales (16,8,4,2,2): 19ms/frame → 93ms/par → **64.8fps output**
+  - **Speedup: 3.62x** (meta era 2x!)
+  
+  Abordagem final: FP16 post-export (convert_float_to_float16, keep_io_types=True)
+  - Pesos FP16 internos, I/O mantido em FP32
+  - Compatível com interp_rife.cpp sem modificações
+  - PSNR >49dB vs FP32 5-scales (inputs realistas)
+  - Modelo: 12MB (vs 22MB FP32)
+  
+  Fix importante: IFNet_HDv3 tem 5 blocos fixos (for i in range(5)),
+  então scale_list precisa de 5 elementos. "4 scales" = [16,8,4,2,2]
+  (substitui scale=1 full-res por scale=2).
+  
+  Modelo deployado: lib/rife/rife_v4.onnx (12MB, FP16 pesos, FP32 I/O)
+  Backup FP32: lib/rife/rife_v4_fp32_backup.onnx (22MB)
+  Build nativo: OK. 545 testes pass, 0w/0e.
+  
+  **PENDENTE**: Validação do pipeline completo (CATRA.App.exe + EP72)
+  para confirmar throughput no pipeline real com encode AMF.
