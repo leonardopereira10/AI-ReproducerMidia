@@ -55,6 +55,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--cpu", action="store_true", help="export on CPU")
 parser.add_argument("--opset", type=int, default=17)
 parser.add_argument("--model-dir", type=str, default="train_log")
+parser.add_argument("--fp16", action="store_true", help="Export as FP16 (half precision)")
+parser.add_argument("--scales", type=str, default="16,8,4,2,1",
+                    help="Comma-separated pyramid scales (default: 16,8,4,2,1)")
 parser.add_argument("-o", "--output", type=str, default="rife_v4.onnx")
 args = parser.parse_args()
 
@@ -66,6 +69,10 @@ model = Model()
 model.load_model(args.model_dir, -1)
 model.eval()
 model.flownet.to(dev)
+
+if args.fp16:
+    print("Converting model to FP16...")
+    model.flownet = model.flownet.half()
 
 # ---------------------------------------------------------------------------
 # Wrapper with pad-to-multiple-of-128 + crop
@@ -82,9 +89,10 @@ class RifeOnnxWrapper(nn.Module):
     Returns:
         output:   [B, 3, H, W]  float32, range [0, 1]
     """
-    def __init__(self, flownet: nn.Module):
+    def __init__(self, flownet: nn.Module, scales="16,8,4,2,1"):
         super().__init__()
         self.flownet = flownet
+        self.scales = scales
 
     def forward(self, img0: torch.Tensor, img1: torch.Tensor,
                 timestep: torch.Tensor) -> torch.Tensor:
@@ -100,7 +108,7 @@ class RifeOnnxWrapper(nn.Module):
             img1 = F.pad(img1, (0, pad_right, 0, pad_bottom), mode='replicate')
 
         imgs = torch.cat((img0, img1), 1)
-        scale_list = [16.0, 8.0, 4.0, 2.0, 1.0]
+        scale_list = [float(s) for s in self.scales.split(",")]
         _flow_list, _mask, merged = self.flownet(imgs, timestep, scale_list)
         out = merged[-1]  # [B, 3, ph, pw]
 
@@ -110,7 +118,7 @@ class RifeOnnxWrapper(nn.Module):
         return out
 
 
-wrapper = RifeOnnxWrapper(model.flownet).to(dev)
+wrapper = RifeOnnxWrapper(model.flownet, scales=args.scales).to(dev)
 wrapper.eval()
 
 # ---------------------------------------------------------------------------
@@ -120,6 +128,11 @@ H, W = 720, 1280
 dummy_img0 = torch.randn(1, 3, H, W, device=dev)
 dummy_img1 = torch.randn(1, 3, H, W, device=dev)
 dummy_ts   = torch.tensor([0.5], device=dev)
+
+if args.fp16:
+    dummy_img0 = dummy_img0.half()
+    dummy_img1 = dummy_img1.half()
+    dummy_ts = dummy_ts.half()
 
 print(f"Warm-up run with {list(dummy_img0.shape)} ...")
 with torch.no_grad():
@@ -158,10 +171,18 @@ try:
     sess = ort.InferenceSession(args.output, providers=["CPUExecutionProvider"])
 
     # Test at a different resolution to verify dynamic axes
+    # Detect model input dtype
+    input_dtype = np.float32
+    for inp in sess.get_inputs():
+        if inp.type == 'tensor(float16)':
+            input_dtype = np.float16
+            break
+
     for test_h, test_w in [(128, 128), (720, 1280), (1080, 1920)]:
-        in0 = np.random.randn(1, 3, test_h, test_w).astype(np.float32)
-        in1 = np.random.randn(1, 3, test_h, test_w).astype(np.float32)
-        ts  = np.array([0.5], dtype=np.float32)
+        # Use appropriate dtype for test inputs
+        in0 = np.random.randn(1, 3, test_h, test_w).astype(input_dtype)
+        in1 = np.random.randn(1, 3, test_h, test_w).astype(input_dtype)
+        ts  = np.array([0.5], dtype=input_dtype)
         out = sess.run(None, {"img0": in0, "img1": in1, "timestep": ts})[0]
         assert out.shape == (1, 3, test_h, test_w), \
             f"Shape mismatch at {test_h}x{test_w}: got {out.shape}"
