@@ -266,8 +266,6 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
                 if (_bufferedTextures.Count > 0)
                 {
                     texture = _bufferedTextures.Dequeue();
-                    Console.Error.WriteLine($"[TryReadFrame] buffered dequeue, remaining={_bufferedTextures.Count}");
-                    Console.Error.Flush();
                     return true;
                 }
 
@@ -276,11 +274,7 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
                     return TryReceiveFrame(out texture);
                 }
 
-                Console.Error.WriteLine("[TryReadFrame] av_read_frame...");
-                Console.Error.Flush();
                 int result = ffmpeg.av_read_frame(_formatContext, _packet);
-                Console.Error.WriteLine($"[TryReadFrame] av_read_frame result={result}");
-                Console.Error.Flush();
                 if (result == ffmpeg.AVERROR_EOF)
                 {
                     int flush = SendPacketDraining(null);
@@ -305,27 +299,17 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
                     continue;
                 }
 
-                Console.Error.WriteLine("[TryReadFrame] SendPacketDraining...");
-                Console.Error.Flush();
                 int send = SendPacketDraining(_packet);
-                Console.Error.WriteLine($"[TryReadFrame] SendPacketDraining result={send}");
-                Console.Error.Flush();
                 ffmpeg.av_packet_unref(_packet);
                 if (send < 0 && send != ffmpeg.AVERROR_EOF)
                 {
                     throw new FfmpegException(send, "avcodec_send_packet");
                 }
 
-                Console.Error.WriteLine("[TryReadFrame] TryReceiveFrame...");
-                Console.Error.Flush();
                 if (TryReceiveFrame(out texture))
                 {
-                    Console.Error.WriteLine($"[TryReadFrame] TryReceiveFrame OK texture=0x{texture:X}");
-                    Console.Error.Flush();
                     return true;
                 }
-                Console.Error.WriteLine("[TryReadFrame] TryReceiveFrame returned false, looping");
-                Console.Error.Flush();
             }
         }
     }
@@ -338,15 +322,9 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
     /// </summary>
     private int SendPacketDraining(AVPacket* packet)
     {
-        Console.Error.WriteLine($"[SendPacketDraining] avcodec_send_packet ctx=0x{(IntPtr)_codecContext:X} pkt=0x{(IntPtr)packet:X}");
-        Console.Error.Flush();
         int result = ffmpeg.avcodec_send_packet(_codecContext, packet);
-        Console.Error.WriteLine($"[SendPacketDraining] avcodec_send_packet result={result}");
-        Console.Error.Flush();
         while (result == -ffmpeg.EAGAIN)
         {
-            Console.Error.WriteLine("[SendPacketDraining] EAGAIN, draining...");
-            Console.Error.Flush();
             while (TryReceiveFrame(out IntPtr drained))
             {
                 _bufferedTextures.Enqueue(drained);
