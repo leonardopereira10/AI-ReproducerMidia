@@ -118,3 +118,16 @@
   técnica que o RIFE já usa com sucesso); RIFE volta a emitir BGRA; encoder AMF
   Init com AMF_SURFACE_BGRA. Dump de diagnóstico decodifica p/ pattern correto
   (sem verde). 3ª corrida do EP28 em andamento p/ validar o MP4 final.
+
+- **CAUSA RAIZ DEFINITIVA DOS FRAMES VERDES (commit 9a53d78)**: NÃO era o
+  share NV12 em si — era `ID3D11DeviceContext::CopySubresourceRegion()` lendo
+  de uma fonte NV12 (planar), que retorna ZEROS neste driver AMD RDNA4 (e
+  `Map()` do subresource UV falha). Isso afetava o `TextureToTensor` do RIFE
+  (inputs verdes → interpola verde) e a conversão NV12→BGRA do interop. Fix:
+  ler NV12 via `CopyResource` p/ staging NV12 + `Map(sub0)` único (região
+  contígua Y+UV, UV em h*RowPitch). Também troquei o caminho de encode p/ um
+  pool D3D12-nativo populado por round-trip CPU (readback D3D11 → upload D3D12
+  na nossa fila), evitando a shared-surface/keyed-mutex não-confiável pós-
+  DirectML. Diagnóstico `tools/interop_readback_test.cpp` decodifica o dump
+  RIFE→interop→AMF p/ o pattern correto (source + 5 intermediários, sem verde).
+  4ª corrida do EP28 em andamento p/ validar o MP4 final.
