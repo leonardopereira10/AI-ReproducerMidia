@@ -47,6 +47,10 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
     private bool _opened;
     private bool _eofSent;
     private bool _disposed;
+    private bool _diagLogged;
+    private SwsContext* _scaler;
+    private int _scalerW;
+    private int _scalerH;
 
     private FrameSourceMetadata? _metadata;
     private IntPtr _d3d11DevicePtr;
@@ -392,106 +396,99 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
                 "avcodec_receive_frame (pipeline requires D3D11VA hardware frames)");
         }
 
-        IntPtr textureArray = (IntPtr)frame->data[0];
-        int subresource = (int)(long)frame->data[1];
-
-        // Keep the original AVFrame alive so the texture array COM ref is held.
-        AVFrame* owned = ffmpeg.av_frame_alloc();
-        if (owned == null)
+        // AMD RDNA4 (Adrenalin) driver bug, confirmed empirically on this machine:
+        // every direct D3D11 read of an NV12 decoder array slice returns ZEROS
+        // (CopySubresourceRegion into staging reads zeros; NV12 staging ARRAYS
+        // fail CreateTexture2D with E_INVALIDARG so whole-array CopyResource is
+        // not an option either) => green frames.
+        // FFmpeg's own D3D11VA download (av_hwframe_transfer_data) is the one
+        // path that works: validated BIT-IDENTICAL to software decode (md5 of
+        // raw NV12 matches CPU decode). Download to system NV12 here, convert
+        // NV12 -> BGRA on the CPU, and upload a standalone BGRA texture.
+        AVFrame* sw = ffmpeg.av_frame_alloc();
+        if (sw == null)
         {
             throw new OutOfMemoryException("av_frame_alloc returned null.");
         }
 
-        ffmpeg.av_frame_move_ref(owned, frame);
+        int transfer = ffmpeg.av_hwframe_transfer_data(sw, frame, 0);
+        if (transfer < 0)
+        {
+            ffmpeg.av_frame_free(&sw);
+            throw new FfmpegException(transfer, "av_hwframe_transfer_data");
+        }
 
-        // Copy the decoder surface (one array slice) into a standalone texture.
-        IntPtr standalone = CopyToStandaloneTexture(textureArray, subresource);
+        // Pixels are now in system memory; drop the hw frame immediately so the
+        // decoder surface (texture array slice) is recycled right away.
+        ffmpeg.av_frame_unref(frame);
 
-        _ownedFrames.Add((standalone, (IntPtr)owned));
-        return standalone;
+        try
+        {
+            IntPtr standalone = ConvertAndUploadNv12(sw);
+            _ownedFrames.Add((standalone, IntPtr.Zero));
+            return standalone;
+        }
+        finally
+        {
+            ffmpeg.av_frame_free(&sw);
+        }
     }
 
     /// <summary>
-    /// Copies one array slice from a (possibly array) ID3D11Texture2D into a fresh
-    /// standalone texture (ArraySize == 1) using Vortice.Direct3D11 wrappers.
-    /// Returns an AddRef'd ID3D11Texture2D* that the caller must Release.
+    /// Converts a system-memory NV12 <c>AVFrame</c> (from
+    /// <c>av_hwframe_transfer_data</c>) into BGRA on the CPU and uploads it as a
+    /// standalone BGRA D3D11 texture (ArraySize == 1). Returns an AddRef'd
+    /// ID3D11Texture2D* that the caller must Release.
     /// </summary>
-    private IntPtr CopyToStandaloneTexture(IntPtr srcTexture, int arraySlice)
+    private IntPtr ConvertAndUploadNv12(AVFrame* sw)
     {
         if (_vorticeDevice == null || _vorticeContext == null)
         {
             throw new InvalidOperationException(
-                "D3D11 device/context not available; cannot copy decoder frame.");
+                "D3D11 device/context not available; cannot create frame texture.");
         }
 
-        // AMD RDNA 4 driver bug: ID3D11DeviceContext::CopySubresourceRegion()
-        // reading from an NV12 (planar) source returns ZEROS, which made every
-        // decoded frame solid green downstream. Avoid that op entirely: read the
-        // decoder array slice back to system memory (whole-resource CopyResource
-        // into a staging array + per-subresource Map, which is reliable), convert
-        // NV12 -> BGRA on the CPU, and upload the BGRA into a standalone texture.
-        var srcTex = new VDX.ID3D11Texture2D(srcTexture);
-        Texture2DDescription srcDesc = srcTex.Description;
-
-        int dstW = _metadata?.Width ?? (int)srcDesc.Width;
-        int dstH = _metadata?.Height ?? (int)srcDesc.Height;
-
-        // Staging copy of the WHOLE array (CopyResource of the full resource is
-        // reliable; only the per-plane CopySubresourceRegion read is broken).
-        var stagingDesc = srcDesc;
-        stagingDesc.Usage = ResourceUsage.Staging;
-        stagingDesc.BindFlags = BindFlags.None;
-        stagingDesc.CPUAccessFlags = CpuAccessFlags.Read;
-        stagingDesc.MiscFlags = ResourceOptionFlags.None;
-        var staging = _vorticeDevice.CreateTexture2D(stagingDesc);
-        _vorticeContext.CopyResource(staging, srcTex);
-
-        var fmt = srcDesc.Format;
-        if (fmt != Format.NV12)
+        if ((AVPixelFormat)sw->format != AVPixelFormat.AV_PIX_FMT_NV12)
         {
-            staging.Dispose();
             throw new NotSupportedException(
-                $"FrameDecoder: unsupported decoded format {fmt}; pipeline expects NV12 D3D11VA frames.");
+                $"FrameDecoder: unexpected downloaded format {(AVPixelFormat)sw->format}; expected NV12.");
         }
 
-        int texH = (int)srcDesc.Height; // texture height (may be aligned, e.g. 1088)
+        int dstW = _metadata?.Width ?? sw->width;
+        int dstH = _metadata?.Height ?? sw->height;
+        int yPitch = sw->linesize[0];
+        int uvPitch = sw->linesize[1];
+
+        // NV12 -> BGRA via FFmpeg sws_scale (SIMD; same approach as VideoRenderer).
+        EnsureScaler(dstW, dstH);
         byte[] bgra = new byte[dstW * dstH * 4];
         unsafe
         {
-            // NV12 array slice: subresource index = slice * (MipLevels * 2 planes).
-            // Map ONLY the Y subresource — on this AMD RDNA 4 driver Map() of the
-            // UV subresource fails. D3D11 returns the whole slice contiguously:
-            // Y rows [0, texH) then UV rows starting at texH * RowPitch (same
-            // pattern proven in native interp_rife.cpp / d3d_interop.cpp).
-            int srcBaseSub = arraySlice * srcDesc.MipLevels * 2;
-            var yBox = _vorticeContext.Map(staging, srcBaseSub, MapMode.Read, MapFlags.None);
-            byte* yPtr = (byte*)yBox.DataPointer;
-            int yPitch = yBox.RowPitch;
-            byte* uvPtr = yPtr + (long)texH * yPitch;
-
-            for (int y = 0; y < dstH; y++)
+            byte* yPtr = sw->data[0];
+            byte* uvPtr = sw->data[1];
+            if (!_diagLogged)
             {
-                byte* yRow = yPtr + (long)y * yPitch;
-                byte* uvRow = uvPtr + (long)(y / 2) * yPitch;
-                for (int x = 0; x < dstW; x++)
-                {
-                    float Yv = yRow[x];
-                    float U = uvRow[(x / 2) * 2 + 0] - 128f;
-                    float V = uvRow[(x / 2) * 2 + 1] - 128f;
-                    float R = Yv + 1.402f * V;
-                    float G = Yv - 0.344136f * U - 0.714136f * V;
-                    float B = Yv + 1.772f * U;
-                    int o = (y * dstW + x) * 4;
-                    bgra[o + 0] = ClampByte(B);
-                    bgra[o + 1] = ClampByte(G);
-                    bgra[o + 2] = ClampByte(R);
-                    bgra[o + 3] = 255;
-                }
+                _diagLogged = true;
+                // Early green-frame probe: zeros here would mean the download is broken.
+                Console.Error.WriteLine($"[FrameDecoder] NV12 download {sw->width}x{sw->height} -> {dstW}x{dstH} " +
+                    $"Y(10,0)={yPtr[10]} Y(10,{dstH / 2})={yPtr[(long)(dstH / 2) * yPitch + 10]} U={uvPtr[0]} V={uvPtr[1]}");
+                Console.Error.Flush();
             }
 
-            _vorticeContext.Unmap(staging, srcBaseSub);
+            byte*[] srcSlices = { yPtr, uvPtr, null, null };
+            int[] srcStrides = { yPitch, uvPitch, 0, 0 };
+            fixed (byte* dst = bgra)
+            {
+                byte*[] dstSlices = { dst, null, null, null };
+                int[] dstStrides = { dstW * 4, 0, 0, 0 };
+                // Convert only the visible dstH rows (source height may be aligned, e.g. 1088).
+                int rows = ffmpeg.sws_scale(_scaler, srcSlices, srcStrides, 0, dstH, dstSlices, dstStrides);
+                if (rows < 0)
+                {
+                    throw new FfmpegException(rows, "sws_scale");
+                }
+            }
         }
-        staging.Dispose();
 
         // Upload the BGRA bytes into a standalone BGRA texture.
         var bgraStagingDesc = new Texture2DDescription
@@ -507,10 +504,14 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
             CPUAccessFlags = CpuAccessFlags.Write,
             MiscFlags = ResourceOptionFlags.None
         };
-        var bgraStaging = _vorticeDevice.CreateTexture2D(bgraStagingDesc);
+        VDX.ID3D11Texture2D bgraStaging;
+        try { bgraStaging = _vorticeDevice.CreateTexture2D(bgraStagingDesc); }
+        catch (Exception ex) { Console.Error.WriteLine($"[CopyToStandalone] FAIL create BGRA staging: {ex.Message}"); Console.Error.Flush(); throw; }
         unsafe
         {
-            var box = _vorticeContext.Map(bgraStaging, 0, MapMode.Write, MapFlags.None);
+            MappedSubresource box;
+            try { box = _vorticeContext.Map(bgraStaging, 0, MapMode.Write, MapFlags.None); }
+            catch (Exception ex) { Console.Error.WriteLine($"[CopyToStandalone] FAIL Map(BGRA write): {ex.Message}"); Console.Error.Flush(); throw; }
             byte* dst = (byte*)box.DataPointer;
             fixed (byte* src = bgra)
             {
@@ -535,8 +536,11 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
             CPUAccessFlags = CpuAccessFlags.None,
             MiscFlags = ResourceOptionFlags.None
         };
-        var dst2 = _vorticeDevice.CreateTexture2D(dstDesc);
-        _vorticeContext.CopyResource(dst2, bgraStaging);
+        VDX.ID3D11Texture2D dst2;
+        try { dst2 = _vorticeDevice.CreateTexture2D(dstDesc); }
+        catch (Exception ex) { Console.Error.WriteLine($"[CopyToStandalone] FAIL create BGRA GPU tex: {ex.Message}"); Console.Error.Flush(); throw; }
+        try { _vorticeContext.CopyResource(dst2, bgraStaging); }
+        catch (Exception ex) { Console.Error.WriteLine($"[CopyToStandalone] FAIL CopyResource(BGRA upload): {ex.Message}"); Console.Error.Flush(); throw; }
         bgraStaging.Dispose();
 
         IntPtr result = dst2.NativePointer;
@@ -547,6 +551,35 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
 
     private static byte ClampByte(float v) =>
         v < 0f ? (byte)0 : v > 255f ? (byte)255 : (byte)(v + 0.5f);
+
+    /// <summary>
+    /// Creates (or reuses) a 1:1 NV12 -> BGRA sws context for the given size.
+    /// </summary>
+    private void EnsureScaler(int width, int height)
+    {
+        if (_scaler != null && _scalerW == width && _scalerH == height)
+        {
+            return;
+        }
+
+        if (_scaler != null)
+        {
+            ffmpeg.sws_freeContext(_scaler);
+            _scaler = null;
+        }
+
+        _scaler = ffmpeg.sws_getContext(
+            width, height, AVPixelFormat.AV_PIX_FMT_NV12,
+            width, height, AVPixelFormat.AV_PIX_FMT_BGRA,
+            (int)FFmpeg.AutoGen.SwsFlags.SWS_BILINEAR, null, null, null);
+        if (_scaler == null)
+        {
+            throw new InvalidOperationException("sws_getContext failed (NV12 -> BGRA).");
+        }
+
+        _scalerW = width;
+        _scalerH = height;
+    }
 
     /// <inheritdoc />
     public void ReleaseFrame(IntPtr texture)
@@ -568,10 +601,15 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
                 // Release the standalone texture copy (COM refcount).
                 Marshal.Release(_ownedFrames[i].Texture);
 
-                // Release the original AVFrame (drops the texture array ref).
-                AVFrame* frame = (AVFrame*)_ownedFrames[i].FramePtr;
-                ffmpeg.av_frame_unref(frame);
-                ffmpeg.av_frame_free(&frame);
+                // Release the original AVFrame if one was kept (drops the texture
+                // array ref). Frames downloaded via av_hwframe_transfer_data store
+                // IntPtr.Zero here — only the texture needs releasing.
+                if (_ownedFrames[i].FramePtr != IntPtr.Zero)
+                {
+                    AVFrame* frame = (AVFrame*)_ownedFrames[i].FramePtr;
+                    ffmpeg.av_frame_unref(frame);
+                    ffmpeg.av_frame_free(&frame);
+                }
                 _ownedFrames.RemoveAt(i);
                 return;
             }
@@ -620,13 +658,22 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
                 Marshal.Release(texture);
             }
 
-            AVFrame* frame = (AVFrame*)framePtr;
-            ffmpeg.av_frame_unref(frame);
-            ffmpeg.av_frame_free(&frame);
+            if (framePtr != IntPtr.Zero)
+            {
+                AVFrame* frame = (AVFrame*)framePtr;
+                ffmpeg.av_frame_unref(frame);
+                ffmpeg.av_frame_free(&frame);
+            }
         }
 
         _ownedFrames.Clear();
         _bufferedTextures.Clear();
+
+        if (_scaler != null)
+        {
+            ffmpeg.sws_freeContext(_scaler);
+            _scaler = null;
+        }
 
         // Dispose Vortice wrappers (releases the extra AddRef from ExtractD3D11Device).
         _vorticeDevice?.Dispose();
