@@ -58,6 +58,13 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
     private VDX.ID3D11Device? _vorticeDevice;
     private VDX.ID3D11DeviceContext? _vorticeContext;
 
+    // ST-23: GPU NV12 → BGRA compute shader state.
+    // _gpuNv12InitAttempted: true after the first OwnFrame call attempted init.
+    // _gpuNv12Available: true if catra_nv12_bgra_init succeeded (permanently false if it failed).
+    private bool _gpuNv12InitAttempted;
+    private bool _gpuNv12Available;
+    private readonly NativeLibraryLoader _nativeLib = new();
+
     /// <inheritdoc />
     public IntPtr D3D11DevicePtr => _d3d11DevicePtr;
 
@@ -355,15 +362,21 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
     }
 
     /// <summary>
-    /// Moves the decoded D3D11 frame into a privately-owned <c>AVFrame</c> so its COM
-    /// texture reference stays valid until <see cref="ReleaseFrame"/>.
+    /// Moves the decoded D3D11 frame into a privately-owned BGRA texture.
     ///
     /// D3D11VA decoders return frames as slices of a shared texture ARRAY
     /// (ArraySize &gt; 1, one slice per decoder surface). Downstream GPU stages
-    /// (RIFE, FSR, AMF) expect standalone ID3D11Texture2D pointers (ArraySize == 1),
-    /// so we copy the relevant subresource into a fresh texture here. The original
-    /// AVFrame is kept alive (holding a COM ref on the texture array) until
-    /// ReleaseFrame; the standalone copy is tracked separately and Released via COM.
+    /// (RIFE, FSR, AMF) expect standalone ID3D11Texture2D pointers (ArraySize == 1).
+    ///
+    /// <b>ST-23 GPU fast path:</b> A compute shader converts the NV12 array slice
+    /// directly to BGRA on the GPU, skipping the costly av_hwframe_transfer_data
+    /// (GPU→CPU) + sws_scale (CPU) + upload (CPU→GPU) round-trip. If the GPU path
+    /// fails (shader compile error, driver bug, null device), the method falls back
+    /// to the CPU path which is guaranteed to work.
+    ///
+    /// <b>CPU fallback path:</b> av_hwframe_transfer_data downloads NV12 to system
+    /// memory, sws_scale converts to BGRA, and a staging texture uploads the result.
+    /// This is the original (pre-ST-23) path and always works.
     /// </summary>
     private IntPtr OwnFrame(AVFrame* frame)
     {
@@ -374,15 +387,20 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
                 "avcodec_receive_frame (pipeline requires D3D11VA hardware frames)");
         }
 
-        // AMD RDNA4 (Adrenalin) driver bug, confirmed empirically on this machine:
-        // every direct D3D11 read of an NV12 decoder array slice returns ZEROS
-        // (CopySubresourceRegion into staging reads zeros; NV12 staging ARRAYS
-        // fail CreateTexture2D with E_INVALIDARG so whole-array CopyResource is
-        // not an option either) => green frames.
-        // FFmpeg's own D3D11VA download (av_hwframe_transfer_data) is the one
-        // path that works: validated BIT-IDENTICAL to software decode (md5 of
-        // raw NV12 matches CPU decode). Download to system NV12 here, convert
-        // NV12 -> BGRA on the CPU, and upload a standalone BGRA texture.
+        // ST-23: Try GPU NV12→BGRA compute shader path first.
+        if (TryGpuConvert(frame, out IntPtr gpuResult))
+        {
+            // GPU path succeeded: unref the hw frame (decoder surface recycled),
+            // track the BGRA texture, return it.
+            ffmpeg.av_frame_unref(frame);
+            _ownedFrames.Add((gpuResult, IntPtr.Zero));
+            return gpuResult;
+        }
+
+        // CPU fallback path: av_hwframe_transfer_data + sws_scale + upload.
+        // AMD RDNA4 (Adrenalin) driver bug: direct D3D11 read of NV12 decoder
+        // array slices returns ZEROS (green frames). FFmpeg's own download is
+        // the one CPU path that works: bit-identical to software decode.
         AVFrame* sw = ffmpeg.av_frame_alloc();
         if (sw == null)
         {
@@ -410,6 +428,89 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
         {
             ffmpeg.av_frame_free(&sw);
         }
+    }
+
+    /// <summary>
+    /// Attempts NV12→BGRA conversion via the GPU compute shader (ST-23).
+    /// Returns <c>true</c> on success with the BGRA texture pointer in
+    /// <paramref name="bgraTexture"/> (AddRef'd, caller owns). Returns
+    /// <c>false</c> on any failure; the caller must fall back to the CPU path.
+    /// </summary>
+    private bool TryGpuConvert(AVFrame* frame, out IntPtr bgraTexture)
+    {
+        bgraTexture = IntPtr.Zero;
+
+        // Extract the NV12 texture array pointer and array slice from the D3D11 frame.
+        // frame->data[0] = ID3D11Texture2D* (the texture array)
+        // frame->data[1] = array slice index (stored as intptr_t)
+        IntPtr nv12TexPtr = (IntPtr)frame->data[0];
+        if (nv12TexPtr == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        uint arraySlice = (uint)(long)frame->data[1];
+        int width = frame->width;
+        int height = frame->height;
+        if (width <= 0 || height <= 0)
+        {
+            return false;
+        }
+
+        // First call: attempt to initialize the GPU shader.
+        if (!_gpuNv12InitAttempted)
+        {
+            _gpuNv12InitAttempted = true;
+
+            if (!_nativeLib.IsAvailable || _d3d11DevicePtr == IntPtr.Zero)
+            {
+                // Native DLL not found or no D3D11 device — GPU path permanently disabled.
+                _gpuNv12Available = false;
+                return false;
+            }
+
+            int initResult = _nativeLib.Nv12BgraInit(_d3d11DevicePtr);
+            if (initResult != 0)
+            {
+                // Shader compile or device failure — GPU path permanently disabled.
+                Console.Error.WriteLine($"[FrameDecoder] ST-23: GPU NV12→BGRA init failed (rc={initResult}), falling back to CPU path");
+                Console.Error.Flush();
+                _gpuNv12Available = false;
+                return false;
+            }
+
+            _gpuNv12Available = true;
+            Console.Error.WriteLine("[FrameDecoder] ST-23: GPU NV12→BGRA compute shader initialized");
+            Console.Error.Flush();
+        }
+
+        if (!_gpuNv12Available)
+        {
+            return false;
+        }
+
+        // Attempt the GPU conversion.
+        int result = _nativeLib.Nv12BgraConvert(
+            _d3d11DevicePtr,
+            _d3d11DeviceContextPtr,
+            nv12TexPtr,
+            arraySlice,
+            (uint)width,
+            (uint)height,
+            out bgraTexture);
+
+        if (result != 0 || bgraTexture == IntPtr.Zero)
+        {
+            // GPU conversion failed for this frame — log once and fall back.
+            // We do NOT permanently disable the GPU path here because transient
+            // failures (e.g., odd frame size) may not affect subsequent frames.
+            Console.Error.WriteLine($"[FrameDecoder] ST-23: GPU convert failed (rc={result}), CPU fallback");
+            Console.Error.Flush();
+            bgraTexture = IntPtr.Zero;
+            return false;
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -646,6 +747,15 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
 
         _ownedFrames.Clear();
         _bufferedTextures.Clear();
+
+        // ST-23: release cached GPU NV12→BGRA shader + output texture.
+        if (_gpuNv12Available)
+        {
+            try { _nativeLib.Nv12BgraShutdown(); }
+            catch { /* best-effort cleanup */ }
+        }
+        _gpuNv12Available = false;
+        _gpuNv12InitAttempted = false;
 
         if (_scaler != null)
         {

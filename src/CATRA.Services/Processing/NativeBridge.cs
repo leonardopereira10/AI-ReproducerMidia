@@ -67,6 +67,13 @@ internal interface INativeLibrary
 
     int ReleaseTexture(IntPtr texture);
     int FreeArray(IntPtr ptr);
+
+    // ST-23: GPU NV12 → BGRA compute shader
+    int Nv12BgraInit(IntPtr d3d11Device);
+    int Nv12BgraConvert(IntPtr d3d11Device, IntPtr d3d11Ctx,
+        IntPtr nv12ArrayTex, uint arraySlice, uint width, uint height,
+        out IntPtr outBgraTex);
+    void Nv12BgraShutdown();
 }
 
 /// <summary>
@@ -150,6 +157,16 @@ internal sealed class NativeLibraryLoader : INativeLibrary
 
     public int FreeArray(IntPtr ptr) => catra_free(ptr);
 
+    // ST-23: GPU NV12 → BGRA compute shader
+    public int Nv12BgraInit(IntPtr d3d11Device) => catra_nv12_bgra_init(d3d11Device);
+
+    public int Nv12BgraConvert(IntPtr d3d11Device, IntPtr d3d11Ctx,
+        IntPtr nv12ArrayTex, uint arraySlice, uint width, uint height,
+        out IntPtr outBgraTex)
+        => catra_nv12_bgra_convert(d3d11Device, d3d11Ctx, nv12ArrayTex, arraySlice, width, height, out outBgraTex);
+
+    public void Nv12BgraShutdown() => catra_nv12_bgra_shutdown();
+
     // --- P/Invoke surface (private so CA1401 "P/Invokes should not be visible" stays silent) ---
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
@@ -205,6 +222,17 @@ internal sealed class NativeLibraryLoader : INativeLibrary
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     private static extern int catra_free(IntPtr ptr);
+
+    // ST-23: GPU NV12 → BGRA compute shader
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int catra_nv12_bgra_init(IntPtr d3d11Device);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int catra_nv12_bgra_convert(IntPtr d3d11Device, IntPtr d3d11Ctx,
+        IntPtr nv12ArrayTex, uint arraySlice, uint width, uint height, out IntPtr outBgraTex);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    private static extern void catra_nv12_bgra_shutdown();
 }
 
 /// <summary>

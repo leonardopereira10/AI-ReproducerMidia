@@ -141,6 +141,7 @@ add_library(catra-gpu SHARED
     d3d_interop.cpp
     encode_amf.cpp
     interp_rife.cpp
+    nv12_to_bgra_shader.cpp
     upscale_fsr1.cpp
     upscale_fsr4.cpp)
 

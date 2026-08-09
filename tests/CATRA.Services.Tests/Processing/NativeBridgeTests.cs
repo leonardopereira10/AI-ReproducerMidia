@@ -215,6 +215,34 @@ internal sealed class FakeNativeLibrary : INativeLibrary
         LastFreeArrayPtr = ptr;
         return FreeArrayResult;
     }
+
+    // ST-23: GPU NV12 → BGRA compute shader
+    public int Nv12BgraInitResult { get; set; }
+    public int Nv12BgraConvertResult { get; set; }
+    public IntPtr Nv12BgraConvertOutTex { get; set; }
+    public int Nv12BgraInitCallCount { get; private set; }
+    public int Nv12BgraConvertCallCount { get; private set; }
+    public int Nv12BgraShutdownCallCount { get; private set; }
+
+    public int Nv12BgraInit(IntPtr d3d11Device)
+    {
+        Nv12BgraInitCallCount++;
+        return Nv12BgraInitResult;
+    }
+
+    public int Nv12BgraConvert(IntPtr d3d11Device, IntPtr d3d11Ctx,
+        IntPtr nv12ArrayTex, uint arraySlice, uint width, uint height,
+        out IntPtr outBgraTex)
+    {
+        Nv12BgraConvertCallCount++;
+        outBgraTex = Nv12BgraConvertOutTex;
+        return Nv12BgraConvertResult;
+    }
+
+    public void Nv12BgraShutdown()
+    {
+        Nv12BgraShutdownCallCount++;
+    }
 }
 
 /// <summary>
@@ -1181,6 +1209,9 @@ public class NativeBridgePInvokeSignatureTests
             "catra_encode_destroy",
             "catra_release_texture",
             "catra_free",
+            "catra_nv12_bgra_init",
+            "catra_nv12_bgra_convert",
+            "catra_nv12_bgra_shutdown",
         };
 
         return names.Select(name => new object[] { name });
@@ -1210,7 +1241,7 @@ public class NativeBridgePInvokeSignatureTests
             .Where(m => m.GetCustomAttribute<DllImportAttribute>() is not null)
             .ToList();
 
-        imports.Should().HaveCount(18, "the full catra_gpu.h C ABI must be declared");
+        imports.Should().HaveCount(21, "the full catra_gpu.h C ABI must be declared");
         imports.Should().OnlyContain(m => m.IsPrivate);
     }
 

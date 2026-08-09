@@ -20,6 +20,7 @@
 #include "interp_rife.h"
 #include "upscale_fsr1.h"
 #include "upscale_fsr4.h"
+#include "nv12_to_bgra_shader.h"
 
 #include <atomic>
 #include <cstdarg>
@@ -375,6 +376,9 @@ void catra_shutdown(void)
         DestroyAllUpscale();
         DestroyAllEncode(); // ST-16: AMF contexts borrow the D3D12 device
 
+        // ST-23: release the cached NV12→BGRA compute shader + output texture.
+        catra::nv12_bgra_shutdown();
+
         // ST-15: tear down the interop (pool textures reference BOTH devices)
         // before releasing the bridge's device refs. Idempotent.
         catra::interop_shutdown();
@@ -655,6 +659,60 @@ void catra_upscale_destroy(int ctx)
 {
     GuardCabiVoid([&]() {
         DestroyUpscale(ctx); // no-op for an unknown handle
+    });
+}
+
+// ===========================================================================
+// NV12 → BGRA GPU compute shader (ST-23)
+// ===========================================================================
+//
+// Wraps catra::nv12_bgra_* behind the C ABI barrier. The compute shader
+// converts a single NV12 array slice (from the FFmpeg D3D11VA decoder texture
+// array) into a standalone BGRA texture entirely on the GPU. When the GPU
+// path fails the C# caller falls back to the CPU path (av_hwframe_transfer_data
+// + sws_scale + upload). The shader is compiled once at init and cached.
+
+int catra_nv12_bgra_init(void* d3d11_device)
+{
+    return GuardCabi([&]() -> int {
+        if (d3d11_device == nullptr)
+        {
+            log_msg(CATRA_LOG_ERROR, "catra_nv12_bgra_init: null device");
+            return CATRA_ERR_INVALID_ARG;
+        }
+        return catra::nv12_bgra_init(static_cast<ID3D11Device*>(d3d11_device));
+    });
+}
+
+int catra_nv12_bgra_convert(void* d3d11_device, void* d3d11_ctx,
+                             void* nv12_array_tex, unsigned int array_slice,
+                             unsigned int width, unsigned int height,
+                             void** out_bgra_tex)
+{
+    return GuardCabi([&]() -> int {
+        if (out_bgra_tex != nullptr)
+        {
+            *out_bgra_tex = nullptr;
+        }
+        if (d3d11_device == nullptr || d3d11_ctx == nullptr ||
+            nv12_array_tex == nullptr || out_bgra_tex == nullptr)
+        {
+            log_msg(CATRA_LOG_ERROR, "catra_nv12_bgra_convert: null argument");
+            return CATRA_ERR_INVALID_ARG;
+        }
+        return catra::nv12_bgra_convert(
+            static_cast<ID3D11Device*>(d3d11_device),
+            static_cast<ID3D11DeviceContext*>(d3d11_ctx),
+            static_cast<ID3D11Texture2D*>(nv12_array_tex),
+            array_slice, width, height,
+            reinterpret_cast<ID3D11Texture2D**>(out_bgra_tex));
+    });
+}
+
+void catra_nv12_bgra_shutdown(void)
+{
+    GuardCabiVoid([&]() {
+        catra::nv12_bgra_shutdown();
     });
 }
 

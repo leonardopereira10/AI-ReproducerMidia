@@ -211,6 +211,37 @@ CATRA_API int  catra_upscale_process(int ctx,
 CATRA_API void catra_upscale_destroy(int ctx);
 
 // ===========================================================================
+// NV12 → BGRA GPU compute shader — ST-23
+// ===========================================================================
+//
+// Converts a single NV12 array slice (from the FFmpeg D3D11VA decoder texture
+// array) into a standalone BGRA texture entirely on the GPU, eliminating the
+// av_hwframe_transfer_data + sws_scale + upload round-trip through system
+// memory. The shader is compiled at first init via D3DCompile (cs_5_0).
+// When the GPU path fails (driver bug, shader compile error) the caller falls
+// back to the CPU path (av_hwframe_transfer_data + sws_scale + upload).
+
+// Compiles the NV12→BGRA compute shader and caches it. Must be called once
+// before catra_nv12_bgra_convert. Idempotent. Returns CATRA_OK on success,
+// CATRA_ERR_DEVICE if shader compilation fails.
+CATRA_API int  catra_nv12_bgra_init(void* d3d11_device);
+
+// Converts one NV12 array slice to a standalone BGRA texture on the GPU.
+// `nv12_array_tex` is the decoder's ID3D11Texture2D* (ArraySize>1, NV12).
+// `array_slice` is the slice index (from AVFrame->data[1]).
+// `width`/`height` are the visible frame dimensions.
+// On success writes an AddRef'd ID3D11Texture2D* (BGRA, ArraySize==1) to
+// *out_bgra_tex. Caller owns the reference (catra_release_texture when done).
+// *out_bgra_tex stays null on every failure path.
+CATRA_API int  catra_nv12_bgra_convert(void* d3d11_device, void* d3d11_ctx,
+                                        void* nv12_array_tex, unsigned int array_slice,
+                                        unsigned int width, unsigned int height,
+                                        void** out_bgra_tex);
+
+// Releases the cached compute shader and output texture. Idempotent.
+CATRA_API void catra_nv12_bgra_shutdown(void);
+
+// ===========================================================================
 // Encode (AMF H.265 / HEVC) — ST-16
 // ===========================================================================
 //
