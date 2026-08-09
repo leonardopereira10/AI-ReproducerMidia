@@ -17,6 +17,17 @@
 //     missing DirectML, RDNA4 driver gap) falls back to the CPU EP so the job
 //     still completes (slowly). This is the RN-07 / risk-mitigation decision:
 //     quality/availability over speed, offline pipeline.
+//   * ST-25 GPU TENSOR I/O: the BGRA <-> planar-RGB-float32 marshalling no
+//     longer runs as pixel-by-pixel CPU loops. Two embedded D3D11 compute
+//     shaders (one thread per pixel) do the conversion on the GPU; the CPU
+//     only performs ONE Map + memcpy of the contiguous float buffer per
+//     transfer. The GPU state (shaders, UAV tensor buffer, staging buffer,
+//     SRV scratch texture) is created lazily on the first Process call once
+//     the frame format is known, and ONLY for BGRA frames. Any init failure
+//     (shader compile, buffer alloc) leaves gpuTensorReady == false and the
+//     original CPU loops carry the pipeline unchanged — the fallback is the
+//     legacy code path, kept intact. The NV12 (hardware decode) conversion
+//     stays on the CPU by design (its YUV math is out of scope for ST-25).
 //   * KEYED-MUTEX NOTE (ST-15): unlike the FSR backends, RIFE never consumes a
 //     shared D3D12 resource. Input frames are read entirely in D3D11 space via
 //     a staging CopyResource + Map (TextureToTensor) and written back through a
@@ -35,6 +46,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -55,6 +67,7 @@
     // the highest mutually-supported API version at runtime (EnsureOrtApiInitialized).
     #define ORT_API_MANUAL_INIT
     #include <d3d11.h>
+    #include <d3dcompiler.h>
     #include <wrl/client.h>
     #include <onnxruntime_cxx_api.h>
     #undef ORT_API_MANUAL_INIT
@@ -209,6 +222,35 @@ bool ResolveModelPath(std::wstring& outPath)
 
 // --- Per-context state -----------------------------------------------------
 
+// ST-25: per-context GPU tensor I/O state. Built lazily on the first Process
+// call once the frame format is known (BGRA only); when any piece fails to
+// initialize, `ready` stays false and the legacy CPU conversion loops carry
+// the pipeline (the ST-25 fallback contract).
+struct GpuTensor
+{
+    bool ready = false;
+
+    // Compute shaders: BGRA texture -> planar float32, planar float32 -> BGRA.
+    ComPtr<ID3D11ComputeShader> bgraToFloatCs;
+    ComPtr<ID3D11ComputeShader> floatToBgraCs;
+
+    // Dynamic constant buffer { uint width; uint height; } (register b0).
+    ComPtr<ID3D11Buffer> constBuf;
+
+    // GPU-side flat tensor buffer (3*W*H R32_FLOAT) + typed UAV (u0 in both
+    // shaders). Holds the planar RGB tensor between GPU and CPU.
+    ComPtr<ID3D11Buffer> tensorGpuBuf;
+    ComPtr<ID3D11UnorderedAccessView> tensorUav;
+
+    // CPU-side staging mirror of tensorGpuBuf (one Map per transfer).
+    ComPtr<ID3D11Buffer> tensorCpuBuf;
+
+    // Shader-readable BGRA copy of the incoming frame (frames are not
+    // guaranteed to be SRV-bindable at their origin) + its SRV (t0).
+    ComPtr<ID3D11Texture2D> bgraScratch;
+    ComPtr<ID3D11ShaderResourceView> bgraSrv;
+};
+
 struct RifeContext
 {
     int srcW = 0;
@@ -245,6 +287,9 @@ struct RifeContext
     // Reusable D3D11 staging textures.
     ComPtr<ID3D11Texture2D> inStagingA;
     ComPtr<ID3D11Texture2D> inStagingB;
+
+    // ST-25: GPU tensor conversion resources (lazy; BGRA frames only).
+    GpuTensor gpu;
 };
 
 int RegisterContext(std::unique_ptr<RifeContext> ctx)
@@ -260,6 +305,421 @@ RifeContext* LookupContext(int handle)
     std::lock_guard<std::mutex> lock(g_registryMutex);
     auto it = g_contexts.find(handle);
     return it == g_contexts.end() ? nullptr : it->second.get();
+}
+
+// --- GPU tensor I/O (ST-25) ------------------------------------------------
+//
+// The BGRA <-> planar-RGB-float32 conversion used to run as pixel-by-pixel
+// CPU loops (~5-7 ms each at 1080p, memory-bound; 7 conversions per frame
+// pair). These two embedded compute shaders move the pixel math to the GPU
+// (one thread per pixel); the CPU only does a single Map + memcpy of the
+// contiguous float buffer per transfer. Same embedded-HLSL pattern as
+// upscale_fsr1.cpp / nv12_to_bgra_shader.cpp: HLSL string -> D3DCompile
+// (cs_5_0, Feature Level 11.0+) at first use.
+//
+// CHANNEL MAPPING NOTE: for a B8G8R8A8_UNORM typed view the hardware swizzle
+// returns SEMANTIC channels — .r is always red (byte 2 in memory), .b is
+// always blue (byte 0). The shaders therefore read/write (r,g,b) directly and
+// the format itself handles the [B,G,R,A] memory byte order. This keeps the
+// GPU path value-equivalent to the CPU loops (which index the bytes as
+// b,g,r,a). Alpha is ignored on read and written as 1.0 (255), matching the
+// CPU paths.
+
+constexpr const char* kBgraToFloatHlsl = R"HLSL(
+// BGRA (B8G8R8A8_UNORM) -> planar RGB float32, normalized [0,1].
+Texture2D<float4> inputTex : register(t0);
+RWBuffer<float>   output   : register(u0);
+
+cbuffer Constants : register(b0)
+{
+    uint width;
+    uint height;
+};
+
+[numthreads(16, 16, 1)]
+void main(uint3 dtid : SV_DispatchThreadID)
+{
+    if (dtid.x >= width || dtid.y >= height)
+    {
+        return;
+    }
+    float4 c = inputTex.Load(uint3(dtid.xy, 0)); // UNORM load: already /255
+    uint pixelIdx = dtid.y * width + dtid.x;
+    uint plane = width * height;
+    output[pixelIdx]              = c.r; // R plane
+    output[pixelIdx + plane]      = c.g; // G plane
+    output[pixelIdx + 2u * plane] = c.b; // B plane
+}
+)HLSL";
+
+constexpr const char* kFloatToBgraHlsl = R"HLSL(
+// Planar RGB float32 -> BGRA (B8G8R8A8_UNORM), clamped to [0,1].
+RWBuffer<float>     inputBuf  : register(u0);
+RWTexture2D<float4> outputTex : register(u1);
+
+cbuffer Constants : register(b0)
+{
+    uint width;
+    uint height;
+};
+
+[numthreads(16, 16, 1)]
+void main(uint3 dtid : SV_DispatchThreadID)
+{
+    if (dtid.x >= width || dtid.y >= height)
+    {
+        return;
+    }
+    uint pixelIdx = dtid.y * width + dtid.x;
+    uint plane = width * height;
+    float r = inputBuf[pixelIdx];
+    float g = inputBuf[pixelIdx + plane];
+    float b = inputBuf[pixelIdx + 2u * plane];
+    // saturate == the CPU clamp01; the UNORM store rounds to nearest, matching
+    // the CPU (v * 255 + 0.5) for all practical values.
+    outputTex[dtid.xy] = float4(saturate(r), saturate(g), saturate(b), 1.0);
+}
+)HLSL";
+
+// Constant-buffer payload (register b0; padded to the 16-byte CB register).
+struct GpuTensorConstants
+{
+    UINT width;
+    UINT height;
+};
+
+// D3DCompile is resolved at runtime from d3dcompiler_47.dll (a Windows 8.1+
+// system component) instead of a link-time import: this translation unit is
+// also compiled into the catra-interop-test diagnostic executable, which does
+// not link d3dcompiler, and ST-25's scope is interp_rife.cpp only. Same
+// dynamic-load pattern as the DirectML EP export in InterpRifeCreate.
+using D3DCompileFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR,
+                                      const D3D_SHADER_MACRO*, ID3DInclude*,
+                                      LPCSTR, LPCSTR, UINT, UINT,
+                                      ID3DBlob**, ID3DBlob**);
+
+D3DCompileFn ResolveD3DCompile()
+{
+    static D3DCompileFn fn = []() -> D3DCompileFn {
+        HMODULE mod = LoadLibraryW(L"d3dcompiler_47.dll");
+        if (mod == nullptr)
+        {
+            return nullptr;
+        }
+        return reinterpret_cast<D3DCompileFn>(GetProcAddress(mod, "D3DCompile"));
+    }();
+    return fn;
+}
+
+// Compiles the two embedded compute shaders and allocates the tensor UAV /
+// staging buffers + BGRA scratch texture. Runs once per context on the first
+// BGRA Process; any failure logs a warning, releases partial state, and
+// leaves ctx->gpu.ready == false so the CPU conversion loops carry on.
+bool TryInitGpuTensor(RifeContext* ctx, UINT texW, UINT texH)
+{
+    GpuTensor& gpu = ctx->gpu;
+    ID3D11Device* device = ctx->device;
+
+    // Cleanup + log for any post-compile failure (partial state released).
+    auto fail = [&gpu](const char* what, HRESULT hr) -> bool {
+        BackendLog(CATRA_LOG_WARN,
+                   "interp_rife: GPU tensor init failed at %s (hr=0x%08lX) -> CPU tensor I/O",
+                   what, static_cast<unsigned long>(hr));
+        gpu = GpuTensor{}; // release partial allocations; ready stays false
+        return false;
+    };
+
+    D3DCompileFn d3dCompile = ResolveD3DCompile();
+    if (d3dCompile == nullptr)
+    {
+        BackendLog(CATRA_LOG_WARN,
+                   "interp_rife: d3dcompiler_47.dll unavailable -> CPU tensor I/O");
+        return false;
+    }
+
+    // 1. Compile the embedded HLSL to DXBC (cs_5_0 — Feature Level 11.0+,
+    //    same target as nv12_to_bgra_shader.cpp).
+    ComPtr<ID3DBlob> blob;
+    ComPtr<ID3DBlob> err;
+    HRESULT hr = d3dCompile(kBgraToFloatHlsl, std::strlen(kBgraToFloatHlsl),
+                            "catra_rife_bgra_to_float", nullptr, nullptr,
+                            "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                            blob.GetAddressOf(), err.GetAddressOf());
+    if (FAILED(hr))
+    {
+        BackendLog(CATRA_LOG_WARN,
+                   "interp_rife: D3DCompile(bgra->float) hr=0x%08lX%s%s -> CPU tensor I/O",
+                   static_cast<unsigned long>(hr),
+                   err ? ": " : "",
+                   err ? static_cast<const char*>(err->GetBufferPointer()) : "");
+        return false;
+    }
+    hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+                                     nullptr, gpu.bgraToFloatCs.GetAddressOf());
+    if (FAILED(hr))
+    {
+        return fail("CreateComputeShader(bgra->float)", hr);
+    }
+
+    blob.Reset();
+    err.Reset();
+    hr = d3dCompile(kFloatToBgraHlsl, std::strlen(kFloatToBgraHlsl),
+                    "catra_rife_float_to_bgra", nullptr, nullptr,
+                    "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                    blob.GetAddressOf(), err.GetAddressOf());
+    if (FAILED(hr))
+    {
+        BackendLog(CATRA_LOG_WARN,
+                   "interp_rife: D3DCompile(float->bgra) hr=0x%08lX%s%s -> CPU tensor I/O",
+                   static_cast<unsigned long>(hr),
+                   err ? ": " : "",
+                   err ? static_cast<const char*>(err->GetBufferPointer()) : "");
+        gpu = GpuTensor{};
+        return false;
+    }
+    hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+                                     nullptr, gpu.floatToBgraCs.GetAddressOf());
+    if (FAILED(hr))
+    {
+        return fail("CreateComputeShader(float->bgra)", hr);
+    }
+
+    // 2. Dynamic constant buffer ({width,height}); CB ByteWidth must be a
+    //    multiple of 16.
+    D3D11_BUFFER_DESC cbDesc = {};
+    cbDesc.ByteWidth = 16; // sizeof(GpuTensorConstants) rounded up
+    cbDesc.Usage = D3D11_USAGE_DYNAMIC;
+    cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = device->CreateBuffer(&cbDesc, nullptr, gpu.constBuf.GetAddressOf());
+    if (FAILED(hr))
+    {
+        return fail("CreateBuffer(const)", hr);
+    }
+
+    // 3. GPU-side tensor buffer + typed R32_FLOAT UAV (3*W*H floats, planar).
+    const UINT elemCount = 3u * static_cast<UINT>(ctx->srcW)
+                              * static_cast<UINT>(ctx->srcH);
+    D3D11_BUFFER_DESC bufDesc = {};
+    bufDesc.ByteWidth = elemCount * static_cast<UINT>(sizeof(float));
+    bufDesc.Usage = D3D11_USAGE_DEFAULT;
+    bufDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    hr = device->CreateBuffer(&bufDesc, nullptr, gpu.tensorGpuBuf.GetAddressOf());
+    if (FAILED(hr))
+    {
+        return fail("CreateBuffer(tensor gpu)", hr);
+    }
+
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+    uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
+    uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    uavDesc.Buffer.FirstElement = 0;
+    uavDesc.Buffer.NumElements = elemCount;
+    hr = device->CreateUnorderedAccessView(gpu.tensorGpuBuf.Get(), &uavDesc,
+                                           gpu.tensorUav.GetAddressOf());
+    if (FAILED(hr))
+    {
+        return fail("CreateUAV(tensor)", hr);
+    }
+
+    // 4. CPU staging mirror of the tensor buffer (READ for BGRA->float
+    //    readback, WRITE for float->BGRA upload).
+    bufDesc.Usage = D3D11_USAGE_STAGING;
+    bufDesc.BindFlags = 0;
+    bufDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
+    hr = device->CreateBuffer(&bufDesc, nullptr, gpu.tensorCpuBuf.GetAddressOf());
+    if (FAILED(hr))
+    {
+        return fail("CreateBuffer(tensor cpu)", hr);
+    }
+
+    // 5. BGRA scratch texture at the FULL frame size (hardware-aligned height
+    //    included) + SRV. Frames are CopyResource'd here before the dispatch
+    //    because source textures are not guaranteed to be SRV-bindable.
+    D3D11_TEXTURE2D_DESC texDesc = {};
+    texDesc.Width = texW;
+    texDesc.Height = texH;
+    texDesc.MipLevels = 1;
+    texDesc.ArraySize = 1;
+    texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.Usage = D3D11_USAGE_DEFAULT;
+    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    hr = device->CreateTexture2D(&texDesc, nullptr, gpu.bgraScratch.GetAddressOf());
+    if (FAILED(hr))
+    {
+        return fail("CreateTexture2D(bgra scratch)", hr);
+    }
+    hr = device->CreateShaderResourceView(gpu.bgraScratch.Get(), nullptr,
+                                          gpu.bgraSrv.GetAddressOf());
+    if (FAILED(hr))
+    {
+        return fail("CreateSRV(bgra scratch)", hr);
+    }
+
+    gpu.ready = true;
+    BackendLog(CATRA_LOG_INFO,
+               "interp_rife: GPU tensor I/O ready (%dx%d tensor, %ux%u scratch)",
+               ctx->srcW, ctx->srcH, texW, texH);
+    return true;
+}
+
+// Uploads {w,h} into the dynamic constant buffer (MAP_WRITE_DISCARD renames
+// the buffer, so no hazard with a previous dispatch reading it).
+HRESULT UpdateGpuTensorConstants(ID3D11DeviceContext* dc, ID3D11Buffer* constBuf,
+                                 int w, int h)
+{
+    GpuTensorConstants constants{static_cast<UINT>(w), static_cast<UINT>(h)};
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    HRESULT hr = dc->Map(constBuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (SUCCEEDED(hr))
+    {
+        std::memcpy(mapped.pData, &constants, sizeof(constants));
+        dc->Unmap(constBuf, 0);
+    }
+    return hr;
+}
+
+// GPU path for TextureToTensor (BGRA only): the compute shader converts the
+// frame to planar RGB float32 into tensorGpuBuf, then the CPU does ONE
+// CopyResource + Map(READ) + memcpy of the contiguous float buffer (the
+// pixel-by-pixel CPU loop is gone).
+int TextureToTensorGpu(RifeContext* ctx, ID3D11Texture2D* source, int w, int h,
+                       std::vector<float>& tensor)
+{
+    GpuTensor& gpu = ctx->gpu;
+    ID3D11DeviceContext* dc = ctx->deviceContext;
+
+    // GPU copy into the SRV-bindable scratch (device-side, negligible cost).
+    dc->CopyResource(gpu.bgraScratch.Get(), source);
+
+    HRESULT hr = UpdateGpuTensorConstants(dc, gpu.constBuf.Get(), w, h);
+    if (FAILED(hr))
+    {
+        BackendLog(CATRA_LOG_ERROR, "interp_rife: Map(const) hr=0x%08lX",
+                   static_cast<unsigned long>(hr));
+        return CATRA_ERR_DEVICE;
+    }
+
+    // Bind + dispatch (16x16 groups; the shader bounds-checks w x h).
+    ID3D11ShaderResourceView* srvs[1] = {gpu.bgraSrv.Get()};
+    ID3D11UnorderedAccessView* uavs[1] = {gpu.tensorUav.Get()};
+    ID3D11Buffer* cbs[1] = {gpu.constBuf.Get()};
+    dc->CSSetShader(gpu.bgraToFloatCs.Get(), nullptr, 0);
+    dc->CSSetShaderResources(0, 1, srvs);
+    dc->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+    dc->CSSetConstantBuffers(0, 1, cbs);
+    dc->Dispatch((static_cast<UINT>(w) + 15) / 16,
+                 (static_cast<UINT>(h) + 15) / 16, 1);
+
+    // Unbind before the readback (releases view refs from the context).
+    ID3D11ShaderResourceView* nullSrv = nullptr;
+    ID3D11UnorderedAccessView* nullUav = nullptr;
+    ID3D11Buffer* nullCb = nullptr;
+    dc->CSSetShaderResources(0, 1, &nullSrv);
+    dc->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+    dc->CSSetConstantBuffers(0, 1, &nullCb);
+    dc->CSSetShader(nullptr, nullptr, 0);
+
+    // Single readback of the contiguous tensor. Map(READ) blocks until the
+    // dispatch + copy finish — the same contract the legacy staging Map had.
+    dc->CopyResource(gpu.tensorCpuBuf.Get(), gpu.tensorGpuBuf.Get());
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    hr = dc->Map(gpu.tensorCpuBuf.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr))
+    {
+        BackendLog(CATRA_LOG_ERROR, "interp_rife: Map(tensor readback) hr=0x%08lX",
+                   static_cast<unsigned long>(hr));
+        return CATRA_ERR_DEVICE;
+    }
+    tensor.resize(static_cast<size_t>(w) * static_cast<size_t>(h) * 3);
+    std::memcpy(tensor.data(), mapped.pData, tensor.size() * sizeof(float));
+    dc->Unmap(gpu.tensorCpuBuf.Get(), 0);
+    return CATRA_OK;
+}
+
+// GPU path for TensorToTexture: ONE memcpy of the CPU tensor into the staging
+// buffer, then the compute shader converts planar float32 -> BGRA directly
+// into the output texture (the pixel-by-pixel CPU loop + staging texture are
+// gone). The output texture keeps the CPU path's contract (B8G8R8A8_UNORM,
+// USAGE_DEFAULT, caller-owned reference) plus BIND_UNORDERED_ACCESS so the
+// shader can write it.
+int TensorToTextureGpu(RifeContext* ctx, const std::vector<float>& tensor,
+                       int w, int h, ID3D11Texture2D** outTexture)
+{
+    GpuTensor& gpu = ctx->gpu;
+    ID3D11Device* device = ctx->device;
+    ID3D11DeviceContext* dc = ctx->deviceContext;
+    *outTexture = nullptr;
+
+    const size_t bytes = static_cast<size_t>(w) * static_cast<size_t>(h)
+                         * 3 * sizeof(float);
+
+    // Upload the contiguous CPU tensor, then mirror it to the GPU buffer.
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    HRESULT hr = dc->Map(gpu.tensorCpuBuf.Get(), 0, D3D11_MAP_WRITE, 0, &mapped);
+    if (FAILED(hr))
+    {
+        BackendLog(CATRA_LOG_ERROR, "interp_rife: Map(tensor upload) hr=0x%08lX",
+                   static_cast<unsigned long>(hr));
+        return CATRA_ERR_DEVICE;
+    }
+    std::memcpy(mapped.pData, tensor.data(), bytes);
+    dc->Unmap(gpu.tensorCpuBuf.Get(), 0);
+    dc->CopyResource(gpu.tensorGpuBuf.Get(), gpu.tensorCpuBuf.Get());
+
+    // Output texture (fresh per frame; the caller owns the reference).
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = static_cast<UINT>(w);
+    desc.Height = static_cast<UINT>(h);
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+    ComPtr<ID3D11Texture2D> dst;
+    hr = device->CreateTexture2D(&desc, nullptr, dst.GetAddressOf());
+    if (FAILED(hr))
+    {
+        BackendLog(CATRA_LOG_ERROR, "interp_rife: CreateTexture2D(dst) hr=0x%08lX",
+                   static_cast<unsigned long>(hr));
+        return CATRA_ERR_DEVICE;
+    }
+    ComPtr<ID3D11UnorderedAccessView> dstUav;
+    hr = device->CreateUnorderedAccessView(dst.Get(), nullptr, dstUav.GetAddressOf());
+    if (FAILED(hr))
+    {
+        BackendLog(CATRA_LOG_ERROR, "interp_rife: CreateUAV(dst) hr=0x%08lX",
+                   static_cast<unsigned long>(hr));
+        return CATRA_ERR_DEVICE;
+    }
+
+    hr = UpdateGpuTensorConstants(dc, gpu.constBuf.Get(), w, h);
+    if (FAILED(hr))
+    {
+        BackendLog(CATRA_LOG_ERROR, "interp_rife: Map(const) hr=0x%08lX",
+                   static_cast<unsigned long>(hr));
+        return CATRA_ERR_DEVICE;
+    }
+
+    // Bind + dispatch: u0 = float tensor, u1 = BGRA texture.
+    ID3D11UnorderedAccessView* uavs[2] = {gpu.tensorUav.Get(), dstUav.Get()};
+    ID3D11Buffer* cbs[1] = {gpu.constBuf.Get()};
+    dc->CSSetShader(gpu.floatToBgraCs.Get(), nullptr, 0);
+    dc->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
+    dc->CSSetConstantBuffers(0, 1, cbs);
+    dc->Dispatch((static_cast<UINT>(w) + 15) / 16,
+                 (static_cast<UINT>(h) + 15) / 16, 1);
+
+    ID3D11UnorderedAccessView* nullUavs[2] = {nullptr, nullptr};
+    ID3D11Buffer* nullCb = nullptr;
+    dc->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
+    dc->CSSetConstantBuffers(0, 1, &nullCb);
+    dc->CSSetShader(nullptr, nullptr, 0);
+
+    *outTexture = dst.Detach(); // caller owns the reference
+    return CATRA_OK;
 }
 
 // --- D3D11 <-> tensor helpers ----------------------------------------------
@@ -282,10 +742,12 @@ HRESULT CreateStagingTexture(ID3D11Device* device, int w, int h,
 // Maps a B8G8R8A8/R8G8B8A8 source texture into a planar RGB float32 tensor
 // normalized to [0,1]. Returns a CATRA_* code.
 // Also supports NV12 (hardware decode format): converts YUV -> RGB on the fly.
-int TextureToTensor(ID3D11DeviceContext* dc, ID3D11Texture2D* staging,
+int TextureToTensor(RifeContext* ctx, ID3D11Texture2D* staging,
                     ID3D11Texture2D* source, int w, int h,
                     std::vector<float>& tensor)
 {
+    ID3D11DeviceContext* dc = ctx->deviceContext;
+
     D3D11_TEXTURE2D_DESC srcDesc = {};
     source->GetDesc(&srcDesc);
 
@@ -359,6 +821,14 @@ int TextureToTensor(ID3D11DeviceContext* dc, ID3D11Texture2D* staging,
         return CATRA_OK;
     }
 
+    // ST-25 GPU path: compute-shader BGRA -> float32 (TextureToTensorGpu).
+    // BGRA only; RGBA8 frames and any non-ready GPU state keep the CPU loop
+    // below (the fallback contract).
+    if (ctx->gpu.ready && srcDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM)
+    {
+        return TextureToTensorGpu(ctx, source, w, h, tensor);
+    }
+
     // BGRA/RGBA path (original)
     dc->CopyResource(staging, source);
 
@@ -396,10 +866,19 @@ int TextureToTensor(ID3D11DeviceContext* dc, ID3D11Texture2D* staging,
 
 // Writes a planar RGB float32 tensor into a fresh B8G8R8A8 texture returned to
 // the caller (refcount 1). Values are clamped to [0,1].
-int TensorToTexture(ID3D11Device* device, ID3D11DeviceContext* dc,
+int TensorToTexture(RifeContext* ctx,
                     const std::vector<float>& tensor, int w, int h,
                     ID3D11Texture2D** outTexture)
 {
+    // ST-25 GPU path: compute-shader float32 -> BGRA (TensorToTextureGpu).
+    if (ctx->gpu.ready)
+    {
+        return TensorToTextureGpu(ctx, tensor, w, h, outTexture);
+    }
+
+    ID3D11Device* device = ctx->device;
+    ID3D11DeviceContext* dc = ctx->deviceContext;
+
     // Intermediate CPU-writeable staging texture (output is always BGRA).
     ComPtr<ID3D11Texture2D> staging;
     HRESULT hr = CreateStagingTexture(device, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, staging.GetAddressOf());
@@ -829,10 +1308,18 @@ int InterpRifeProcess(int ctxHandle,
         ctx->stagingReady = true;
         fprintf(stderr, "interp_rife: staging textures created (format=%d, %ux%u)\n",
                 static_cast<int>(ctx->stagingFormat), desc.Width, desc.Height);
+
+        // ST-25: BGRA frames convert through compute shaders on the GPU.
+        // NV12 (hardware decode) and RGBA8 keep the CPU loops. Init failure
+        // is non-fatal: gpu.ready stays false and the CPU paths carry on.
+        if (ctx->stagingFormat == DXGI_FORMAT_B8G8R8A8_UNORM)
+        {
+            TryInitGpuTensor(ctx, desc.Width, desc.Height);
+        }
     }
 
     fprintf(stderr, "interp_rife: TextureToTensor A...\n"); fflush(stderr);
-    rc = TextureToTensor(ctx->deviceContext, ctx->inStagingA.Get(), texA,
+    rc = TextureToTensor(ctx, ctx->inStagingA.Get(), texA,
                          ctx->srcW, ctx->srcH, ctx->tensorA);
     if (rc != CATRA_OK)
     {
@@ -840,7 +1327,7 @@ int InterpRifeProcess(int ctxHandle,
         return rc;
     }
     fprintf(stderr, "interp_rife: TextureToTensor B...\n"); fflush(stderr);
-    rc = TextureToTensor(ctx->deviceContext, ctx->inStagingB.Get(), texB,
+    rc = TextureToTensor(ctx, ctx->inStagingB.Get(), texB,
                          ctx->srcW, ctx->srcH, ctx->tensorB);
     if (rc != CATRA_OK)
     {
@@ -927,7 +1414,7 @@ int InterpRifeProcess(int ctxHandle,
             // (verified with tools/interop_readback_test.cpp: the D3D12 view
             // reads zeros). BGRA shares cleanly, so the whole pipeline runs
             // BGRA and the AMF encoder is initialized with AMF_SURFACE_BGRA.
-            rc = TensorToTexture(ctx->device, ctx->deviceContext, ctx->tensorOut,
+            rc = TensorToTexture(ctx, ctx->tensorOut,
                                  ctx->srcW, ctx->srcH, &outTex);
             if (rc != CATRA_OK)
             {
