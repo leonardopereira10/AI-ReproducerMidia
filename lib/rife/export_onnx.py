@@ -58,8 +58,17 @@ parser.add_argument("--model-dir", type=str, default="train_log")
 parser.add_argument("--fp16", action="store_true", help="Export as FP16 (half precision)")
 parser.add_argument("--scales", type=str, default="16,8,4,2,1",
                     help="Comma-separated pyramid scales (default: 16,8,4,2,1)")
+parser.add_argument("--preset", type=str, choices=["default", "fast"],
+                    default=None,
+                    help="Preset: 'fast' = FP16 + 4 scales (8,4,2,1) for ~2x speed")
 parser.add_argument("-o", "--output", type=str, default="rife_v4.onnx")
 args = parser.parse_args()
+
+# Resolve preset (overrides individual flags)
+if args.preset == "fast":
+    args.fp16 = True
+    args.scales = "8,4,2,1"
+    print(f"Preset 'fast': fp16={args.fp16}, scales={args.scales}")
 
 use_cuda = torch.cuda.is_available() and not args.cpu
 dev = torch.device("cuda" if use_cuda else "cpu")
