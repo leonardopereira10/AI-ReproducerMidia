@@ -317,7 +317,7 @@ public sealed unsafe class VideoDecoder : IVideoDecoder
     private int SendPacketDraining(AVPacket* packet)
     {
         int result = ffmpeg.avcodec_send_packet(_codecContext, packet);
-        while (result == ffmpeg.EAGAIN)
+        while (result == -ffmpeg.EAGAIN)
         {
             while (true)
             {
@@ -339,7 +339,7 @@ public sealed unsafe class VideoDecoder : IVideoDecoder
     private VideoFrame? TryReceiveFrame()
     {
         int result = ffmpeg.avcodec_receive_frame(_codecContext, _frame);
-        if (result == ffmpeg.EAGAIN || result == ffmpeg.AVERROR_EOF)
+        if (result == -ffmpeg.EAGAIN || result == ffmpeg.AVERROR_EOF)
         {
             return null;
         }
