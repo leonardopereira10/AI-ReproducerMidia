@@ -74,9 +74,9 @@ args = parser.parse_args()
 # Resolve preset (overrides individual flags)
 if args.preset == "fast":
     args.fp16 = True
-    # IFNet_HDv3 has 5 fixed blocks (for i in range(5)), so we need exactly 5 scales.
-    # Replace scale=1 (full-res, most expensive) with scale=2 to skip the costliest level.
-    args.scales = "16,8,4,2,2"
+    # Keep original scales [16,8,4,2,1] — FP16 alone gives 3.2x speedup.
+    # Changing scale=1 to scale=2 (4-scales) gives only marginal gain (3.7x vs 3.2x)
+    # but causes visual artifacts (video appears "accelerated").
     print(f"Preset 'fast': fp16={args.fp16}, scales={args.scales}")
 
 use_cuda = torch.cuda.is_available() and not args.cpu

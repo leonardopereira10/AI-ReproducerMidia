@@ -42,7 +42,7 @@ The export script (`export_onnx.py` in this directory) handles:
 | Preset    | Flags                        | Size  | Speed (GPU) | Quality |
 |-----------|------------------------------|-------|-------------|----------|
 | `default` | (none)                       | ~22MB | 1x (67ms)   | 100%     |
-| `fast`    | `--preset fast`              | ~11MB | **3.6x** (19ms) | ~98% (PSNR >49dB) |
+| `fast`    | `--preset fast`              | ~11MB | **3.2x** (21ms) | ~99% (PSNR >49dB) |
 
 ```bash
 # Recommended: fast preset (FP16 + 4 scales)
