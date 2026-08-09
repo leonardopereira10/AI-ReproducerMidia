@@ -25,6 +25,7 @@
 | (fix) | DXGI_DEVICE_REMOVED: 4 root causes (AMD timeout quirk, key=0, NV12 out, Flush) | ✅ | — | ✅ (build+test+GPU real) | ab9459a | — |
 | (fix) | Bundle ffmpeg/ffprobe CLI para audio mux | ✅ | — | ✅ (build+test+mux smoke) | 9cf7da1 | — |
 | (fix) | Frames verdes: AMD RDNA4 não compartilha NV12 D3D11→D3D12 (view lê zeros) | ✅ | — | ✅ (diag tool + dump decodificado) | aee1166 | — |
+| (fix) | Frames verdes RAIZ: decoder nascia verde (CopySubresourceRegion NV12 zeros) — download via av_hwframe_transfer_data | ✅ | — | ✅ (EP Martial Master validado, MP4 real 978MB) | df89fce | — |
 | ST-20 | Playback/DLNA usar processado | 🔄 EM ANDAMENTO | — | — | — | 0 |
 | ST-21 | Cleanup on close + startup | ⏳ | — | — | — | 0 |
 | ST-22 | Settings processamento | ⏳ | — | — | — | 0 |
@@ -131,3 +132,26 @@
   DirectML. Diagnóstico `tools/interop_readback_test.cpp` decodifica o dump
   RIFE→interop→AMF p/ o pattern correto (source + 5 intermediários, sem verde).
   4ª corrida do EP28 em andamento p/ validar o MP4 final.
+
+- **FRAMES VERDES RESOLVIDO DEFINITIVAMENTE (commits 6e5c753→b7cea52→df89fce)**:
+  a causa que faltava era o decoder: FrameDecoder.CopyToStandaloneTexture usava
+  CopySubresourceRegion p/ extrair a fatia do array D3D11VA → frames nasciam verdes.
+  Descobertas empíricas no driver AMD RDNA4/Adrenalin desta máquina:
+  1. CopySubresourceRegion de fatia NV12 → staging NV12 single-slice: lê ZEROS
+  2. CreateTexture2D de staging NV12 ARRAY (ArraySize>1): E_INVALIDARG (bloqueia
+     CopyResource do array inteiro)
+  3. Map() do subresource UV: falha
+  → ÚNICO caminho confiável: download do FFmpeg. av_hwframe_transfer_data
+  validado BIT-IDÊNTICO ao decode de software (md5 do NV12 raw == CPU decode;
+  ffmpeg CLI -hwaccel d3d11va idem).
+  Fix final (df89fce): OwnFrame = av_hwframe_transfer_data(hw→NV12 system) →
+  unref hw imediato → sws_scale NV12→BGRA (SIMD) → upload textura BGRA standalone.
+  Sem nenhuma leitura D3D11 direta do array NV12.
+  **VALIDAÇÃO REAL (filme "Martial Master", 6 min, EpisodeId=72)**:
+  - Job 100% completed em ~52 min (round-trip CPU do decode + encode; ~16 fps out)
+  - Frames do .tmp conferem com a fonte: out avgRGB(76,67,90) vs src(73,64,86) @25s
+  - `D:\MediaPlayer\.cache\72_local.mp4` 978 MB; ffprobe: HEVC 1920x1080 @135fps
+    + AAC, 356.8s; PNGs @30/150/300s = 1.2–1.6 MB (frames verdes eram 8.7 KB)
+  - ProcessedFile criado; build 0w/0e; testes 542 verdes.
+  Pendente/opcional: restaurar caminho GPU rápido no interop (git show aee1166)
+  no lugar do round-trip CPU — validar com catra-interop-test.exe antes.
