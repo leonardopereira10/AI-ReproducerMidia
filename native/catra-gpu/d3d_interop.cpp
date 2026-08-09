@@ -622,6 +622,26 @@ int EnsurePool12Locked(const D3D11_TEXTURE2D_DESC& d)
     return CATRA_OK;
 }
 
+// Logs the active pooled-share path once per transition (a per-frame log
+// would spam the backend sink on a throughput-bound offline transcode).
+// Caller holds g_mutex (the whole share runs under it), so the plain statics
+// need no extra synchronization.
+void LogSharePath(bool gpuGpu)
+{
+    static bool lastGpuGpu = false;
+    static bool logged = false;
+    if (logged && lastGpuGpu == gpuGpu)
+    {
+        return;
+    }
+    logged = true;
+    lastGpuGpu = gpuGpu;
+    catra::BackendLog(CATRA_LOG_INFO,
+                      gpuGpu
+                          ? "interop: using GPU-GPU pooled copy (BGRA, zero CPU)"
+                          : "interop: using CPU round-trip (NV12 or GPU copy failed)");
+}
+
 // Reads a D3D11 texture back to tightly-packed system memory (BGRA).
 bool ReadBack11ToCpu(ID3D11Texture2D* src, const D3D11_TEXTURE2D_DESC& d,
                      std::vector<uint8_t>& out, UINT& outPitch)
@@ -977,14 +997,71 @@ int interop_share_d3d11_to_d3d12(ID3D11Texture2D* src,
     }
 
     // POOLED COPY: source is not NT-shareable (typical D3D11VA decoder
-    // texture). Copy into the next round-robin shared slot — one GPU-GPU
-    // copy, zero CPU traffic, no per-frame allocation.
-    //
-    // NV12 (planar) sources are first converted to BGRA: the AMD RDNA 4
-    // driver does not correctly share D3D11-created NV12 textures into D3D12
-    // (the D3D12 view reads zeros -> green frames). Keeping the pool BGRA-only
-    // also means a single pool format for the whole pipeline (decoder frames
-    // and RIFE intermediates are both BGRA by the time they reach the pool).
+    // texture). Since ST-23 the pipeline is 100% BGRA (decoder frames leave
+    // the GPU shader as BGRA, RIFE emits BGRA), and BGRA cross-API sharing is
+    // verified clean on the AMD RDNA 4 driver — so BGRA frames take the
+    // pooled GPU-GPU copy below (ST-24): one CopyResource into the next
+    // round-robin shared slot, zero CPU traffic, no per-frame allocation.
+    // NV12 (should not happen post-ST-23, kept for safety) and any GPU-GPU
+    // failure fall back to the CPU round-trip into g_pool12.
+    if (desc.Format != DXGI_FORMAT_NV12)
+    {
+        // BGRA GPU-GPU path: copy into the pooled shared D3D11 texture, sync
+        // cross-API, then hand out the paired D3D12 resource (opened from the
+        // NT handle at pool-build time) to the consumer (AMF wraps it via
+        // CreateSurfaceFromDX12Native and QIs the keyed mutex off it).
+        const int grc = EnsurePoolLocked(desc);
+        if (grc == CATRA_OK && !g_pool.empty())
+        {
+            InteropPoolSlot& slot = g_pool[g_poolIndex];
+            g_poolIndex = (g_poolIndex + 1) % g_pool.size();
+
+            g_d3d11Context->CopyResource(slot.tex11.Get(), src);
+            // Flush submits the copy; WaitForD3D11GpuIdle blocks until it is
+            // FINISHED on the GPU (AMD RDNA 4 needs completion, not just
+            // submission, before the D3D12 consumer reads the shared
+            // allocation — see WaitForD3D11GpuIdle above).
+            g_d3d11Context->Flush();
+            WaitForD3D11GpuIdle();
+
+            // Producer half of the keyed-mutex ping-pong (spec ST-15):
+            // ReleaseSync(key) hands the slot to the consumer, which does
+            // AcquireSync(key) before reading (encode_amf / upscale_fsr*). The
+            // key alternates 0/1; a pool rebuild resets it to 0 and bumps the
+            // generation so consumers resync in lockstep. The toggle happens
+            // only on success — a failed release keeps the key deterministic.
+            const uint64_t key = g_frameKey;
+            const HRESULT relHr = slot.mutex11->ReleaseSync(key);
+            if (SUCCEEDED(relHr))
+            {
+                g_frameKey ^= 1;
+                LogSharePath(true);
+                // No per-frame NT handle is minted (the pool keeps its handles
+                // open for its whole lifetime); leave *out_shared_handle null
+                // so the caller's RAII cleanup skips CloseHandle.
+                *out_d3d12_tex = slot.res12.Get();
+                slot.res12->AddRef();
+                return CATRA_OK;
+            }
+            BackendLog(CATRA_LOG_WARN,
+                       "interop: GPU-GPU copy ReleaseSync(key=%llu) hr=0x%08lX — falling back to CPU round-trip",
+                       static_cast<unsigned long long>(key),
+                       static_cast<unsigned long>(relHr));
+        }
+        else
+        {
+            BackendLog(CATRA_LOG_WARN,
+                       "interop: GPU-GPU pool ensure failed rc=%d — falling back to CPU round-trip",
+                       grc);
+        }
+    }
+
+    // NV12 path (converted to BGRA first — the AMD RDNA 4 driver does not
+    // correctly share D3D11-created NV12 planar textures into D3D12; the
+    // D3D12 view reads zeros -> green frames) and BGRA GPU-GPU fallback:
+    // CPU ROUND-TRIP into a D3D12-native pool slot (see header comment above
+    // Pool12Slot). Read the (BGRA) D3D11 source back to system memory, upload
+    // into a same-device D3D12 texture, hand that to the consumer.
     ComPtr<ID3D11Texture2D> converted;
     ID3D11Texture2D* copySrc = src;
     if (desc.Format == DXGI_FORMAT_NV12)
@@ -997,11 +1074,8 @@ int interop_share_d3d11_to_d3d12(ID3D11Texture2D* src,
         copySrc = converted.Get();
         copySrc->GetDesc(&desc); // pool geometry now matches the BGRA texture
     }
+    LogSharePath(false);
 
-    // CPU ROUND-TRIP into a D3D12-native pool slot (see header comment above
-    // Pool12Slot): avoids the unreliable cross-API shared surface on this
-    // driver. Read the (BGRA) D3D11 source back to system memory, upload into
-    // a same-device D3D12 texture, hand that to the consumer.
     int rc = EnsurePool12Locked(desc);
     if (rc != CATRA_OK)
     {
