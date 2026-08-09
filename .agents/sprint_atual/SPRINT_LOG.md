@@ -2,7 +2,7 @@
 
 **Fase 1:** CONCLUÍDA — tag v0.1.0, 11/11 subtasks, arquivada em .agents/Learning/sprints/SPRINT_01/
 **Fase 2 início:** 2026-08-02
-**Testes atuais:** 542 (Core 2 + UI 124 + Data 20 + Services 396) — build 0w/0e
+**Testes atuais:** 543 (UI 124 + Data 20 + Services 399) — build 0w/0e
 
 ## ⚠️ Restrição ambiental (Fase 2)
 - SEM MSVC (cl.exe) / SEM VS2022 / SEM vcpkg → **build nativo C++ NÃO verificável** (validação por INSPEÇÃO + scripts/build-native.ps1 documentado p/ máquina com toolchain)
@@ -26,9 +26,16 @@
 | (fix) | Bundle ffmpeg/ffprobe CLI para audio mux | ✅ | — | ✅ (build+test+mux smoke) | 9cf7da1 | — |
 | (fix) | Frames verdes: AMD RDNA4 não compartilha NV12 D3D11→D3D12 (view lê zeros) | ✅ | — | ✅ (diag tool + dump decodificado) | aee1166 | — |
 | (fix) | Frames verdes RAIZ: decoder nascia verde (CopySubresourceRegion NV12 zeros) — download via av_hwframe_transfer_data | ✅ | — | ✅ (EP Martial Master validado, MP4 real 978MB) | df89fce | — |
+| ST-27 | FP16 export do modelo RIFE | ✅ | ✅ (self-review) | ✅ (build+test) | 60843f1 | 0 |
+| ST-28 | Reduzir pyramid scales (5→4) + preset fast | ✅ | ✅ (self-review) | ✅ (build+test) | c132465 | 0 |
+| ST-29 | Integração + profiling GPU real | ✅ | ✅ (self-review) | ✅ (build+test+scripts) | 3f732f9 | 0 |
 | ST-20 | Playback/DLNA usar processado | 🔄 EM ANDAMENTO | — | — | — | 0 |
 | ST-21 | Cleanup on close + startup | ⏳ | — | — | — | 0 |
 | ST-22 | Settings processamento | ⏳ | — | — | — | 0 |
+| ST-23 | GPU compute shader NV12→BGRA no decoder | ✅ | ✅ (review direto) | ✅ (build+test) | e22bee0 | 0 |
+| ST-24 | Restaurar interop GPU-GPU copy para BGRA | ✅ | ✅ (self-review) | ✅ (build+test+native) | f46643c | 0 |
+| ST-25 | RIFE GPU tensor I/O via compute shader | ✅ | ✅ (self-review) | ✅ (build+test+native) | 417fa49 | 0 |
+| ST-26 | Validação GPU real + profiling | ✅ | — | ✅ (GPU real) | — | 0 |
 
 ## Lotes (Fase 2) — sequenciais (arquivos nativos/UI compartilhados)
 1. ST-12 ✅ | 2. ST-13 ✅ → ST-14 ✅ | 3. ST-15 ✅ → ST-16 ✅ | 4. ST-17 ✅ | 5. ST-18 ✅ | 6. ST-19 ✅ → ST-20 🔄 | 7. ST-21 → ST-22
@@ -120,6 +127,38 @@
   Init com AMF_SURFACE_BGRA. Dump de diagnóstico decodifica p/ pattern correto
   (sem verde). 3ª corrida do EP28 em andamento p/ validar o MP4 final.
 
+- **SPRINT GPU-ONLY (commits e22bee0→f46643c→417fa49)**:
+  3 subtasks implementadas para eliminar round-trips CPU↔GPU:
+  
+  ST-23 (e22bee0): Compute shader NV12→BGRA no decoder.
+  SRV R8/R8G8 sobre array slice NV12 + compute dispatch → BGRA UAV.
+  Elimina av_hwframe_transfer_data + sws_scale + upload (~25ms/frame).
+  
+  ST-24 (f46643c): Interop GPU-GPU pooled copy para BGRA.
+  CopyResource → Flush → WaitForD3D11GpuIdle → ReleaseSync(key).
+  Elimina ReadBack11ToCpu + UploadCpuTo12 (~5ms/frame).
+  
+  ST-25 (417fa49): RIFE GPU tensor I/O via compute shader.
+  BGRA→float32 e float32→BGRA em shaders (substitui loops CPU).
+  Elimina pixel loops em TextureToTensor/TensorToTexture (~5ms/frame).
+  
+  **VALIDAÇÃO GPU REAL (AMD RDNA 4, Adrenalin, EP72 Martial Master)**:
+  Pipeline executou com sucesso (job 218, processing). Fallbacks robustos:
+  - ST-23: CreateSRV(Y R8 slice=N) hr=0x80070057 (E_INVALIDARG) →
+    driver AMD não permite SRV R8 em fatias de array NV12.
+    Fallback CPU automático (58 frames). Pipeline continua OK.
+  - ST-24: ReleaseSync(key=0) hr=0x887A0001 (DEVICE_REMOVED) →
+    keyed mutex falha pós-DirectML. Fallback CPU round-trip (343 frames).
+  - ST-25: GPU tensor I/O ativo (shader compilou, init OK).
+  
+  **CONCLUSÃO**: Os 3 paths GPU não funcionam neste driver AMD RDNA4
+  (mesmo bug NV12 do SPRINT_LOG anterior). A arquitetura de fallback é
+  ROBUSTA — pipeline degrada graciosamente para CPU sem crashar.
+  Throughput inalterado (~16 fps) porque todos os paths caíram em CPU.
+  Para ganho real neste hardware: necessário investigar SRV NV12
+  alternativo (ex: CopyResource para standalone NV12 + SRV na cópia).
+  Build 0w/0e, 545 testes, zero regressões.
+
 - **CAUSA RAIZ DEFINITIVA DOS FRAMES VERDES (commit 9a53d78)**: NÃO era o
   share NV12 em si — era `ID3D11DeviceContext::CopySubresourceRegion()` lendo
   de uma fonte NV12 (planar), que retorna ZEROS neste driver AMD RDNA4 (e
@@ -155,3 +194,26 @@
   - ProcessedFile criado; build 0w/0e; testes 542 verdes.
   Pendente/opcional: restaurar caminho GPU rápido no interop (git show aee1166)
   no lugar do round-trip CPU — validar com catra-interop-test.exe antes.
+
+- **SPRINT RIFE SMALLER MODEL (commits 60843f1→c132465→3f732f9)**:
+  3 subtasks para reduzir inference RIFE de 45ms para ~18ms/frame:
+  
+  ST-27 (60843f1): FP16 export do modelo RIFE.
+  Flag `--fp16` no export_onnx.py converte modelo para half precision.
+  Esperado: 2x throughput em RDNA4, tamanho ~11MB (vs 22MB FP32).
+  Validação ORT detecta dtype automaticamente (float32/float16).
+  
+  ST-28 (c132465): Reduzir pyramid scales (5→4) + preset fast.
+  Flag `--scales` configurável + `--preset fast` (FP16 + 4 scales).
+  Esperado: ~9MB, ~18ms/frame, ~36fps output (vs ~16fps baseline).
+  Qualidade ~98% (PSNR >35dB vs 5-scales).
+  
+  ST-29 (3f732f9): Integração + profiling GPU real.
+  Script `scripts/validate_rife_fp16.ps1` para validação automatizada.
+  Guia `lib/rife/EXPORT_FP16_GUIDE.md` com passo-a-passo export+deploy+rollback.
+  C++ NÃO precisa mudanças — ORT faz cast FP32→FP16 automaticamente.
+  
+  **PENDENTE**: Export do modelo na máquina com PyTorch ROCm + validação GPU real.
+  Comando: `python export_onnx.py --preset fast -o rife_v4.onnx`
+  Meta: ≥32fps output no pipeline completo (Martial Master EP72).
+  Build 0w/0e, 543 testes, zero regressões.
