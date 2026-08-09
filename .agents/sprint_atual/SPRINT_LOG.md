@@ -233,5 +233,20 @@
   Backup FP32: lib/rife/rife_v4_fp32_backup.onnx (22MB)
   Build nativo: OK. 545 testes pass, 0w/0e.
   
-  **PENDENTE**: Validação do pipeline completo (CATRA.App.exe + EP72)
-  para confirmar throughput no pipeline real com encode AMF.
+  **BUG CORRIGIDO (video acelerado)**:
+  Modelo com scales [16,8,4,2,2] causava video de output com apenas 59s
+  (de 321s originais). Player sincroniza pelo audio (321s) -> video parece
+  5.4x mais rapido.
+  
+  Causa: scale=2 no ultimo bloco (block4) opera em metade da resolucao,
+  causando imprecisao no optical flow final. Frames interpolados sao
+  descartados ou corrompidos.
+  
+  Solucao: usar FP16 com 5 scales [16,8,4,2,1] (mesmo scales do original).
+  Ganho: 3.2x speedup (21ms vs 67ms) — suficiente para meta de 32fps.
+  
+  Modelo final: lib/rife/rife_v4.onnx (12MB, FP16 5-scales, I/O FP32)
+  Build nativo: OK. 545 testes pass, 0w/0e.
+  
+  **PENDENTE**: Validacao do pipeline completo (CATRA.App.exe + EP72)
+  com modelo FP16 5-scales para confirmar throughput e qualidade.
