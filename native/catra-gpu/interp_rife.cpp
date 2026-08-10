@@ -267,7 +267,6 @@ struct RifeContext
     int dropInterval = 0;            // drop 1 frame every dropInterval pairs (0 = no dropping)
     int pairsSinceLastDrop = 0;      // counter for drop scheduling
     long long totalPairsProcessed = 0; // total pairs processed (for stats)
-    long long totalFramesProduced = 0; // total intermediate frames produced (for drop tracking)
 
     ID3D11Device* device = nullptr;             // borrowed (bridge-owned)
     ID3D11DeviceContext* deviceContext = nullptr; // borrowed
@@ -1055,7 +1054,6 @@ int InterpRifeCreate(ID3D11Device* device,
     ctx->dropInterval = dropInterval;
     ctx->pairsSinceLastDrop = 0;
     ctx->totalPairsProcessed = 0;
-    ctx->totalFramesProduced = 0;
 
     if (ctx->passthrough)
     {
@@ -1367,31 +1365,21 @@ int InterpRifeProcess(int ctxHandle,
     }
     fprintf(stderr, "interp_rife: tensors ready, starting inference loop N=%d\n", ctx->framesPerPair); fflush(stderr);
 
-    // ST-29: variable frames per pair — drop frames periodically to maintain
-    // correct output duration when ratio is not integer.
-    // Uses accumulated progress for precise dropping (not fixed interval).
+    // ST-29: variable frames per pair — drop 1 frame every dropInterval pairs
+    // to maintain correct output duration when ratio is not integer.
     int N = ctx->framesPerPair;
-    if (ctx->ratio > 0.0 && ctx->framesPerPair > 0)
+    if (ctx->dropInterval > 0)
     {
-        // Calculate expected frames vs actual frames at this point
-        double expectedFramesPerPair = ctx->ratio;  // e.g., 5.4
-        double actualFramesPerPair = ctx->framesPerPair + 1.0;  // e.g., 6.0
-        double excessPerPair = actualFramesPerPair - expectedFramesPerPair;  // e.g., 0.6
-        
-        // How many frames should we have dropped by now?
-        double expectedDrops = static_cast<double>(ctx->totalPairsProcessed) * excessPerPair;
-        double actualDrops = static_cast<double>(ctx->totalPairsProcessed - ctx->totalFramesProduced);
-        
-        // If we haven't dropped enough, drop 1 frame this pair
-        if (expectedDrops - actualDrops >= 0.5)
+        ctx->pairsSinceLastDrop++;
+        if (ctx->pairsSinceLastDrop >= ctx->dropInterval)
         {
             N = ctx->framesPerPair - 1;
-            fprintf(stderr, "interp_rife: dropping 1 frame (pair #%lld, expected_drops=%.1f, actual_drops=%.0f, N=%d->%d)\n",
-                    ctx->totalPairsProcessed + 1, expectedDrops, actualDrops, ctx->framesPerPair, N); fflush(stderr);
+            ctx->pairsSinceLastDrop = 0;
+            fprintf(stderr, "interp_rife: dropping 1 frame (pair #%lld, N=%d->%d)\n",
+                    ctx->totalPairsProcessed + 1, ctx->framesPerPair, N); fflush(stderr);
         }
     }
     ctx->totalPairsProcessed++;
-    ctx->totalFramesProduced += N;
 
     // Ensure N is at least 0 (can be 0 if framesPerPair was 1 and we're dropping)
     if (N < 0) N = 0;
