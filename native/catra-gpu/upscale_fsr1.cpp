@@ -548,16 +548,16 @@ int Fsr1Upscaler::Process(ID3D11Texture2D* src, ID3D12Resource** outDst)
     outDesc.Height = static_cast<UINT>(m_dstH);
     outDesc.DepthOrArraySize = 1;
     outDesc.MipLevels = 1;
-    outDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    outDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; // BGRA for AMF encoder
     outDesc.SampleDesc.Count = 1;
     outDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    outDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    outDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS; // BGRA for AMF encoder
     D3D12_HEAP_PROPERTIES defaultHeap = {};
     defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
 
     ComPtr<ID3D12Resource> dstRes;
     hr = d.device->CreateCommittedResource(
-        &defaultHeap, D3D12_HEAP_FLAG_NONE, &outDesc,
+        &defaultHeap, D3D12_HEAP_FLAG_SHARED, &outDesc,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
         IID_PPV_ARGS(dstRes.GetAddressOf()));
     if (FAILED(hr))
@@ -579,7 +579,7 @@ int Fsr1Upscaler::Process(ID3D11Texture2D* src, ID3D12Resource** outDst)
     D3D12_CPU_DESCRIPTOR_HANDLE uavCpu = heapCpu;
     uavCpu.ptr += d.cbvSrvUavSize;
     D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
-    uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    uavDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; // BGRA for AMF encoder
     uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     d.device->CreateUnorderedAccessView(dstRes.Get(), nullptr, &uavDesc, uavCpu);
 
@@ -624,6 +624,45 @@ int Fsr1Upscaler::Process(ID3D11Texture2D* src, ID3D12Resource** outDst)
     if (FAILED(hr))
     {
         BackendLog(CATRA_LOG_ERROR, "upscale_fsr1: fence wait hr=0x%08lX",
+                   static_cast<unsigned long>(hr));
+        return CATRA_ERR_DEVICE;
+    }
+
+    // --- Transition texture to COMMON state for AMF consumption ------------
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = dstRes.Get();
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    
+    hr = d.allocator->Reset();
+    if (SUCCEEDED(hr))
+    {
+        hr = d.cmdList->Reset(d.allocator.Get(), nullptr);
+    }
+    if (SUCCEEDED(hr))
+    {
+        d.cmdList->ResourceBarrier(1, &barrier);
+        d.cmdList->Close();
+        ID3D12CommandList* lists2[] = {d.cmdList.Get()};
+        d.queue->ExecuteCommandLists(1, lists2);
+        
+        // Wait for transition to complete
+        ++d.fenceValue;
+        hr = d.queue->Signal(d.fence.Get(), d.fenceValue);
+        if (SUCCEEDED(hr) && d.fence->GetCompletedValue() < d.fenceValue)
+        {
+            hr = d.fence->SetEventOnCompletion(d.fenceValue, d.fenceEvent);
+            if (SUCCEEDED(hr))
+            {
+                WaitForSingleObject(d.fenceEvent, INFINITE);
+            }
+        }
+    }
+    if (FAILED(hr))
+    {
+        BackendLog(CATRA_LOG_ERROR, "upscale_fsr1: transition barrier hr=0x%08lX",
                    static_cast<unsigned long>(hr));
         return CATRA_ERR_DEVICE;
     }

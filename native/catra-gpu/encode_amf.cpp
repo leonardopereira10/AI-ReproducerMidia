@@ -484,6 +484,21 @@ int AmfEncoder::Encode(ID3D12Resource* texture, uint8_t** outBuf, int* outSize)
     // The resource already lives on the AMF D3D12 device, so no GPU copy is
     // needed; AMF's encoder holds the surface reference in its internal input
     // queue (the 4-8 deep "surface pool" under USAGE_TRANSCONDING).
+    
+    // Debug: log texture info before CreateSurfaceFromDX12Native
+    ID3D12Device* texDevice = nullptr;
+    if (SUCCEEDED(texture->GetDevice(IID_PPV_ARGS(&texDevice))))
+    {
+        D3D12_RESOURCE_DESC desc = texture->GetDesc();
+        BackendLog(CATRA_LOG_INFO, "encode_amf: CreateSurfaceFromDX12Native texture=%p, device=%p, format=%d, width=%llu, height=%u, flags=%u",
+                   texture, texDevice, desc.Format, desc.Width, desc.Height, desc.Flags);
+        texDevice->Release();
+    }
+    else
+    {
+        BackendLog(CATRA_LOG_ERROR, "encode_amf: Failed to get device from texture %p", texture);
+    }
+    
     AMFSurfacePtr surface;
     AMF_RESULT res = d.context2->CreateSurfaceFromDX12Native(texture, &surface, nullptr);
     if (res != AMF_OK || surface == nullptr)

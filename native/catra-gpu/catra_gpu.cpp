@@ -824,8 +824,8 @@ int catra_encode_frame(int ctx, void* texture,
         int irc = CATRA_OK;
 
         ID3D12Resource* probed12 = nullptr;
-        if (SUCCEEDED(static_cast<IUnknown*>(texture)->QueryInterface(
-                IID_PPV_ARGS(&probed12))))
+        HRESULT qhr = static_cast<IUnknown*>(texture)->QueryInterface(IID_PPV_ARGS(&probed12));
+        if (SUCCEEDED(qhr))
         {
             // Already D3D12 (upscale output): zero-copy to AMF, no interop
             // pool involvement -> no NT handle minted. AmfEncoder::Encode QIs
@@ -833,9 +833,12 @@ int catra_encode_frame(int ctx, void* texture,
             // shared (the FSR-output case). The QI reference is owned by the
             // ShareCleanup guard below (released exactly once).
             d3d12res = probed12;
+            log_msg(CATRA_LOG_INFO, "catra_encode_frame: texture is D3D12 (zero-copy), texture=%p", probed12);
         }
         else
         {
+            log_msg(CATRA_LOG_INFO, "catra_encode_frame: texture is D3D11 (QI hr=0x%08lX), doing interop",
+                    static_cast<unsigned long>(qhr));
             // D3D11 input: share (or pooled-copy) onto the bridge's shared
             // adapter via the ST-15 interop.
             irc = catra::interop_share_d3d11_to_d3d12(
