@@ -279,3 +279,52 @@
   - Abordagem acumulada causava problema no final, revertido para drop fixo
   
   Build 0w/0e, 545 testes pass, zero regressoes.
+
+## ST-30: Floor Mode + Effective FPS (commit db415e3, f5f49ae, 305e307)
+
+**Mudanca de abordagem**: ceil() + frame dropping → floor() puro
+
+**Problema com ceil() + drop**:
+- ratio=5.4 → ceil(5.4)=6 → 5 frames intermediarios/pair
+- Excesso: 0.6 frames/pair → 35.6s a mais em 321s de audio
+- Frame dropping (1 a cada 2 pairs) reduzia para 5.9s a mais (1.8% desvio)
+- Ainda havia desvio de duracao
+
+**Solucao floor()**:
+- ratio=2.4 → floor(2.4)=2 → 1 frame intermediario/pair
+- Output: 25fps * 2 = 50fps (nao ultrapassa 60Hz)
+- Sem frame dropping, sem perda de frames interpolados
+- Duracao perfeitamente sincronizada
+
+**Exemplo pratico** (source=25fps, target=60Hz):
+- ratio = 60/25 = 2.4
+- floor(2.4) = 2
+- framesPerPair = 2 - 1 = 1
+- Output: 25 * (1+1) = 50fps
+
+**UI**: label "FPS" → "Monitor Hz", default 60Hz
+- AppSettingsModel: LocalTargetFps default 135 → 60
+- SettingsViewModel: _localFps default 135 → 60
+- DatabaseInitializer: seed local_target_fps 135 → 60
+- SettingsView.xaml: "FPS:" → "Monitor Hz:"
+
+**Effective FPS no encoder**:
+- Problema: encoder usava target fps (60Hz) mas pipeline gerava frames a 50fps
+- Resultado: video com 267s em vez de 321s
+- Solucao: calcular effectiveFps = srcFps * floor(targetFps/srcFps)
+- Encoder usa effective fps (50fps) em vez de target (60Hz)
+
+**Resultado final** (EP47 Martial Master):
+- Container: 321.194667s
+- Video: 321.180000s (16059 frames @ 50fps)
+- Audio: 321.194667s
+- Diferenca: 14.7ms (0.00457%) — praticamente zero!
+- Tamanho: 792MB (vs 860MB anterior)
+- Tempo: ~21min (vs ~60min anterior — 5x mais rapido)
+
+**Commits**:
+- db415e3: floor() mode — sem frame dropping
+- f5f49ae: UI — mudar FPS para Monitor Hz, default 60Hz
+- 305e307: effective fps no encoder corrige duracao
+
+**Build**: 0w/0e, 540 testes pass, zero regressoes.
