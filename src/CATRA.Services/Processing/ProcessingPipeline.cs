@@ -230,8 +230,22 @@ public sealed class ProcessingPipeline : IProcessingPipeline
                 haveUpscale = true;
             }
 
+            // ST-30: Calculate effective fps for encoder (floor-based).
+            // With floor mode, the actual output fps is srcFps * floor(targetFps/srcFps).
+            // Example: src=25fps, target=60Hz -> floor(2.4)=2 -> effective=50fps.
+            double effectiveFps = config.TargetFps;
+            if (needInterp && meta.Fps > 0)
+            {
+                double ratio = config.TargetFps / meta.Fps;
+                int intRatio = (int)Math.Floor(ratio);
+                if (intRatio > 0)
+                {
+                    effectiveFps = meta.Fps * intRatio;
+                }
+            }
+
             encodeContext = _bridge.CreateEncoder(
-                config.TargetWidth, config.TargetHeight, config.EncodeBitrateKbps, config.TargetFps);
+                config.TargetWidth, config.TargetHeight, config.EncodeBitrateKbps, effectiveFps);
             haveEncode = true;
             System.Diagnostics.Trace.WriteLine($"[ProcessingPipeline] Encoder created: ctx={encodeContext}");
 
