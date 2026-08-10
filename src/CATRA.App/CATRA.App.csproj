@@ -33,6 +33,16 @@
     <None Include="$(CatraNativeDir)\onnxruntime*.dll" CopyToOutputDirectory="PreserveNewest" Link="runtimes\win-x64\native\%(Filename)%(Extension)" Visible="false" Condition="Exists('$(CatraNativeDir)\onnxruntime.dll')" />
   </ItemGroup>
 
+  <!-- ST-27: deploy RIFE ONNX model when present in lib/rife/.
+       The native bridge looks for rife_v4.onnx relative to the module directory.
+       The Condition keeps `dotnet build` green on machines without the model. -->
+  <PropertyGroup>
+    <RifeModelDir>$(MSBuildThisFileDirectory)\..\..\lib\rife</RifeModelDir>
+  </PropertyGroup>
+  <ItemGroup Condition="Exists('$(RifeModelDir)\rife_v4.onnx')">
+    <None Include="$(RifeModelDir)\rife_v4.onnx" CopyToOutputDirectory="PreserveNewest" Link="lib\rife\rife_v4.onnx" Visible="false" />
+  </ItemGroup>
+
   <!-- ST-05: deploy FFmpeg native DLLs when present in lib/ffmpeg/.
        scripts/download-ffmpeg.ps1 populates that folder. App.xaml.cs sets
        ffmpeg.RootPath to AppContext.BaseDirectory/lib/ffmpeg at startup.
