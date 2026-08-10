@@ -259,7 +259,22 @@
   Bug corrigido (commit 27f1b69): modelo nao era copiado para output.
   csproj atualizado para deployar lib/rife/rife_v4.onnx automaticamente.
   
-  **SPRINT CONCLUIDA**: FP16 + 5 scales + deploy fix.
+  **SPRINT CONCLUIDA**: FP16 + 5 scales + deploy fix + frame dropping.
   Modelo: 12MB (vs 22MB FP32). Speedup: 3.2x no inference.
   Qualidade: PSNR >49dB. Video com duracao correta.
+  
+  **BUG CORRIGIDO (duracao incorreta)**:
+  Problema: ratio=5.4 (135/25) gera 6 frames/pair com ceil(), mas deveria
+  gerar 5.4 frames/pair em media. Excesso: 0.6 frames/pair = 35.6s a mais.
+  
+  Solucao: frame dropping baseado em progresso acumulado.
+  - Calcula excessPerPair = (framesPerPair+1) - ratio
+  - A cada pair, compara expectedDrops vs actualDrops
+  - Dropa 1 frame quando diff >= 0.5
+  
+  Resultado (EP72 Martial Master):
+  - Antes: 356.8s (5:57) — 35.6s a mais que audio (321.2s)
+  - Depois: 321.2s (5:21) — identico ao audio!
+  - Drops: 4014 em 8028 pairs (50%) — correto para ratio=5.4
+  
   Build 0w/0e, 545 testes pass, zero regressoes.
