@@ -204,6 +204,12 @@ internal sealed class FakeVideoRenderer : IVideoRenderer
     {
         lock (_gate)
         {
+            // Mirrors VideoRenderer: resizing an unbound renderer throws.
+            if (!IsInitialized)
+            {
+                throw new InvalidOperationException("Video renderer has not been initialized.");
+            }
+
             ResizeCalls.Add((width, height));
         }
     }

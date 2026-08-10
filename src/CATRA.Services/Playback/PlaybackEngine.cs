@@ -155,6 +155,14 @@ public sealed class PlaybackEngine : IPlaybackEngine
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             _windowHandle = windowHandle;
+
+            // The handle may arrive after Play() already created the renderer
+            // unbound; bind it as soon as it becomes available so Resize and
+            // Present never hit an uninitialized renderer.
+            if (_videoRenderer is { IsInitialized: false })
+            {
+                EnsureRendererInitialized();
+            }
         }
     }
 
@@ -166,7 +174,19 @@ public sealed class PlaybackEngine : IPlaybackEngine
             ObjectDisposedException.ThrowIf(_disposed, this);
             _outputWidth = width;
             _outputHeight = height;
-            _videoRenderer?.Resize(width, height);
+
+            // A resize can race ahead of Initialize (the window handle arrives
+            // later via SetOutputWindow); bind the pending size instead of
+            // resizing an uninitialized renderer.
+            if (_videoRenderer is { IsInitialized: false })
+            {
+                EnsureRendererInitialized();
+            }
+
+            if (_videoRenderer is { IsInitialized: true })
+            {
+                _videoRenderer.Resize(width, height);
+            }
         }
     }
 
@@ -351,7 +371,12 @@ public sealed class PlaybackEngine : IPlaybackEngine
 
                     lock (_loopGate)
                     {
-                        _videoRenderer?.Present(video);
+                        // Drop frames until the renderer is bound to a window;
+                        // presenting an uninitialized renderer would crash the loop.
+                        if (_videoRenderer is { IsInitialized: true })
+                        {
+                            _videoRenderer.Present(video);
+                        }
                     }
 
                     video.Dispose();

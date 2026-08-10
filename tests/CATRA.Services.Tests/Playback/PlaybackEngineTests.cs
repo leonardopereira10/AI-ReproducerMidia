@@ -110,6 +110,7 @@ public class PlaybackEngineTests
         using var ended = new ManualResetEventSlim(false);
         h.Engine.MediaEnded += (_, _) => ended.Set();
 
+        h.Engine.SetOutputWindow(new IntPtr(0x1));
         h.Engine.Play();
 
         ended.Wait(TimeSpan.FromSeconds(5)).Should().BeTrue("the engine should reach end of stream");
@@ -295,6 +296,50 @@ public class PlaybackEngineTests
         h.Engine.ResizeOutput(1280, 720);
 
         h.VideoRenderer.ResizeCalls.Should().ContainSingle().Which.Should().Be((1280, 720));
+        h.Engine.Stop();
+    }
+
+    [Fact]
+    public async Task ResizeOutput_AfterPlayBeforeWindowHandle_InitializesInsteadOfThrowing()
+    {
+        using var h = TestEngines.Create();
+        h.AudioDecoder.Infinite = true;
+        await h.Engine.OpenAsync("movie.mp4");
+
+        // Regression: Play() created the renderer before the UI window existed,
+        // leaving it unbound; the later VideoHost_Loaded resize then crashed with
+        // "Video renderer has not been initialized.".
+        h.Engine.Play();
+
+        var handle = new IntPtr(0x1234);
+        h.Engine.SetOutputWindow(handle);
+
+        Action act = () => h.Engine.ResizeOutput(1280, 720);
+
+        act.Should().NotThrow();
+        h.VideoRenderer.IsInitialized.Should().BeTrue();
+        h.VideoRenderer.InitializedWindow.Should().Be(handle);
+        h.Engine.Stop();
+    }
+
+    [Fact]
+    public async Task ResizeOutput_BeforePlayback_StoresSizeWithoutThrowing()
+    {
+        using var h = TestEngines.Create();
+        await h.Engine.OpenAsync("movie.mp4");
+
+        // No renderer exists yet; the size must just be stored for Initialize.
+        Action act = () => h.Engine.ResizeOutput(1920, 1080);
+
+        act.Should().NotThrow();
+        h.VideoRenderer.IsInitialized.Should().BeFalse();
+
+        h.Engine.SetOutputWindow(new IntPtr(0x2));
+        h.Engine.Play();
+
+        h.VideoRenderer.IsInitialized.Should().BeTrue();
+        h.VideoRenderer.InitializedWidth.Should().Be(1920);
+        h.VideoRenderer.InitializedHeight.Should().Be(1080);
         h.Engine.Stop();
     }
 
