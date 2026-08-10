@@ -459,7 +459,7 @@ public sealed class ProcessingQueueService : IProcessingQueueService, IDisposabl
 
         int width = GetInt($"{prefix}_target_width", dlna ? 3840 : 1920);
         int height = GetInt($"{prefix}_target_height", dlna ? 2160 : 1080);
-        double fps = GetDouble($"{prefix}_target_fps", dlna ? 55d : 135d);
+        double fps = GetDouble($"{prefix}_target_fps", dlna ? 55d : 60d);
         int bitrate = GetInt($"{prefix}_encode_bitrate_kbps", dlna ? 45_000 : 20_000);
         string interp = _settings.Get("interp_method") ?? "rife";
         string upscale = _settings.Get("upscale_method") ?? "fsr4";

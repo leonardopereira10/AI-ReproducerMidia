@@ -195,7 +195,7 @@
                         <TextBox Width="70" Padding="6,4" Text="{Binding LocalWidth, UpdateSourceTrigger=PropertyChanged}" />
                         <TextBlock Margin="6,0" VerticalAlignment="Center" Text="x" />
                         <TextBox Width="70" Padding="6,4" Text="{Binding LocalHeight, UpdateSourceTrigger=PropertyChanged}" />
-                        <TextBlock Margin="12,0,0,0" Style="{StaticResource FieldLabel}" Text="FPS:" />
+                        <TextBlock Margin="12,0,0,0" Style="{StaticResource FieldLabel}" Text="Monitor Hz:" />
                         <TextBox Width="70" Padding="6,4" Text="{Binding LocalFps, UpdateSourceTrigger=PropertyChanged}" />
                         <TextBlock Margin="12,0,0,0" Style="{StaticResource FieldLabel}" Text="Bitrate:" />
                         <TextBox Width="90" Padding="6,4" Text="{Binding LocalBitrate, UpdateSourceTrigger=PropertyChanged}" />
@@ -214,7 +214,7 @@
                         <TextBox Width="70" Padding="6,4" Text="{Binding DlnaWidth, UpdateSourceTrigger=PropertyChanged}" />
                         <TextBlock Margin="6,0" VerticalAlignment="Center" Text="x" />
                         <TextBox Width="70" Padding="6,4" Text="{Binding DlnaHeight, UpdateSourceTrigger=PropertyChanged}" />
-                        <TextBlock Margin="12,0,0,0" Style="{StaticResource FieldLabel}" Text="FPS:" />
+                        <TextBlock Margin="12,0,0,0" Style="{StaticResource FieldLabel}" Text="Monitor Hz:" />
                         <TextBox Width="70" Padding="6,4" Text="{Binding DlnaFps, UpdateSourceTrigger=PropertyChanged}" />
                         <TextBlock Margin="12,0,0,0" Style="{StaticResource FieldLabel}" Text="Bitrate:" />
                         <TextBox Width="90" Padding="6,4" Text="{Binding DlnaBitrate, UpdateSourceTrigger=PropertyChanged}" />

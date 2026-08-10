@@ -73,7 +73,7 @@ public sealed class DatabaseInitializer
         ("processed_folder", string.Empty),
         ("window_size", "5"),
         ("cleanup_on_close", "true"),
-        ("local_target_fps", "135"),
+        ("local_target_fps", "60"),
         ("local_target_width", "1920"),
         ("local_target_height", "1080"),
         ("local_encode_bitrate_kbps", "20000"),

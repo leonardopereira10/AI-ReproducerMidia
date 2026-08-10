@@ -57,7 +57,7 @@ public sealed class AppSettingsModel
     public string UpscaleMethod { get; set; } = "fsr4";
     public int LocalTargetWidth { get; set; } = 1920;
     public int LocalTargetHeight { get; set; } = 1080;
-    public int LocalTargetFps { get; set; } = 135;
+    public int LocalTargetFps { get; set; } = 60;
     public int LocalEncodeBitrateKbps { get; set; } = 20000;
     public int DlnaTargetWidth { get; set; } = 3840;
     public int DlnaTargetHeight { get; set; } = 2160;

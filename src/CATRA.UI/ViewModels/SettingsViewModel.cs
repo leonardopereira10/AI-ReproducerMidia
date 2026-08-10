@@ -210,7 +210,7 @@ public sealed partial class SettingsViewModel : ObservableObject
 
     /// <summary>Local profile target FPS.</summary>
     [ObservableProperty]
-    private int _localFps = 135;
+    private int _localFps = 60;
 
     /// <summary>Local profile encode bitrate (kbps).</summary>
     [ObservableProperty]
