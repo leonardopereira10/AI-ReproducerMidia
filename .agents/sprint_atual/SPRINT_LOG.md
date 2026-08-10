@@ -267,14 +267,15 @@
   Problema: ratio=5.4 (135/25) gera 6 frames/pair com ceil(), mas deveria
   gerar 5.4 frames/pair em media. Excesso: 0.6 frames/pair = 35.6s a mais.
   
-  Solucao: frame dropping baseado em progresso acumulado.
-  - Calcula excessPerPair = (framesPerPair+1) - ratio
-  - A cada pair, compara expectedDrops vs actualDrops
-  - Dropa 1 frame quando diff >= 0.5
+  Solucao: frame dropping fixo (1 frame a cada N pairs).
+  - excessPerPair = (framesPerPair+1) - ratio = 6.0 - 5.4 = 0.6
+  - dropInterval = round(1/0.6) = 2
+  - A cada 2 pairs, dropa 1 frame (N=5 -> N=4)
   
   Resultado (EP72 Martial Master):
   - Antes: 356.8s (5:57) — 35.6s a mais que audio (321.2s)
-  - Depois: 321.2s (5:21) — identico ao audio!
+  - Depois: 327.1s (5:27) — 5.9s a mais que audio (1.8% desvio)
   - Drops: 4014 em 8028 pairs (50%) — correto para ratio=5.4
+  - Abordagem acumulada causava problema no final, revertido para drop fixo
   
   Build 0w/0e, 545 testes pass, zero regressoes.
