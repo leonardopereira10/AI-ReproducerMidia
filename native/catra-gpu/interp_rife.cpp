@@ -260,6 +260,15 @@ struct RifeContext
     bool stagingReady = false; // lazy init on first Process call
     DXGI_FORMAT stagingFormat = DXGI_FORMAT_UNKNOWN;
 
+    // ST-29: variable frames per pair to maintain correct output duration.
+    // When ratio (targetFps/srcFps) is not integer, ceil(ratio) generates
+    // more frames than needed. We compensate by dropping frames periodically.
+    double ratio = 0.0;              // targetFps / srcFps
+    int dropInterval = 0;            // drop 1 frame every dropInterval pairs (0 = no dropping)
+    int pairsSinceLastDrop = 0;      // counter for drop scheduling
+    long long totalPairsProcessed = 0; // total pairs processed (for stats)
+    long long totalFramesProduced = 0; // total intermediate frames produced (for drop tracking)
+
     ID3D11Device* device = nullptr;             // borrowed (bridge-owned)
     ID3D11DeviceContext* deviceContext = nullptr; // borrowed
 
@@ -1018,6 +1027,23 @@ int InterpRifeCreate(ID3D11Device* device,
         framesPerPair = 0;
     }
 
+    // ST-29: calculate drop interval to maintain correct output duration.
+    // When ratio is not integer, ceil(ratio) generates excess frames.
+    // Example: ratio=5.4, framesPerPair=5, generates 6 frames/pair (5 interp + 1 orig).
+    // Expected: 5.4 frames/pair. Excess: 0.6 frames/pair.
+    // Drop 1 frame every (1/0.6) = 1.67 pairs -> every 5 pairs, drop 3 frames.
+    int dropInterval = 0;
+    if (framesPerPair > 0 && ratio > 0.0)
+    {
+        double framesPerPairActual = framesPerPair + 1.0; // intermediates + original
+        double excessPerPair = framesPerPairActual - ratio;
+        if (excessPerPair > 0.001) // has meaningful excess
+        {
+            dropInterval = static_cast<int>(std::round(1.0 / excessPerPair));
+            if (dropInterval < 1) dropInterval = 1;
+        }
+    }
+
     auto ctx = std::make_unique<RifeContext>();
     ctx->srcW = srcW;
     ctx->srcH = srcH;
@@ -1025,6 +1051,11 @@ int InterpRifeCreate(ID3D11Device* device,
     ctx->passthrough = (framesPerPair == 0);
     ctx->device = device;
     ctx->deviceContext = deviceContext;
+    ctx->ratio = ratio;
+    ctx->dropInterval = dropInterval;
+    ctx->pairsSinceLastDrop = 0;
+    ctx->totalPairsProcessed = 0;
+    ctx->totalFramesProduced = 0;
 
     if (ctx->passthrough)
     {
@@ -1106,10 +1137,10 @@ int InterpRifeCreate(ID3D11Device* device,
     }
 
     BackendLog(CATRA_LOG_INFO,
-               "interp_rife: model loaded (%s), EP=%s, %dx%d, %d frames/pair (ratio=%.3f)",
+               "interp_rife: model loaded (%s), EP=%s, %dx%d, %d frames/pair (ratio=%.3f, drop_interval=%d)",
                WideToUtf8(modelPath).c_str(),
                ctx->useDml ? "DirectML" : "CPU",
-               srcW, srcH, framesPerPair, ratio);
+               srcW, srcH, framesPerPair, ratio, dropInterval);
 
     // --- Query model I/O names (RIFE exports vary; do not hardcode) -------
     size_t inputCount = ctx->session.GetInputCount();
@@ -1336,7 +1367,34 @@ int InterpRifeProcess(int ctxHandle,
     }
     fprintf(stderr, "interp_rife: tensors ready, starting inference loop N=%d\n", ctx->framesPerPair); fflush(stderr);
 
-    const int N = ctx->framesPerPair;
+    // ST-29: variable frames per pair — drop frames periodically to maintain
+    // correct output duration when ratio is not integer.
+    // Uses accumulated progress for precise dropping (not fixed interval).
+    int N = ctx->framesPerPair;
+    if (ctx->ratio > 0.0 && ctx->framesPerPair > 0)
+    {
+        // Calculate expected frames vs actual frames at this point
+        double expectedFramesPerPair = ctx->ratio;  // e.g., 5.4
+        double actualFramesPerPair = ctx->framesPerPair + 1.0;  // e.g., 6.0
+        double excessPerPair = actualFramesPerPair - expectedFramesPerPair;  // e.g., 0.6
+        
+        // How many frames should we have dropped by now?
+        double expectedDrops = static_cast<double>(ctx->totalPairsProcessed) * excessPerPair;
+        double actualDrops = static_cast<double>(ctx->totalPairsProcessed - ctx->totalFramesProduced);
+        
+        // If we haven't dropped enough, drop 1 frame this pair
+        if (expectedDrops - actualDrops >= 0.5)
+        {
+            N = ctx->framesPerPair - 1;
+            fprintf(stderr, "interp_rife: dropping 1 frame (pair #%lld, expected_drops=%.1f, actual_drops=%.0f, N=%d->%d)\n",
+                    ctx->totalPairsProcessed + 1, expectedDrops, actualDrops, ctx->framesPerPair, N); fflush(stderr);
+        }
+    }
+    ctx->totalPairsProcessed++;
+    ctx->totalFramesProduced += N;
+
+    // Ensure N is at least 0 (can be 0 if framesPerPair was 1 and we're dropping)
+    if (N < 0) N = 0;
     const int64_t w = ctx->srcW;
     const int64_t h = ctx->srcH;
     const std::array<int64_t, 4> frameShape{1, 3, h, w};
