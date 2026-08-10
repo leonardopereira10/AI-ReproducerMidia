@@ -328,3 +328,45 @@
 - 305e307: effective fps no encoder corrige duracao
 
 **Build**: 0w/0e, 540 testes pass, zero regressoes.
+
+## BUG ABERTO: Upscale FSR1 + AMF Encoder
+
+**Problema identificado:** O upscale FSR1 produz texturas D3D12, mas o AMF encoder
+falha ao tentar consumi-las via `CreateSurfaceFromDX12Native` (res=1 = AMF_FAIL).
+
+**Impacto:** Perfil DLNA não funciona (precisa upscale 1920x1080 → 2560x1440).
+Perfil Local funciona (não usa upscale).
+
+**Diagnóstico detalhado:**
+```
+texture D3D12: format=87 (DXGI_FORMAT_B8G8R8A8_UNORM), width=2560, height=1440
+device D3D12: mesmo device usado pelo AMF (g_d3d12Device)
+flags: 4 (D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+heap: D3D12_HEAP_FLAG_SHARED
+resource state: D3D12_RESOURCE_STATE_COMMON (após barrier)
+```
+
+**Tentativas sem sucesso:**
+- ✅ Formato BGRA (DXGI_FORMAT_B8G8R8A8_UNORM)
+- ✅ D3D12_HEAP_FLAG_SHARED
+- ✅ Resource barrier para COMMON state
+- ✅ Remover ALLOW_SIMULTANEOUS_ACCESS
+- ✅ Remover ALLOW_SIMULTANEOUS_ACCESS + ALLOW_UNORDERED_ACCESS
+
+**Próximas abordagens para resolver:**
+1. **Reescrever upscale FSR1 para D3D11** (recomendado)
+   - AMF já lida bem com texturas D3D11 (RIFE produz D3D11 e funciona)
+   - Compute shader FSR1 pode rodar em D3D11
+   - Mais confiável que D3D12
+   
+2. Usar pool de texturas do interop (pool12)
+   - Pool já funciona com AMF
+   - Complexidade: modificar upscale para alocar do pool
+   
+3. Investigar documentação AMF
+   - Verificar se há requisitos específicos para CreateSurfaceFromDX12Native
+   - Procurar exemplos no AMF SDK
+
+**Commit:** 5ffa04d (logs de debug)
+
+**Status:** Perfil Local 100% funcional. Perfil DLNA bloqueado até resolver upscale.
