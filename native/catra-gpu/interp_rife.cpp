@@ -6,13 +6,15 @@
 // CATRA_ERR_NOT_IMPL so the rest of the bridge still builds and loads.
 //
 // ROOT-CAUSE / DESIGN NOTES
-//   * frames_per_pair = ceil(target_fps / src_fps) - 1. For 24->135 this is
-//     ceil(5.625)-1 = 5; for 24->55 it is ceil(2.2917)-1 = 2. When the source
-//     already meets/exceeds the target (RN-07) the value is 0 and the context
-//     becomes a passthrough that emits zero frames.
+//   * frames_per_pair = floor(target_fps / src_fps) - 1 (ST-30). The floor
+//     picks the highest integer rate that does NOT exceed the target, so no
+//     frame dropping is needed. Example: 25fps -> 60Hz gives floor(2.4)-1 = 1
+//     (output 50fps). When the source already meets/exceeds the target (RN-07)
+//     the value clamps to 0 and the context becomes a passthrough that emits
+//     zero frames.
 //   * Timesteps are i/(N+1) for i in [1..N] (N == frames_per_pair). This splits
 //     the [0,1] interval into N+1 equal segments and matches the spec's
-//     "t in [1/N'..(N'-1)/N']" with N' == ceil(ratio) == N+1.
+//     "t in [1/N'..(N'-1)/N']" with N' == floor(ratio) == N+1.
 //   * The DirectML EP is requested first; any failure (unsupported adapter,
 //     missing DirectML, RDNA4 driver gap) falls back to the CPU EP so the job
 //     still completes (slowly). This is the RN-07 / risk-mitigation decision:
@@ -259,14 +261,6 @@ struct RifeContext
     bool passthrough = false;
     bool stagingReady = false; // lazy init on first Process call
     DXGI_FORMAT stagingFormat = DXGI_FORMAT_UNKNOWN;
-
-    // ST-29: variable frames per pair to maintain correct output duration.
-    // When ratio (targetFps/srcFps) is not integer, ceil(ratio) generates
-    // more frames than needed. We compensate by dropping frames periodically.
-    double ratio = 0.0;              // targetFps / srcFps
-    int dropInterval = 0;            // drop 1 frame every dropInterval pairs (0 = no dropping)
-    int pairsSinceLastDrop = 0;      // counter for drop scheduling
-    long long totalPairsProcessed = 0; // total pairs processed (for stats)
 
     ID3D11Device* device = nullptr;             // borrowed (bridge-owned)
     ID3D11DeviceContext* deviceContext = nullptr; // borrowed
@@ -1018,29 +1012,14 @@ int InterpRifeCreate(ID3D11Device* device,
         BackendLog(CATRA_LOG_WARN, "interp_rife: method %d unavailable, using RIFE", method);
     }
 
-    // frames_per_pair = ceil(target/src) - 1; RN-07 skip when source >= target.
+    // ST-30: Use floor() to get the integer rate that doesn't exceed target.
+    // Example: source=25fps, target=60Hz -> ratio=2.4 -> floor(2.4)=2 -> output=50fps
+    // This ensures output never exceeds the target monitor frequency.
     double ratio = targetFps / srcFps;
-    int framesPerPair = static_cast<int>(std::ceil(ratio)) - 1;
+    int framesPerPair = static_cast<int>(std::floor(ratio)) - 1;
     if (framesPerPair < 0)
     {
         framesPerPair = 0;
-    }
-
-    // ST-29: calculate drop interval to maintain correct output duration.
-    // When ratio is not integer, ceil(ratio) generates excess frames.
-    // Example: ratio=5.4, framesPerPair=5, generates 6 frames/pair (5 interp + 1 orig).
-    // Expected: 5.4 frames/pair. Excess: 0.6 frames/pair.
-    // Drop 1 frame every (1/0.6) = 1.67 pairs -> every 5 pairs, drop 3 frames.
-    int dropInterval = 0;
-    if (framesPerPair > 0 && ratio > 0.0)
-    {
-        double framesPerPairActual = framesPerPair + 1.0; // intermediates + original
-        double excessPerPair = framesPerPairActual - ratio;
-        if (excessPerPair > 0.001) // has meaningful excess
-        {
-            dropInterval = static_cast<int>(std::round(1.0 / excessPerPair));
-            if (dropInterval < 1) dropInterval = 1;
-        }
     }
 
     auto ctx = std::make_unique<RifeContext>();
@@ -1050,10 +1029,6 @@ int InterpRifeCreate(ID3D11Device* device,
     ctx->passthrough = (framesPerPair == 0);
     ctx->device = device;
     ctx->deviceContext = deviceContext;
-    ctx->ratio = ratio;
-    ctx->dropInterval = dropInterval;
-    ctx->pairsSinceLastDrop = 0;
-    ctx->totalPairsProcessed = 0;
 
     if (ctx->passthrough)
     {
@@ -1135,10 +1110,10 @@ int InterpRifeCreate(ID3D11Device* device,
     }
 
     BackendLog(CATRA_LOG_INFO,
-               "interp_rife: model loaded (%s), EP=%s, %dx%d, %d frames/pair (ratio=%.3f, drop_interval=%d)",
+               "interp_rife: model loaded (%s), EP=%s, %dx%d, %d frames/pair (ratio=%.3f, floor mode)",
                WideToUtf8(modelPath).c_str(),
                ctx->useDml ? "DirectML" : "CPU",
-               srcW, srcH, framesPerPair, ratio, dropInterval);
+               srcW, srcH, framesPerPair, ratio);
 
     // --- Query model I/O names (RIFE exports vary; do not hardcode) -------
     size_t inputCount = ctx->session.GetInputCount();
@@ -1365,24 +1340,8 @@ int InterpRifeProcess(int ctxHandle,
     }
     fprintf(stderr, "interp_rife: tensors ready, starting inference loop N=%d\n", ctx->framesPerPair); fflush(stderr);
 
-    // ST-29: variable frames per pair — drop 1 frame every dropInterval pairs
-    // to maintain correct output duration when ratio is not integer.
-    int N = ctx->framesPerPair;
-    if (ctx->dropInterval > 0)
-    {
-        ctx->pairsSinceLastDrop++;
-        if (ctx->pairsSinceLastDrop >= ctx->dropInterval)
-        {
-            N = ctx->framesPerPair - 1;
-            ctx->pairsSinceLastDrop = 0;
-            fprintf(stderr, "interp_rife: dropping 1 frame (pair #%lld, N=%d->%d)\n",
-                    ctx->totalPairsProcessed + 1, ctx->framesPerPair, N); fflush(stderr);
-        }
-    }
-    ctx->totalPairsProcessed++;
-
-    // Ensure N is at least 0 (can be 0 if framesPerPair was 1 and we're dropping)
-    if (N < 0) N = 0;
+    // ST-30: floor mode — fixed frames per pair, no frame dropping.
+    const int N = ctx->framesPerPair;
     const int64_t w = ctx->srcW;
     const int64_t h = ctx->srcH;
     const std::array<int64_t, 4> frameShape{1, 3, h, w};
