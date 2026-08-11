@@ -47,7 +47,7 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
     private bool _opened;
     private bool _eofSent;
     private bool _disposed;
-    private bool _diagLogged;
+
     private SwsContext* _scaler;
     private int _scalerW;
     private int _scalerH;
@@ -368,15 +368,15 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
     /// (ArraySize &gt; 1, one slice per decoder surface). Downstream GPU stages
     /// (RIFE, FSR, AMF) expect standalone ID3D11Texture2D pointers (ArraySize == 1).
     ///
-    /// <b>ST-23 GPU fast path:</b> A compute shader converts the NV12 array slice
-    /// directly to BGRA on the GPU, skipping the costly av_hwframe_transfer_data
-    /// (GPU→CPU) + sws_scale (CPU) + upload (CPU→GPU) round-trip. If the GPU path
-    /// fails (shader compile error, driver bug, null device), the method falls back
-    /// to the CPU path which is guaranteed to work.
-    ///
-    /// <b>CPU fallback path:</b> av_hwframe_transfer_data downloads NV12 to system
-    /// memory, sws_scale converts to BGRA, and a staging texture uploads the result.
-    /// This is the original (pre-ST-23) path and always works.
+    /// Conversion priority:
+    /// 1. <b>GPU compute shader</b> (ST-23): fastest, but requires the decoder texture
+    ///    to have D3D11_BIND_SHADER_RESOURCE (many D3D11VA decoders don't).
+    /// 2. <b>CPU fallback</b>: av_hwframe_transfer_data + sws_scale + upload.
+    ///    FFmpeg's own D3D11VA download is the one verified-good read path on
+    ///    this AMD RDNA4 machine (bit-identical to software decode, md5 match).
+    ///    Direct D3D11 copies of NV12 decoder array slices (CopyResource /
+    ///    CopySubresourceRegion into staging) read ZEROS on this driver —
+    ///    the native staging path is intentionally NOT used here.
     /// </summary>
     private IntPtr OwnFrame(AVFrame* frame)
     {
@@ -387,20 +387,20 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
                 "avcodec_receive_frame (pipeline requires D3D11VA hardware frames)");
         }
 
-        // ST-23: Try GPU NV12→BGRA compute shader path first.
+        // 1. Try GPU NV12→BGRA compute shader path (ST-23).
         if (TryGpuConvert(frame, out IntPtr gpuResult))
         {
-            // GPU path succeeded: unref the hw frame (decoder surface recycled),
-            // track the BGRA texture, return it.
             ffmpeg.av_frame_unref(frame);
             _ownedFrames.Add((gpuResult, IntPtr.Zero));
             return gpuResult;
         }
 
-        // CPU fallback path: av_hwframe_transfer_data + sws_scale + upload.
-        // AMD RDNA4 (Adrenalin) driver bug: direct D3D11 read of NV12 decoder
-        // array slices returns ZEROS (green frames). FFmpeg's own download is
-        // the one CPU path that works: bit-identical to software decode.
+        // 2. CPU fallback path: av_hwframe_transfer_data + sws_scale + upload.
+        //    AMD RDNA4 (Adrenalin): direct D3D11 reads of NV12 decoder array
+        //    slices return ZEROS (verified: staging CopySubresourceRegion,
+        //    whole-array CopyResource, and Map of plane subresources all read
+        //    zeros). FFmpeg's own download is the one path that works:
+        //    bit-identical to software decode (md5 match).
         AVFrame* sw = ffmpeg.av_frame_alloc();
         if (sw == null)
         {
@@ -414,8 +414,44 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
             throw new FfmpegException(transfer, "av_hwframe_transfer_data");
         }
 
-        // Pixels are now in system memory; drop the hw frame immediately so the
-        // decoder surface (texture array slice) is recycled right away.
+        // Diagnostic (black-frame hunt): probe the downloaded NV12 RIGHT AFTER
+        // the transfer, before any conversion. Trace.WriteLine is the channel
+        // captured by the VS debug log (Console.Error is not).
+        unsafe
+        {
+            byte* yp = sw->data[0];
+            byte* uvp = sw->data[1];
+            if (yp != null)
+            {
+                int ls0 = sw->linesize[0];
+                int ls1 = sw->linesize[1];
+                int w = sw->width;
+                int h = sw->height;
+                long ySum = 0;
+                // 16 sample points spread across the luma plane.
+                for (int i = 0; i < 16; i++)
+                {
+                    int sy = (h - 1) * i / 15;
+                    int sx = (w - 1) * ((i * 7) % 15) / 14;
+                    ySum += yp[(long)sy * ls0 + sx];
+                }
+                long uvSum = 0;
+                if (uvp != null)
+                {
+                    for (int i = 0; i < 8; i++)
+                    {
+                        int sy = (h / 2 - 1) * i / 7;
+                        int sx = (w - 2) * ((i * 5) % 7) / 6;
+                        uvSum += uvp[(long)sy * ls1 + sx];
+                    }
+                }
+                System.Diagnostics.Trace.WriteLine(
+                    $"[FrameDecoder] post-transfer probe fmt={(AVPixelFormat)sw->format} {w}x{h} " +
+                    $"ls0={ls0} ls1={ls1} Yavg16={ySum / 16} UVavg8={(uvp != null ? uvSum / 8 : -1)} " +
+                    $"Y00={yp[0]} Ymid={yp[(long)(h / 2) * ls0 + w / 2]}");
+            }
+        }
+
         ffmpeg.av_frame_unref(frame);
 
         try
@@ -514,6 +550,56 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
     }
 
     /// <summary>
+    /// Attempts NV12→BGRA conversion via the native staging copy path.
+    /// This is the AMD RDNA 4 workaround: uses full-texture CopyResource
+    /// + two separate Map calls (Y and UV subresources) + CPU BT.601
+    /// conversion + upload to a standalone BGRA texture.
+    ///
+    /// Bypasses av_hwframe_transfer_data which produces zeros on AMD RDNA 4
+    /// for D3D11VA NV12 decoder textures (CopySubresourceRegion driver bug).
+    ///
+    /// Returns <c>true</c> on success with the BGRA texture pointer in
+    /// <paramref name="bgraTexture"/> (AddRef'd, caller owns). Returns
+    /// <c>false</c> on any failure; the caller must fall back to the CPU path.
+    /// </summary>
+    private bool TryStagingConvert(AVFrame* frame, out IntPtr bgraTexture)
+    {
+        bgraTexture = IntPtr.Zero;
+
+        IntPtr nv12TexPtr = (IntPtr)frame->data[0];
+        if (nv12TexPtr == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        uint arraySlice = (uint)(long)frame->data[1];
+        int width = frame->width;
+        int height = frame->height;
+        if (width <= 0 || height <= 0)
+        {
+            return false;
+        }
+
+        if (!_nativeLib.IsAvailable)
+        {
+            return false;
+        }
+
+        int result = _nativeLib.Nv12StagingConvert(
+            nv12TexPtr, arraySlice, (uint)width, (uint)height, out bgraTexture);
+
+        if (result != 0 || bgraTexture == IntPtr.Zero)
+        {
+            Console.Error.WriteLine($"[FrameDecoder] Staging NV12\u2192BGRA failed (rc={result})");
+            Console.Error.Flush();
+            bgraTexture = IntPtr.Zero;
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
     /// Converts a system-memory NV12 <c>AVFrame</c> (from
     /// <c>av_hwframe_transfer_data</c>) into BGRA on the CPU and uploads it as a
     /// standalone BGRA D3D11 texture (ArraySize == 1). Returns an AddRef'd
@@ -545,14 +631,9 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
         {
             byte* yPtr = sw->data[0];
             byte* uvPtr = sw->data[1];
-            if (!_diagLogged)
-            {
-                _diagLogged = true;
-                // Early green-frame probe: zeros here would mean the download is broken.
-                Console.Error.WriteLine($"[FrameDecoder] NV12 download {sw->width}x{sw->height} -> {dstW}x{dstH} " +
-                    $"Y(10,0)={yPtr[10]} Y(10,{dstH / 2})={yPtr[(long)(dstH / 2) * yPitch + 10]} U={uvPtr[0]} V={uvPtr[1]}");
-                Console.Error.Flush();
-            }
+            // NV12 probe on the Trace channel (captured by VS debug log).
+            System.Diagnostics.Trace.WriteLine($"[FrameDecoder] NV12 probe {sw->width}x{sw->height} -> {dstW}x{dstH} " +
+                $"Y(10,0)={yPtr[10]} Y(10,{dstH / 2})={yPtr[(long)(dstH / 2) * yPitch + 10]} U={uvPtr[0]} V={uvPtr[1]}");
 
             byte*[] srcSlices = { yPtr, uvPtr, null, null };
             int[] srcStrides = { yPitch, uvPitch, 0, 0 };

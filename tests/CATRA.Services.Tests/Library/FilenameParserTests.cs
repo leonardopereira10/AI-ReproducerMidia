@@ -75,6 +75,99 @@ public class FilenameParserTests
         result.SeasonNumber.Should().BeNull();
     }
 
+    // ── PublisherRelease ─────────────────────────────────────────────────────
+
+    [Fact]
+    public void Parse_PublisherReleaseSpecExample_ExtractsNameSeasonEpisodeAndPublisher()
+    {
+        // Arrange
+        var fileName = "[Ep. 001] Martial Master - 1T [DonghuaNoSekai] [1080p] [PT-BR].mp4";
+
+        // Act
+        var result = _parser.Parse(fileName);
+
+        // Assert
+        result.PatternUsed.Should().Be(FilenamePattern.PublisherRelease);
+        result.SeriesName.Should().Be("Martial Master");
+        result.SeasonNumber.Should().Be(1);
+        result.EpisodeNumber.Should().Be(1);
+        result.Publisher.Should().Be("DonghuaNoSekai");
+    }
+
+    [Fact]
+    public void Parse_PublisherReleaseWithoutExtension_MatchesTheSameWay()
+    {
+        // Act
+        var result = _parser.Parse("[Ep. 001] Martial Master - 1T [DonghuaNoSekai] [1080p] [PT-BR]");
+
+        // Assert
+        result.PatternUsed.Should().Be(FilenamePattern.PublisherRelease);
+        result.SeriesName.Should().Be("Martial Master");
+        result.EpisodeNumber.Should().Be(1);
+        result.Publisher.Should().Be("DonghuaNoSekai");
+    }
+
+    [Fact]
+    public void Parse_PublisherRelease_PreservesPublisherCasing()
+    {
+        // Act
+        var result = _parser.Parse("[Ep. 007] Some Series - 2T [DonghuaNoSekai] [1080p] [PT-BR].mkv");
+
+        // Assert — the group tag is kept verbatim, never title-cased.
+        result.Publisher.Should().Be("DonghuaNoSekai");
+        result.SeasonNumber.Should().Be(2);
+        result.EpisodeNumber.Should().Be(7);
+    }
+
+    [Fact]
+    public void Parse_PublisherReleaseHigherEpisode_ParsesNumber()
+    {
+        // Act
+        var result = _parser.Parse("[Ep. 042] Martial Master - 1T [DonghuaNoSekai] [1080p] [PT-BR].mp4");
+
+        // Assert
+        result.EpisodeNumber.Should().Be(42);
+        result.PatternUsed.Should().Be(FilenamePattern.PublisherRelease);
+    }
+
+    [Fact]
+    public void Parse_PublisherReleaseNoSeasonMarker_SeasonIsNull()
+    {
+        // Act
+        var result = _parser.Parse("[Ep. 005] Some Name [Group] [720p].mp4");
+
+        // Assert
+        result.PatternUsed.Should().Be(FilenamePattern.PublisherRelease);
+        result.SeriesName.Should().Be("Some Name");
+        result.SeasonNumber.Should().BeNull();
+        result.EpisodeNumber.Should().Be(5);
+        result.Publisher.Should().Be("Group");
+    }
+
+    [Fact]
+    public void Parse_PublisherRelease_SkipsQualityAndLanguageTagsForPublisher()
+    {
+        // Publisher appears after a quality tag; resolution/language tags must
+        // never be mistaken for the release group.
+        // Act
+        var result = _parser.Parse("[Ep. 003] Series X - 1T [1080p] [PT-BR] [CoolFansub].mkv");
+
+        // Assert
+        result.Publisher.Should().Be("CoolFansub");
+    }
+
+    [Theory]
+    [InlineData("[Ep. 010] Serie Y - 1T [1080p] [PT-BR].mp4")] // only quality+lang tags
+    public void Parse_PublisherReleaseNoPublisherTag_PublisherIsNull(string fileName)
+    {
+        // Act
+        var result = _parser.Parse(fileName);
+
+        // Assert
+        result.PatternUsed.Should().Be(FilenamePattern.PublisherRelease);
+        result.Publisher.Should().BeNull();
+    }
+
     // ── P3 ──────────────────────────────────────────────────────────────────
 
     [Fact]

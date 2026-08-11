@@ -48,20 +48,45 @@ public partial class App : Application
         // TEMP: route Trace.WriteLine to stderr for diagnostics.
         System.Diagnostics.Trace.Listeners.Add(new System.Diagnostics.ConsoleTraceListener { TraceOutputOptions = System.Diagnostics.TraceOptions.None });
 
-        // Global crash handler: log unhandled exceptions to stderr before the app dies.
+        DiagnosticsLogger.Info($"=== CATRA startup (pid={Environment.ProcessId}). Log file: {DiagnosticsLogger.LogFilePath} ===");
+
+        // Global crash handler: persist the FULL exception chain (all inners +
+        // stack) to the log file. stderr is invisible for a WinExe GUI app, so
+        // the file log is the only reliable place the user can inspect later.
         AppDomain.CurrentDomain.UnhandledException += (_, args) =>
         {
             var ex = args.ExceptionObject as Exception;
-            Console.Error.WriteLine($"[FATAL] Unhandled exception (terminating={args.IsTerminating}):\n{ex}");
+            DiagnosticsLogger.Fatal($"Unhandled exception (terminating={args.IsTerminating})", ex);
         };
         DispatcherUnhandledException += (_, args) =>
         {
-            Console.Error.WriteLine($"[FATAL] Dispatcher unhandled exception:\n{args.Exception}");
+            // Render-thread failures (e.g. MediaContext.RenderMessageHandlerCore)
+            // surface here; capture the complete chain before deciding to crash.
+            DiagnosticsLogger.Fatal("Dispatcher unhandled exception", args.Exception);
+
+            // The app is a WinExe: without this the user only sees an abrupt exit.
+            // Surface the exception type/message and where the full trace was saved.
+            try
+            {
+                var ex = args.Exception;
+                MessageBox.Show(
+                    $"{ex.GetType().FullName}\n\n{ex.Message}\n\n"
+                    + (ex.InnerException is not null ? $"Inner: {ex.InnerException.GetType().FullName}: {ex.InnerException.Message}\n\n" : string.Empty)
+                    + $"Log completo:\n{DiagnosticsLogger.LogFilePath}",
+                    "Erro fatal de renderização",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
+            catch
+            {
+                // Never let the reporter itself crash the teardown.
+            }
+
             args.Handled = false; // let it crash so we see the full trace
         };
         TaskScheduler.UnobservedTaskException += (_, args) =>
         {
-            Console.Error.WriteLine($"[FATAL] Unobserved task exception:\n{args.Exception}");
+            DiagnosticsLogger.Fatal("Unobserved task exception", args.Exception);
         };
 
         ConfigureFfmpeg();

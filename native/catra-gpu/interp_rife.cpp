@@ -75,6 +75,12 @@
     #undef ORT_API_MANUAL_INIT
 #endif
 
+#if defined(CATRA_HAS_PYTORCH)
+    // PyTorch C++ API (libtorch) for ROCm backend
+    #include <torch/torch.h>
+    #include <torch/script.h>
+#endif
+
 // log_msg lives in catra_gpu.cpp; redeclare the minimal surface we need. It is
 // defined in the anonymous namespace there, so we route through a small extern
 // shim exposed for the backends.
@@ -265,13 +271,26 @@ struct RifeContext
     ID3D11Device* device = nullptr;             // borrowed (bridge-owned)
     ID3D11DeviceContext* deviceContext = nullptr; // borrowed
 
+    // Backend selection priority: ROCm (PyTorch) -> DirectML (ORT) -> CPU
+    enum class Backend { ROCm, DirectML, CPU };
+    Backend backend = Backend::CPU;
+
+#if defined(CATRA_HAS_PYTORCH)
+    // PyTorch/ROCm backend state
+    torch::jit::script::Module torchModule;
+    torch::Device torchDevice{torch::kCPU};
+    bool torchLoaded = false;
+#endif
+
+#if defined(CATRA_HAS_ONNXRUNTIME)
+    // ONNX Runtime / DirectML backend state
     Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "catra-rife"};
     Ort::SessionOptions sessionOptions;
     Ort::Session session{nullptr};
     Ort::AllocatorWithDefaultOptions allocator;
     Ort::MemoryInfo memInfo{nullptr};
-
-    bool useDml = false;
+    bool useDml = false; // legacy flag for DirectML
+#endif
 
     // Model I/O metadata (queried, not hardcoded — RIFE exports vary).
     std::vector<std::string> inputNames;
@@ -1056,56 +1075,158 @@ int InterpRifeCreate(ID3D11Device* device,
 
     ctx->memInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 
-    // --- Execution providers: DirectML first, CPU fallback ----------------
+    // --- Execution providers: ROCm first, DirectML second, CPU fallback -----
     ctx->sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-#if defined(USE_DML)
-    // The DirectML EP is registered via the C export from the ORT DirectML
-    // build. The C++ wrapper method (SessionOptions::AppendExecutionProvider_DML)
-    // does NOT exist in the Microsoft.ML.OnnxRuntime.DirectML NuGet package —
-    // only the flat C export does. We load it dynamically so there is no
-    // link-time dependency on the export (graceful fallback if absent).
-    using DmlAppendFn = OrtStatus*(__stdcall*)(OrtSessionOptions*, int);
-    HMODULE ortMod = GetModuleHandleW(L"onnxruntime.dll");
-    auto dmlAppend = ortMod != nullptr
-        ? reinterpret_cast<DmlAppendFn>(
-              GetProcAddress(ortMod, "OrtSessionOptionsAppendExecutionProvider_DML"))
-        : nullptr;
-    if (dmlAppend != nullptr)
+
+    // Try ROCm (PyTorch) first if available
+#if defined(CATRA_HAS_PYTORCH)
+    if (!ctx->torchLoaded)
     {
-        OrtSessionOptions* rawOpts = ctx->sessionOptions;
-        OrtStatus* st = dmlAppend(rawOpts, 0 /* device_id: primary adapter */);
-        if (st == nullptr)
+        try
         {
-            ctx->useDml = true;
+            // Check if ROCm/HIP is available
+            if (torch::cuda::is_available())
+            {
+                ctx->torchDevice = torch::Device(torch::kCUDA);
+                BackendLog(CATRA_LOG_INFO, "interp_rife: ROCm/HIP detected, using GPU");
+            }
+            else
+            {
+                BackendLog(CATRA_LOG_INFO, "interp_rife: ROCm not available, trying DirectML next");
+            }
+        }
+        catch (const std::exception& e)
+        {
+            BackendLog(CATRA_LOG_WARN, "interp_rife: ROCm init failed: %s", e.what());
+        }
+    }
+#endif
+
+    // Try DirectML if ROCm is not available
+#if defined(USE_DML)
+    if (
+#if defined(CATRA_HAS_PYTORCH)
+        !ctx->torchLoaded &&
+#endif
+        true)
+    {
+        // The DirectML EP is registered via the C export from the ORT DirectML
+        // build. The C++ wrapper method (SessionOptions::AppendExecutionProvider_DML)
+        // does NOT exist in the Microsoft.ML.OnnxRuntime.DirectML NuGet package —
+        // only the flat C export does. We load it dynamically so there is no
+        // link-time dependency on the export (graceful fallback if absent).
+        using DmlAppendFn = OrtStatus*(__stdcall*)(OrtSessionOptions*, int);
+        HMODULE ortMod = GetModuleHandleW(L"onnxruntime.dll");
+        auto dmlAppend = ortMod != nullptr
+            ? reinterpret_cast<DmlAppendFn>(
+                  GetProcAddress(ortMod, "OrtSessionOptionsAppendExecutionProvider_DML"))
+            : nullptr;
+        if (dmlAppend != nullptr)
+        {
+            OrtSessionOptions* rawOpts = ctx->sessionOptions;
+            OrtStatus* st = dmlAppend(rawOpts, 0 /* device_id: primary adapter */);
+            if (st == nullptr)
+            {
+                ctx->useDml = true;
+                BackendLog(CATRA_LOG_INFO, "interp_rife: DirectML EP enabled");
+            }
+            else
+            {
+                const char* msg = Ort::GetApi().GetErrorMessage(st);
+                BackendLog(CATRA_LOG_WARN,
+                           "interp_rife: DirectML EP unavailable (%s) -> CPU fallback",
+                           msg != nullptr ? msg : "unknown");
+                Ort::GetApi().ReleaseStatus(st);
+                ctx->useDml = false;
+            }
         }
         else
         {
-            const char* msg = Ort::GetApi().GetErrorMessage(st);
             BackendLog(CATRA_LOG_WARN,
-                       "interp_rife: DirectML EP unavailable (%s) -> CPU fallback",
-                       msg != nullptr ? msg : "unknown");
-            Ort::GetApi().ReleaseStatus(st);
+                       "interp_rife: DirectML EP export not found in onnxruntime.dll -> CPU fallback");
             ctx->useDml = false;
         }
-    }
-    else
-    {
-        BackendLog(CATRA_LOG_WARN,
-                   "interp_rife: DirectML EP export not found in onnxruntime.dll -> CPU fallback");
-        ctx->useDml = false;
     }
 #endif
     // CPU EP is always registered by default in ONNX Runtime; no explicit
     // AppendExecutionProvider_CPU call needed (the method does not exist in
     // the 1.18 C++ API). When DML is unavailable the session simply uses CPU.
 
-    try
+    // Determine which backend to use
+#if defined(CATRA_HAS_PYTORCH)
+    if (ctx->torchLoaded && torch::cuda::is_available())
     {
-        ctx->session = Ort::Session(ctx->env, modelPath.c_str(), ctx->sessionOptions);
+        ctx->backend = RifeContext::Backend::ROCm;
+        BackendLog(CATRA_LOG_INFO, "interp_rife: using ROCm backend");
     }
-    catch (const Ort::Exception& e)
+    else
+#endif
+#if defined(CATRA_HAS_ONNXRUNTIME)
+    if (ctx->useDml)
     {
-        BackendLog(CATRA_LOG_ERROR, "interp_rife: failed to load model: %s", e.what());
+        ctx->backend = RifeContext::Backend::DirectML;
+        BackendLog(CATRA_LOG_INFO, "interp_rife: using DirectML backend");
+    }
+    else
+#endif
+    {
+        ctx->backend = RifeContext::Backend::CPU;
+        BackendLog(CATRA_LOG_INFO, "interp_rife: using CPU backend");
+    }
+
+    // --- Load model with backend priority: ROCm -> DirectML -> CPU ---------
+    bool modelLoaded = false;
+
+#if defined(CATRA_HAS_PYTORCH)
+    // Try ROCm (PyTorch) first
+    if (!modelLoaded)
+    {
+        try
+        {
+            BackendLog(CATRA_LOG_INFO, "interp_rife: attempting to load model with PyTorch/ROCm");
+            ctx->torchModule = torch::jit::load(modelPath);
+            
+            if (torch::cuda::is_available())
+            {
+                ctx->torchDevice = torch::Device(torch::kCUDA);
+                ctx->torchModule.to(ctx->torchDevice);
+                ctx->torchLoaded = true;
+                modelLoaded = true;
+                BackendLog(CATRA_LOG_INFO, "interp_rife: model loaded with PyTorch/ROCm on GPU");
+            }
+            else
+            {
+                BackendLog(CATRA_LOG_WARN, "interp_rife: PyTorch loaded but CUDA not available");
+            }
+        }
+        catch (const std::exception& e)
+        {
+            BackendLog(CATRA_LOG_WARN, "interp_rife: PyTorch load failed: %s, trying DirectML next", e.what());
+        }
+    }
+#endif
+
+#if defined(CATRA_HAS_ONNXRUNTIME)
+    // Try DirectML second
+    if (!modelLoaded)
+    {
+        try
+        {
+            BackendLog(CATRA_LOG_INFO, "interp_rife: attempting to load model with ONNX Runtime/DirectML");
+            ctx->session = Ort::Session(ctx->env, modelPath.c_str(), ctx->sessionOptions);
+            modelLoaded = true;
+            BackendLog(CATRA_LOG_INFO, "interp_rife: model loaded with ONNX Runtime");
+        }
+        catch (const Ort::Exception& e)
+        {
+            BackendLog(CATRA_LOG_ERROR, "interp_rife: ONNX Runtime load failed: %s", e.what());
+        }
+    }
+#endif
+
+    if (!modelLoaded)
+    {
+        BackendLog(CATRA_LOG_ERROR, "interp_rife: failed to load model with any backend");
         return CATRA_ERR_INIT;
     }
 
@@ -1380,38 +1501,94 @@ int InterpRifeProcess(int ctxHandle,
                 ctx->memInfo, ctx->tensorB.data(), ctx->tensorB.size(),
                 frameShape.data(), frameShape.size());
 
-            std::vector<Ort::Value> inputs;
-            inputs.push_back(std::move(inA));
-            inputs.push_back(std::move(inB));
-
-            // Optional arbitrary-timestep input.
-            Ort::Value tsValue{nullptr};
-            if (ctx->timestepInputIndex != SIZE_MAX)
+            if (ctx->backend == RifeContext::Backend::ROCm)
             {
-                ctx->tensorTimestep.assign(1, t);
-                const std::array<int64_t, 1> tsShape{1};
-                tsValue = Ort::Value::CreateTensor<float>(
-                    ctx->memInfo, ctx->tensorTimestep.data(), ctx->tensorTimestep.size(),
-                    tsShape.data(), tsShape.size());
-                inputs.push_back(std::move(tsValue));
-            }
-
-            auto outputs = ctx->session.Run(
-                Ort::RunOptions{nullptr},
-                ctx->inputNamePtrs.data(), inputs.data(), inputs.size(),
-                ctx->outputNamePtrs.data(), ctx->outputNamePtrs.size());
-
-            if (outputs.empty())
-            {
-                BackendLog(CATRA_LOG_ERROR, "interp_rife: Run returned no outputs (t=%.3f)", t);
+#if defined(CATRA_HAS_PYTORCH)
+                // PyTorch/ROCm inference
+                try
+                {
+                    // Convert input tensors to PyTorch format
+                    // Input shape: [1, 3, H, W] for RIFE
+                    auto tensor0 = torch::from_blob(
+                        ctx->tensorA.data(),
+                        {1, 3, h, w},
+                        torch::TensorOptions().dtype(torch::kFloat32)
+                    ).to(ctx->torchDevice);
+                    
+                    auto tensor1 = torch::from_blob(
+                        ctx->tensorB.data(),
+                        {1, 3, h, w},
+                        torch::TensorOptions().dtype(torch::kFloat32)
+                    ).to(ctx->torchDevice);
+                    
+                    auto tensorT = torch::tensor({t}, torch::TensorOptions().dtype(torch::kFloat32))
+                        .to(ctx->torchDevice);
+                    
+                    // Run inference
+                    std::vector<torch::jit::IValue> inputs;
+                    inputs.push_back(tensor0);
+                    inputs.push_back(tensor1);
+                    if (ctx->timestepInputIndex != SIZE_MAX)
+                    {
+                        inputs.push_back(tensorT);
+                    }
+                    
+                    auto output = ctx->torchModule.forward(inputs).toTensor();
+                    
+                    // Copy output back to CPU
+                    auto outputCpu = output.cpu().contiguous();
+                    const float* outData = outputCpu.data_ptr<float>();
+                    size_t pixelCount = static_cast<size_t>(w) * static_cast<size_t>(h) * 3;
+                    std::copy(outData, outData + pixelCount, ctx->tensorOut.begin());
+                }
+                catch (const std::exception& e)
+                {
+                    BackendLog(CATRA_LOG_ERROR, "interp_rife: ROCm inference failed: %s", e.what());
+                    releaseProduced();
+                    return CATRA_ERR_DEVICE;
+                }
+#else
+                BackendLog(CATRA_LOG_ERROR, "interp_rife: ROCm backend selected but PyTorch not available");
                 releaseProduced();
-                return CATRA_ERR_DEVICE;
+                return CATRA_ERR_NOT_IMPL;
+#endif
             }
+            else
+            {
+                // ONNX Runtime inference (DirectML or CPU)
+                std::vector<Ort::Value> inputs;
+                inputs.push_back(std::move(inA));
+                inputs.push_back(std::move(inB));
 
-            // Copy the model output (RGB float32) into the reusable buffer.
-            const float* outData = outputs[0].GetTensorData<float>();
-            size_t pixelCount = static_cast<size_t>(w) * static_cast<size_t>(h) * 3;
-            std::copy(outData, outData + pixelCount, ctx->tensorOut.begin());
+                // Optional arbitrary-timestep input.
+                Ort::Value tsValue{nullptr};
+                if (ctx->timestepInputIndex != SIZE_MAX)
+                {
+                    ctx->tensorTimestep.assign(1, t);
+                    const std::array<int64_t, 1> tsShape{1};
+                    tsValue = Ort::Value::CreateTensor<float>(
+                        ctx->memInfo, ctx->tensorTimestep.data(), ctx->tensorTimestep.size(),
+                        tsShape.data(), tsShape.size());
+                    inputs.push_back(std::move(tsValue));
+                }
+
+                auto outputs = ctx->session.Run(
+                    Ort::RunOptions{nullptr},
+                    ctx->inputNamePtrs.data(), inputs.data(), inputs.size(),
+                    ctx->outputNamePtrs.data(), ctx->outputNamePtrs.size());
+
+                if (outputs.empty())
+                {
+                    BackendLog(CATRA_LOG_ERROR, "interp_rife: Run returned no outputs (t=%.3f)", t);
+                    releaseProduced();
+                    return CATRA_ERR_DEVICE;
+                }
+
+                // Copy the model output (RGB float32) into the reusable buffer.
+                const float* outData = outputs[0].GetTensorData<float>();
+                size_t pixelCount = static_cast<size_t>(w) * static_cast<size_t>(h) * 3;
+                std::copy(outData, outData + pixelCount, ctx->tensorOut.begin());
+            }
 
             ID3D11Texture2D* outTex = nullptr;
             // BGRA output: the AMD RDNA 4 driver does not correctly share

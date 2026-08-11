@@ -1,5 +1,6 @@
 using CATRA.Core.Enums;
 using CATRA.Core.Interfaces;
+using CATRA.Core.Library;
 using CATRA.Core.Models;
 
 namespace CATRA.Services.Playback;
@@ -26,6 +27,17 @@ public sealed class PlaybackEngine : IPlaybackEngine
 {
     private static readonly TimeSpan DefaultPositionInterval = TimeSpan.FromMilliseconds(250);
 
+    // Keep roughly this much audio buffered ahead of the consumed position. Below
+    // the provider's 0.5 s capacity (writes beyond it are discarded) and large
+    // enough to absorb decode jitter. Video pacing is throttled by this clock,
+    // never the other way around.
+    private static readonly TimeSpan AudioAheadTarget = TimeSpan.FromMilliseconds(350);
+
+    // Refill burst cap per loop pass: bounds work when a renderer reports its
+    // position as instantly consumed (e.g. test fakes), while still topping the
+    // real buffer up to AudioAheadTarget within a pass or two.
+    private const int MaxAudioBuffersPerPass = 32;
+
     private readonly Func<IVideoDecoder> _videoDecoderFactory;
     private readonly Func<IAudioDecoder> _audioDecoderFactory;
     private readonly Func<IVideoRenderer> _videoRendererFactory;
@@ -50,6 +62,10 @@ public sealed class PlaybackEngine : IPlaybackEngine
     private Timer? _positionTimer;
 
     private TimeSpan _baseOffset = TimeSpan.Zero;
+    // Total duration handed to the audio renderer since the last flush; compared
+    // against the renderer's consumed position to know how much is still buffered.
+    private TimeSpan _audioWritten;
+    private bool _audioEof;
     private IntPtr _windowHandle;
     private int _outputWidth;
     private int _outputHeight;
@@ -156,6 +172,8 @@ public sealed class PlaybackEngine : IPlaybackEngine
             ObjectDisposedException.ThrowIf(_disposed, this);
             _windowHandle = windowHandle;
 
+            DiagnosticsLogger.Info($"[PlaybackEngine] SetOutputWindow hwnd=0x{windowHandle:X}");
+
             // The handle may arrive after Play() already created the renderer
             // unbound; bind it as soon as it becomes available so Resize and
             // Present never hit an uninitialized renderer.
@@ -174,6 +192,8 @@ public sealed class PlaybackEngine : IPlaybackEngine
             ObjectDisposedException.ThrowIf(_disposed, this);
             _outputWidth = width;
             _outputHeight = height;
+
+            DiagnosticsLogger.Info($"[PlaybackEngine] ResizeOutput {width}x{height}");
 
             // A resize can race ahead of Initialize (the window handle arrives
             // later via SetOutputWindow); bind the pending size instead of
@@ -285,6 +305,8 @@ public sealed class PlaybackEngine : IPlaybackEngine
             _videoDecoder!.Seek(target);
             _audioDecoder!.Seek(target);
             _audioRenderer!.Flush();
+            _audioWritten = TimeSpan.Zero;
+            _audioEof = false;
             _baseOffset = target;
             _clock.Set(target);
         }
@@ -345,18 +367,10 @@ public sealed class PlaybackEngine : IPlaybackEngine
                     continue;
                 }
 
-                AudioFrame? audio;
                 VideoFrame? video;
                 lock (_loopGate)
                 {
-                    audio = _audioDecoder!.ReadSamples();
-                    if (audio is not null)
-                    {
-                        _audioRenderer!.Write(audio.Samples, audio.Count);
-                        // Audio is master: re-anchor the clock to consumed samples.
-                        _clock.Set(_baseOffset + _audioRenderer.Position);
-                    }
-
+                    FeedAudio();
                     video = _videoDecoder!.ReadVideoFrame();
                 }
 
@@ -364,7 +378,7 @@ public sealed class PlaybackEngine : IPlaybackEngine
                 {
                     // Gate video on the master clock only while audio is still flowing;
                     // once audio is exhausted present remaining frames as fast as possible.
-                    if (audio is not null)
+                    if (!_audioEof)
                     {
                         await WaitUntilDueAsync(video.PresentationTime, token).ConfigureAwait(false);
                     }
@@ -382,7 +396,7 @@ public sealed class PlaybackEngine : IPlaybackEngine
                     video.Dispose();
                 }
 
-                if (audio is null && video is null)
+                if (_audioEof && video is null)
                 {
                     break; // natural end of stream
                 }
@@ -402,6 +416,52 @@ public sealed class PlaybackEngine : IPlaybackEngine
         catch (Exception ex)
         {
             HandleError("Playback failed.", ex);
+        }
+    }
+
+    /// <summary>
+    /// Keeps the audio renderer's buffer topped up to <see cref="AudioAheadTarget"/>
+    /// and re-anchors the master clock to the consumed position. Audio supply must
+    /// not be throttled by video pacing: writing exactly one buffer per presented
+    /// frame starves the renderer whenever the video period exceeds the audio
+    /// buffer period, the master clock falls behind real time, each subsequent
+    /// frame waits longer and playback grinds to a halt (positive feedback).
+    /// Caller holds <c>_loopGate</c>.
+    /// </summary>
+    private void FeedAudio()
+    {
+        if (_audioEof)
+        {
+            return;
+        }
+
+        int written = 0;
+        while (written < MaxAudioBuffersPerPass)
+        {
+            // ahead == what is still buffered in the renderer, not yet consumed.
+            TimeSpan ahead = _audioWritten - _audioRenderer!.Position;
+            if (ahead >= AudioAheadTarget)
+            {
+                return;
+            }
+
+            AudioFrame? audio = _audioDecoder!.ReadSamples();
+            if (audio is null)
+            {
+                _audioEof = true;
+                return;
+            }
+
+            _audioRenderer.Write(audio.Samples, audio.Count);
+            if (_audioDecoder.SampleRate > 0 && _audioDecoder.Channels > 0)
+            {
+                _audioWritten += TimeSpan.FromSeconds(
+                    (double)audio.Count / _audioDecoder.Channels / _audioDecoder.SampleRate);
+            }
+
+            // Audio is master: re-anchor the clock to consumed samples.
+            _clock.Set(_baseOffset + _audioRenderer.Position);
+            written++;
         }
     }
 
@@ -438,6 +498,8 @@ public sealed class PlaybackEngine : IPlaybackEngine
 
     private void HandleError(string message, Exception exception)
     {
+        DiagnosticsLogger.Error($"[PlaybackEngine] {message}", exception);
+
         // Running on the loop task itself: it must not be awaited here, so tear
         // down inline under a single lock acquisition.
         lock (_gate)
@@ -482,6 +544,8 @@ public sealed class PlaybackEngine : IPlaybackEngine
         _metadata = null;
         _audioTracks = new List<AudioTrack>();
         _baseOffset = TimeSpan.Zero;
+        _audioWritten = TimeSpan.Zero;
+        _audioEof = false;
 
         if (resetClock)
         {
@@ -502,6 +566,8 @@ public sealed class PlaybackEngine : IPlaybackEngine
         {
             int width = _outputWidth > 0 ? _outputWidth : _metadata!.Width;
             int height = _outputHeight > 0 ? _outputHeight : _metadata!.Height;
+            DiagnosticsLogger.Info(
+                $"[PlaybackEngine] Initializing renderer hwnd=0x{_windowHandle:X} size={width}x{height}");
             _videoRenderer.Initialize(_windowHandle, width, height);
             _videoRenderer.Clear();
         }

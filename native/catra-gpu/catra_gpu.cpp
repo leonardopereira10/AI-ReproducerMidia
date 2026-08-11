@@ -141,6 +141,7 @@ namespace catra {
 // Backend log shim (declared in interp_rife.h's companion): forwards to the
 // same sink as the C ABI diagnostics. Defined here so every backend TU can
 // emit through the managed callback without duplicating the plumbing.
+//
 void BackendLog(int level, const char* fmt, ...)
 {
     char buffer[512];
@@ -713,6 +714,75 @@ void catra_nv12_bgra_shutdown(void)
 {
     GuardCabiVoid([&]() {
         catra::nv12_bgra_shutdown();
+    });
+}
+
+// ===========================================================================
+// NV12 → BGRA CPU staging path — AMD RDNA 4 workaround
+// ===========================================================================
+//
+// Bypasses av_hwframe_transfer_data (which produces zeros on AMD RDNA 4 for
+// D3D11VA NV12 decoder textures) by using the proven full-texture CopyResource
+// + two Map calls mechanism in d3d_interop.cpp's ConvertNv12ToBgra11. The
+// bridge must be initialized (catra_init) so this function can use the same
+// D3D11 device + immediate context the decoder lives on.
+
+namespace catra {
+// Defined in d3d_interop.cpp. Wrapper around the anonymous-namespace
+// ConvertNv12ToBgra11. targetSlice selects the array slice.
+Microsoft::WRL::ComPtr<ID3D11Texture2D> Nv12ToBgraStaging(
+    ID3D11Texture2D* src,
+    const D3D11_TEXTURE2D_DESC& srcDesc,
+    unsigned int targetSlice);
+} // namespace catra
+
+int catra_nv12_staging_convert(void* nv12_tex,
+                               unsigned int array_slice,
+                               unsigned int width,
+                               unsigned int height,
+                               void** out_bgra_tex)
+{
+    return GuardCabi([&]() -> int {
+        if (out_bgra_tex != nullptr)
+        {
+            *out_bgra_tex = nullptr;
+        }
+        if (nv12_tex == nullptr || out_bgra_tex == nullptr)
+        {
+            log_msg(CATRA_LOG_ERROR, "catra_nv12_staging_convert: null argument");
+            return CATRA_ERR_INVALID_ARG;
+        }
+        if (!g_initialized.load() || !g_device.Get() || !g_deviceContext.Get())
+        {
+            log_msg(CATRA_LOG_ERROR,
+                    "catra_nv12_staging_convert: bridge not initialized");
+            return CATRA_ERR_INIT;
+        }
+
+        ID3D11Texture2D* src = static_cast<ID3D11Texture2D*>(nv12_tex);
+
+        D3D11_TEXTURE2D_DESC desc = {};
+        src->GetDesc(&desc);
+
+        catra::BackendLog(CATRA_LOG_INFO,
+                   "catra_nv12_staging_convert: src fmt=%d w=%u h=%u arr=%u "
+                   "bind=0x%02X slice=%u vis=%ux%u",
+                   static_cast<int>(desc.Format), desc.Width, desc.Height,
+                   desc.ArraySize, static_cast<unsigned>(desc.BindFlags),
+                   array_slice, width, height);
+
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> bgra =
+            catra::Nv12ToBgraStaging(src, desc, array_slice);
+        if (!bgra)
+        {
+            catra::BackendLog(CATRA_LOG_ERROR,
+                       "catra_nv12_staging_convert: ConvertNv12ToBgra11 failed");
+            return CATRA_ERR_DEVICE;
+        }
+
+        // Detach: caller owns the reference (catra_release_texture when done).
+        *out_bgra_tex = bgra.Detach();
+        return CATRA_OK;
     });
 }
 

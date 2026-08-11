@@ -16,6 +16,13 @@ public enum FilenamePattern
     /// <summary>P3: <c>ABREV##EP##.ext</c> → season + episode.</summary>
     Pattern3,
 
+    /// <summary>
+    /// Fansub/publisher release: <c>[Ep. NNN] Name - NT [Publisher] [Quality] [Lang].ext</c>
+    /// → name + season + episode + publisher (e.g.
+    /// <c>[Ep. 001] Martial Master - 1T [DonghuaNoSekai] [1080p] [PT-BR]</c>).
+    /// </summary>
+    PublisherRelease,
+
     /// <summary>P4: no pattern matched → use folder name + container metadata.</summary>
     Fallback,
 }

@@ -74,6 +74,12 @@ internal interface INativeLibrary
         IntPtr nv12ArrayTex, uint arraySlice, uint width, uint height,
         out IntPtr outBgraTex);
     void Nv12BgraShutdown();
+
+    // AMD RDNA 4 workaround: NV12 → BGRA via CPU staging copy.
+    // Bypasses av_hwframe_transfer_data (produces zeros on this driver).
+    // Requires bridge to be initialized (catra_init).
+    int Nv12StagingConvert(IntPtr nv12Tex, uint arraySlice,
+        uint width, uint height, out IntPtr outBgraTex);
 }
 
 /// <summary>
@@ -167,6 +173,11 @@ internal sealed class NativeLibraryLoader : INativeLibrary
 
     public void Nv12BgraShutdown() => catra_nv12_bgra_shutdown();
 
+    // AMD RDNA 4 workaround: NV12 → BGRA via CPU staging copy.
+    public int Nv12StagingConvert(IntPtr nv12Tex, uint arraySlice,
+        uint width, uint height, out IntPtr outBgraTex)
+        => catra_nv12_staging_convert(nv12Tex, arraySlice, width, height, out outBgraTex);
+
     // --- P/Invoke surface (private so CA1401 "P/Invokes should not be visible" stays silent) ---
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
@@ -233,6 +244,11 @@ internal sealed class NativeLibraryLoader : INativeLibrary
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     private static extern void catra_nv12_bgra_shutdown();
+
+    // AMD RDNA 4 workaround: NV12 → BGRA via CPU staging copy.
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int catra_nv12_staging_convert(IntPtr nv12Tex,
+        uint arraySlice, uint width, uint height, out IntPtr outBgraTex);
 }
 
 /// <summary>

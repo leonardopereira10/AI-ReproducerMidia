@@ -246,45 +246,91 @@ int nv12_bgra_convert(ID3D11Device* device,
         return CATRA_ERR_INVALID_ARG;
     }
 
-    // --- Create SRVs for the NV12 array slice ---------------------------------
-    // Y plane: DXGI_FORMAT_R8_UNORM, single array slice.
-    D3D11_SHADER_RESOURCE_VIEW_DESC ySrvDesc = {};
-    ySrvDesc.Format = DXGI_FORMAT_R8_UNORM;
-    ySrvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-    ySrvDesc.Texture2DArray.MostDetailedMip = 0;
-    ySrvDesc.Texture2DArray.MipLevels = 1;
-    ySrvDesc.Texture2DArray.FirstArraySlice = arraySlice;
-    ySrvDesc.Texture2DArray.ArraySize = 1;
+    // --- Diagnose the decoder texture ---------------------------------------
+    // The D3D11VA decoder hands back a texture whose real shape (array vs
+    // single, bind flags, sample count) is driver-dependent. Querying it first
+    // lets us both build a valid SRV and log why it would otherwise fail. A
+    // TEXTURE2DARRAY view on a non-array resource (or an SRV on a texture
+    // without BIND_SHADER_RESOURCE) is E_INVALIDARG — the classic source of the
+    // "nv12_bgra_convert: CreateSRV(Y R8) hr=0x80070057" spam seen on AMD RDNA4.
+    D3D11_TEXTURE2D_DESC texDesc = {};
+    nv12ArrayTex->GetDesc(&texDesc);
+    BackendLog(CATRA_LOG_INFO,
+               "nv12_bgra_convert: tex desc fmt=%d w=%u h=%u arr=%u bind=0x%02X "
+               "misc=0x%02X samples=%u",
+               static_cast<int>(texDesc.Format), texDesc.Width, texDesc.Height,
+               texDesc.ArraySize, static_cast<unsigned>(texDesc.BindFlags),
+               static_cast<unsigned>(texDesc.MiscFlags), texDesc.SampleDesc.Count);
 
-    ComPtr<ID3D11ShaderResourceView> ySrv;
-    HRESULT hr = device->CreateShaderResourceView(nv12ArrayTex, &ySrvDesc,
-                                                  ySrv.GetAddressOf());
-    if (FAILED(hr))
+    const bool isArray = texDesc.ArraySize > 1;
+    const UINT bind = texDesc.BindFlags;
+    if ((bind & D3D11_BIND_SHADER_RESOURCE) == 0)
     {
         BackendLog(CATRA_LOG_ERROR,
-                   "nv12_bgra_convert: CreateSRV(Y R8 slice=%u) hr=0x%08lX",
-                   arraySlice, static_cast<unsigned long>(hr));
+                   "nv12_bgra_convert: decoder texture NOT shader-bindable "
+                   "(bind=0x%02X) slice=%u",
+                   static_cast<unsigned>(bind), arraySlice);
         return CATRA_ERR_DEVICE;
     }
 
-    // UV plane: DXGI_FORMAT_R8G8_UNORM, single array slice (same texture,
-    // different format view — D3D11 allows format-compatible views of NV12).
-    D3D11_SHADER_RESOURCE_VIEW_DESC uvSrvDesc = {};
-    uvSrvDesc.Format = DXGI_FORMAT_R8G8_UNORM;
-    uvSrvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-    uvSrvDesc.Texture2DArray.MostDetailedMip = 0;
-    uvSrvDesc.Texture2DArray.MipLevels = 1;
-    uvSrvDesc.Texture2DArray.FirstArraySlice = arraySlice;
-    uvSrvDesc.Texture2DArray.ArraySize = 1;
-
+    // --- Create SRVs for the NV12 slice -------------------------------------
+    // Y plane: DXGI_FORMAT_R8_UNORM. UV plane: DXGI_FORMAT_R8G8_UNORM. The
+    // view dimension must match the resource (array vs single texture).
+    ComPtr<ID3D11ShaderResourceView> ySrv;
     ComPtr<ID3D11ShaderResourceView> uvSrv;
-    hr = device->CreateShaderResourceView(nv12ArrayTex, &uvSrvDesc,
-                                          uvSrv.GetAddressOf());
+    HRESULT hr = E_FAIL;
+
+    if (isArray)
+    {
+        D3D11_SHADER_RESOURCE_VIEW_DESC ySrvDesc = {};
+        ySrvDesc.Format = DXGI_FORMAT_R8_UNORM;
+        ySrvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+        ySrvDesc.Texture2DArray.MostDetailedMip = 0;
+        ySrvDesc.Texture2DArray.MipLevels = 1;
+        ySrvDesc.Texture2DArray.FirstArraySlice = arraySlice;
+        ySrvDesc.Texture2DArray.ArraySize = 1;
+        hr = device->CreateShaderResourceView(nv12ArrayTex, &ySrvDesc,
+                                              ySrv.GetAddressOf());
+        if (SUCCEEDED(hr))
+        {
+            D3D11_SHADER_RESOURCE_VIEW_DESC uvSrvDesc = {};
+            uvSrvDesc.Format = DXGI_FORMAT_R8G8_UNORM;
+            uvSrvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+            uvSrvDesc.Texture2DArray.MostDetailedMip = 0;
+            uvSrvDesc.Texture2DArray.MipLevels = 1;
+            uvSrvDesc.Texture2DArray.FirstArraySlice = arraySlice;
+            uvSrvDesc.Texture2DArray.ArraySize = 1;
+            hr = device->CreateShaderResourceView(nv12ArrayTex, &uvSrvDesc,
+                                                  uvSrv.GetAddressOf());
+        }
+    }
+    else
+    {
+        // Non-array texture: use a plain TEXTURE2D view (no array selector).
+        D3D11_SHADER_RESOURCE_VIEW_DESC ySrvDesc = {};
+        ySrvDesc.Format = DXGI_FORMAT_R8_UNORM;
+        ySrvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        ySrvDesc.Texture2D.MostDetailedMip = 0;
+        ySrvDesc.Texture2D.MipLevels = 1;
+        hr = device->CreateShaderResourceView(nv12ArrayTex, &ySrvDesc,
+                                              ySrv.GetAddressOf());
+        if (SUCCEEDED(hr))
+        {
+            D3D11_SHADER_RESOURCE_VIEW_DESC uvSrvDesc = {};
+            uvSrvDesc.Format = DXGI_FORMAT_R8G8_UNORM;
+            uvSrvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            uvSrvDesc.Texture2D.MostDetailedMip = 0;
+            uvSrvDesc.Texture2D.MipLevels = 1;
+            hr = device->CreateShaderResourceView(nv12ArrayTex, &uvSrvDesc,
+                                                  uvSrv.GetAddressOf());
+        }
+    }
+
     if (FAILED(hr))
     {
         BackendLog(CATRA_LOG_ERROR,
-                   "nv12_bgra_convert: CreateSRV(UV R8G8 slice=%u) hr=0x%08lX",
-                   arraySlice, static_cast<unsigned long>(hr));
+                   "nv12_bgra_convert: CreateSRV(Y/UV slice=%u arr=%d) hr=0x%08lX",
+                   arraySlice, isArray ? 1 : 0, static_cast<unsigned long>(hr));
         return CATRA_ERR_DEVICE;
     }
 

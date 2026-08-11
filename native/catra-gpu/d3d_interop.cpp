@@ -376,22 +376,45 @@ HRESULT ShareViaTempCopy(ID3D11Device* d3d11Device,
 // does not). To keep the pooled share BGRA-only, NV12 decoder frames are
 // converted to BGRA here before the pooled copy.
 //
-// Technique mirrors interp_rife.cpp TextureToTensor (proven on this driver):
-// AMD fails Map() on the NV12 UV subresource, so each plane is first copied
-// into a non-planar staging texture (R8 for Y, R8G8 for UV) and mapped there.
-// The Y/UV bytes are combined on the CPU (BT.601 full-range) into a BGRA
-// staging texture, then copied to a shader-bindable BGRA GPU texture.
+// Uses a full-texture CopyResource (proven reliable on this driver, unlike
+// CopySubresourceRegion which yields zeros for NV12 planar sources) into a
+// matching NV12 staging texture, then two separate Map calls for the Y and UV
+// subresources of the target array slice. The Y/UV bytes are combined on the
+// CPU (BT.601 full-range) into a BGRA staging texture, then copied to a
+// shader-bindable BGRA GPU texture.
+//
+// `targetSlice` selects which array slice to convert (0 for single-slice
+// textures, frame->data[1] for decoder texture arrays).
 ComPtr<ID3D11Texture2D> ConvertNv12ToBgra11(ID3D11Texture2D* src,
-                                            const D3D11_TEXTURE2D_DESC& srcDesc)
+                                            const D3D11_TEXTURE2D_DESC& srcDesc,
+                                            unsigned int targetSlice = 0)
 {
     const int w = static_cast<int>(srcDesc.Width);
     const int h = static_cast<int>(srcDesc.Height);
 
-    // NOTE: on this driver CopySubresourceRegion() from an NV12 (planar)
-    // source yields zeros, and Map() of the UV subresource fails. The reliable
-    // read is a whole-texture CopyResource into an NV12 staging followed by a
-    // single Map(subresource 0), whose mapped region spans Y then UV
-    // contiguously (UV begins h*RowPitch bytes in).
+    // NV12 staging. Two shapes exist:
+    //
+    // (a) Single-slice source (ArraySize == 1): whole-texture CopyResource
+    //     into a matching staging (proven reliable on AMD RDNA 4).
+    //
+    // (b) Decoder texture ARRAY (ArraySize > 1, e.g. FFmpeg D3D11VA pools with
+    //     ArraySize=20 on AMD RDNA 4): a NV12 staging ARRAY cannot be created
+    //     — plain CreateTexture2D of a planar-format array returns
+    //     E_INVALIDARG (0x80070057) because NV12 arrays only exist with
+    //     D3D11_BIND_DECODER, which is incompatible with USAGE_STAGING.
+    //     Allocate a SINGLE-SLICE NV12 staging and copy the target slice with
+    //     ONE CopySubresourceRegion using the slice index as the source
+    //     subresource.
+    //
+    //     CRITICAL (learned from the playback path, VideoRenderer.cs
+    //     ScaleHardwareToBgra — the ONLY verified-good NV12 read on this
+    //     driver): for planar formats the subresource index is the ARRAY
+    //     SLICE, NOT slice*2+plane. One CopySubresourceRegion(dst, 0, src,
+    //     slice) copies Y AND UV together, and a single Map(subresource 0)
+    //     exposes them contiguously (UV begins h*RowPitch bytes in, same
+    //     pitch). Per-plane copies (src subresource slice*2+1) and separate
+    //     Map()s of the UV "subresource" read ZEROS on AMD RDNA 4 — that
+    //     split-subresource model is what produced the black/green frames.
     D3D11_TEXTURE2D_DESC stDesc = srcDesc;
     stDesc.Usage = D3D11_USAGE_STAGING;
     stDesc.BindFlags = 0;
@@ -399,25 +422,82 @@ ComPtr<ID3D11Texture2D> ConvertNv12ToBgra11(ID3D11Texture2D* src,
     stDesc.MiscFlags = 0;
 
     ComPtr<ID3D11Texture2D> nvStaging;
-    HRESULT hr = g_d3d11Device->CreateTexture2D(&stDesc, nullptr, nvStaging.GetAddressOf());
-    if (FAILED(hr))
+    HRESULT hr = E_FAIL;
+    bool isSliceCopy = false;
+
+    if (srcDesc.ArraySize <= 1)
     {
-        catra::BackendLog(CATRA_LOG_ERROR, "interop: NV12 staging alloc hr=0x%08lX",
+        hr = g_d3d11Device->CreateTexture2D(&stDesc, nullptr, nvStaging.GetAddressOf());
+        if (SUCCEEDED(hr))
+        {
+            // CopyResource records the copy; Map below blocks until it completes.
+            g_d3d11Context->CopyResource(nvStaging.Get(), src);
+        }
+    }
+    else
+    {
+        // Array source: single-slice staging + whole-slice copy (slice index
+        // as subresource — mirrors VideoRenderer.ScaleHardwareToBgra).
+        stDesc.ArraySize = 1;
+        hr = g_d3d11Device->CreateTexture2D(&stDesc, nullptr, nvStaging.GetAddressOf());
+        if (SUCCEEDED(hr))
+        {
+            g_d3d11Context->CopySubresourceRegion(
+                nvStaging.Get(), 0, 0, 0, 0, src, targetSlice, nullptr);
+            isSliceCopy = true;
+        }
+    }
+
+    if (FAILED(hr) || !nvStaging)
+    {
+        catra::BackendLog(CATRA_LOG_ERROR, "interop: NV12 staging alloc/copy hr=0x%08lX",
                    static_cast<unsigned long>(hr));
         return nullptr;
     }
 
-    // Map(MAP_READ) on a staging with a pending CopyResource blocks until the
-    // GPU copy completes, so no explicit flush/wait is needed here.
-    g_d3d11Context->CopyResource(nvStaging.Get(), src);
-
+    // Map the staging. For the slice-copy path the ONLY verified-good read on
+    // this driver is a single Map(subresource 0) whose region spans Y then UV
+    // contiguously (UV at h*RowPitch) — exactly what the playback renderer
+    // does. Separate Y/UV plane maps read zeros on AMD RDNA 4, so the slice
+    // path never uses them.
+    bool singleRegionMap = isSliceCopy;
     D3D11_MAPPED_SUBRESOURCE mapY = {};
-    hr = g_d3d11Context->Map(nvStaging.Get(), 0, D3D11_MAP_READ, 0, &mapY);
-    if (FAILED(hr))
+    D3D11_MAPPED_SUBRESOURCE mapUV = {};
+
+    if (singleRegionMap)
     {
-        catra::BackendLog(CATRA_LOG_ERROR, "interop: NV12 staging map hr=0x%08lX",
-                   static_cast<unsigned long>(hr));
-        return nullptr;
+        hr = g_d3d11Context->Map(nvStaging.Get(), 0, D3D11_MAP_READ, 0, &mapY);
+        if (FAILED(hr))
+        {
+            catra::BackendLog(CATRA_LOG_ERROR,
+                       "interop: NV12 staging map hr=0x%08lX",
+                       static_cast<unsigned long>(hr));
+            return nullptr;
+        }
+        mapUV.pData = static_cast<uint8_t*>(mapY.pData) +
+                      static_cast<size_t>(h) * mapY.RowPitch;
+        mapUV.RowPitch = mapY.RowPitch;
+    }
+    else
+    {
+        hr = g_d3d11Context->Map(nvStaging.Get(), 0, D3D11_MAP_READ, 0, &mapY);
+        if (FAILED(hr))
+        {
+            catra::BackendLog(CATRA_LOG_ERROR,
+                       "interop: NV12 staging map Y hr=0x%08lX",
+                       static_cast<unsigned long>(hr));
+            return nullptr;
+        }
+        // Single-slice CopyResource path: try a separate UV map first; if the
+        // driver rejects it (known RDNA 4 quirk) reuse the contiguous layout.
+        hr = g_d3d11Context->Map(nvStaging.Get(), 1, D3D11_MAP_READ, 0, &mapUV);
+        if (FAILED(hr))
+        {
+            singleRegionMap = true;
+            mapUV.pData = static_cast<uint8_t*>(mapY.pData) +
+                          static_cast<size_t>(h) * mapY.RowPitch;
+            mapUV.RowPitch = mapY.RowPitch;
+        }
     }
 
     // BGRA staging (CPU write) + destination GPU texture.
@@ -435,7 +515,15 @@ ComPtr<ID3D11Texture2D> ConvertNv12ToBgra11(ID3D11Texture2D* src,
     hr = g_d3d11Device->CreateTexture2D(&bgraStagingDesc, nullptr, bgraStaging.GetAddressOf());
     if (FAILED(hr))
     {
-        g_d3d11Context->Unmap(nvStaging.Get(), 0);
+        if (singleRegionMap)
+        {
+            g_d3d11Context->Unmap(nvStaging.Get(), 0);
+        }
+        else
+        {
+            g_d3d11Context->Unmap(nvStaging.Get(), 1);
+            g_d3d11Context->Unmap(nvStaging.Get(), 0);
+        }
         catra::BackendLog(CATRA_LOG_ERROR, "interop: BGRA staging alloc hr=0x%08lX",
                    static_cast<unsigned long>(hr));
         return nullptr;
@@ -445,24 +533,44 @@ ComPtr<ID3D11Texture2D> ConvertNv12ToBgra11(ID3D11Texture2D* src,
     hr = g_d3d11Context->Map(bgraStaging.Get(), 0, D3D11_MAP_WRITE, 0, &mapB);
     if (FAILED(hr))
     {
-        g_d3d11Context->Unmap(nvStaging.Get(), 0);
+        if (singleRegionMap)
+        {
+            g_d3d11Context->Unmap(nvStaging.Get(), 0);
+        }
+        else
+        {
+            g_d3d11Context->Unmap(nvStaging.Get(), 1);
+            g_d3d11Context->Unmap(nvStaging.Get(), 0);
+        }
         catra::BackendLog(CATRA_LOG_ERROR, "interop: BGRA staging map hr=0x%08lX",
                    static_cast<unsigned long>(hr));
         return nullptr;
     }
 
-    const uint8_t* base = static_cast<const uint8_t*>(mapY.pData);
-    const size_t pitch = mapY.RowPitch;
-    const uint8_t* yRows = base;                          // Y plane: rows [0, h)
-    const uint8_t* uvRows = base + static_cast<size_t>(h) * pitch; // UV: [h, 1.5h)
+    const uint8_t* yBase = static_cast<const uint8_t*>(mapY.pData);
+    const uint8_t* uvBase = static_cast<const uint8_t*>(mapUV.pData);
+    const size_t yPitch = mapY.RowPitch;
+    const size_t uvPitch = mapUV.RowPitch;
+
+    // Diagnostic: log first Y/UV values to detect all-zero decoder output
+    // (the AMD RDNA 4 driver bug where NV12 reads return zeros).
+    catra::BackendLog(CATRA_LOG_INFO,
+               "[nv12conv] slice=%u Y(0,0)=%u Y(10,0)=%u Y(mid)=%u U=%u V=%u "
+               "yPitch=%zu uvPitch=%u",
+               targetSlice,
+               yBase[0], yBase[10],
+               yBase[static_cast<size_t>(h / 2) * yPitch + 10],
+               uvBase[0], uvBase[1],
+               yPitch, static_cast<unsigned>(uvPitch));
+
     auto clamp8 = [](float v) -> uint8_t {
         return v < 0.0f ? 0 : (v > 255.0f ? 255 : static_cast<uint8_t>(v + 0.5f));
     };
 
     for (int y = 0; y < h; ++y)
     {
-        const uint8_t* yPx = yRows + static_cast<size_t>(y) * pitch;
-        const uint8_t* uvPx = uvRows + static_cast<size_t>(y / 2) * pitch;
+        const uint8_t* yPx = yBase + static_cast<size_t>(y) * yPitch;
+        const uint8_t* uvPx = uvBase + static_cast<size_t>(y / 2) * uvPitch;
         uint8_t* dst = static_cast<uint8_t*>(mapB.pData) + static_cast<size_t>(y) * mapB.RowPitch;
         for (int x = 0; x < w; ++x)
         {
@@ -480,14 +588,15 @@ ComPtr<ID3D11Texture2D> ConvertNv12ToBgra11(ID3D11Texture2D* src,
         }
     }
 
-    if (getenv("CATRA_INTEROP_DEBUG"))
+    if (singleRegionMap)
     {
-        fprintf(stderr, "[nv12conv] Y(10,0)=%u Y(10,500)=%u U=%u V=%u\n",
-                yRows[10], yRows[500 * pitch + 10], uvRows[0], uvRows[1]);
-        fflush(stderr);
+        g_d3d11Context->Unmap(nvStaging.Get(), 0);
     }
-
-    g_d3d11Context->Unmap(nvStaging.Get(), 0);
+    else
+    {
+        g_d3d11Context->Unmap(nvStaging.Get(), 1);
+        g_d3d11Context->Unmap(nvStaging.Get(), 0);
+    }
     g_d3d11Context->Unmap(bgraStaging.Get(), 0);
 
     D3D11_TEXTURE2D_DESC gpuDesc = bgraStagingDesc;
@@ -565,6 +674,14 @@ void WaitForD3D11GpuIdle()
 struct Pool12Slot
 {
     ComPtr<ID3D12Resource> tex; // D3D12-native, DEFAULT heap
+    // Real GPU state of the slot. Slots are recycled round-robin: after the
+    // first upload the post-copy barrier leaves them in COMMON, so the next
+    // use must transition COMMON->COPY_DEST before writing (a copy into a
+    // COMMON resource, or a barrier whose StateBefore doesn't match the real
+    // state, is undefined behaviour — the AMD driver can silently drop the
+    // copy -> stale/zero pixels). Tracks the true state so UploadCpuTo12 can
+    // issue the correct pre/post barriers.
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST; // initial create state
 };
 
 std::vector<Pool12Slot> g_pool12;
@@ -681,21 +798,21 @@ bool ReadBack11ToCpu(ID3D11Texture2D* src, const D3D11_TEXTURE2D_DESC& d,
     }
     outPitch = d.Width * bpp;
     g_d3d11Context->Unmap(staging.Get(), 0);
-    if (getenv("CATRA_INTEROP_DEBUG"))
+    // Always log readback pixels (diagnostic for black-frame issue)
     {
         size_t mid = static_cast<size_t>(d.Height / 2) * d.Width * bpp + 40;
-        fprintf(stderr,
-                "[readback] w=%u h=%u first4=%u,%u,%u,%u mid(row%u,x10)=%u,%u,%u,%u\n",
-                d.Width, d.Height, out[0], out[1], out[2], out[3], d.Height / 2,
-                out[mid], out[mid + 1], out[mid + 2], out[mid + 3]);
-        fflush(stderr);
+        catra::BackendLog(CATRA_LOG_INFO,
+                          "[readback] w=%u h=%u first4=%u,%u,%u,%u mid(row%u,x10)=%u,%u,%u,%u",
+                          d.Width, d.Height, out[0], out[1], out[2], out[3], d.Height / 2,
+                          out[mid], out[mid + 1], out[mid + 2], out[mid + 3]);
     }
     return true;
 }
 
 // Uploads tightly-packed BGRA bytes into a D3D12-native texture on our queue.
 bool UploadCpuTo12(ID3D12Resource* dst, const D3D11_TEXTURE2D_DESC& d,
-                   const std::vector<uint8_t>& data, UINT srcPitch)
+                   const std::vector<uint8_t>& data, UINT srcPitch,
+                   D3D12_RESOURCE_STATES& slotState)
 {
     D3D12_RESOURCE_DESC rd = dst->GetDesc();
     UINT numRows = 0;
@@ -755,8 +872,26 @@ bool UploadCpuTo12(ID3D12Resource* dst, const D3D11_TEXTURE2D_DESC& d,
     srcLoc.pResource = upload.Get();
     srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     srcLoc.PlacedFootprint = fp;
+    // Pre-barrier: the slot may currently be in COMMON (left there by the
+    // previous frame's post-copy transition). Copying into a COMMON resource
+    // is undefined behaviour, so first transition (slotState)->COPY_DEST only
+    // when the tracked state says it's needed. Fresh slots are created in
+    // COPY_DEST and need no barrier on their first use.
+    if (slotState != D3D12_RESOURCE_STATE_COPY_DEST)
+    {
+        D3D12_RESOURCE_BARRIER pre = {};
+        pre.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        pre.Transition.pResource = dst;
+        pre.Transition.StateBefore = slotState;
+        pre.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        pre.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        g_cmdList->ResourceBarrier(1, &pre);
+        slotState = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+
     g_cmdList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
 
+    // Post-barrier: COPY_DEST -> COMMON so the AMF encoder can consume it.
     D3D12_RESOURCE_BARRIER bar = {};
     bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     bar.Transition.pResource = dst;
@@ -764,6 +899,7 @@ bool UploadCpuTo12(ID3D12Resource* dst, const D3D11_TEXTURE2D_DESC& d,
     bar.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
     bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     g_cmdList->ResourceBarrier(1, &bar);
+    slotState = D3D12_RESOURCE_STATE_COMMON;
     g_cmdList->Close();
 
     ID3D12CommandList* lists[] = { g_cmdList.Get() };
@@ -782,6 +918,20 @@ bool UploadCpuTo12(ID3D12Resource* dst, const D3D11_TEXTURE2D_DESC& d,
 } // namespace
 
 namespace catra {
+
+// ===========================================================================
+// NV12 → BGRA staging conversion (callable from other TUs)
+// ===========================================================================
+//
+// Thin wrapper around the anonymous-namespace ConvertNv12ToBgra11, exposed
+// so catra_gpu.cpp can offer it as a C ABI entry point (the AMD RDNA 4
+// workaround that bypasses av_hwframe_transfer_data).
+ComPtr<ID3D11Texture2D> Nv12ToBgraStaging(ID3D11Texture2D* src,
+                                          const D3D11_TEXTURE2D_DESC& srcDesc,
+                                          unsigned int targetSlice)
+{
+    return ConvertNv12ToBgra11(src, srcDesc, targetSlice);
+}
 
 // ===========================================================================
 // Lifecycle
@@ -926,6 +1076,13 @@ void interop_shutdown()
     // submitted on g_d3d12Queue by this module (the command list parks closed
     // and backends own their own queues), so no fence flush is needed here.
     DestroyPoolLocked();
+    // D3D12-native pool (CPU round-trip encode path) holds ComPtrs to the
+    // D3D12 device. Clear it here too, otherwise a re-init reuses slots from a
+    // destroyed device (EnsurePool12Locked only checks SameGeometry and would
+    // hand back stale resources -> zeros/crash).
+    g_pool12.clear();
+    g_pool12Desc = {};
+    g_pool12Index = 0;
 
     if (g_fenceEvent != nullptr)
     {
@@ -1092,7 +1249,7 @@ int interop_share_d3d11_to_d3d12(ID3D11Texture2D* src,
         BackendLog(CATRA_LOG_ERROR, "interop: pool12 D3D11 readback failed");
         return CATRA_ERR_DEVICE;
     }
-    if (!UploadCpuTo12(slot.tex.Get(), desc, cpu, srcPitch))
+    if (!UploadCpuTo12(slot.tex.Get(), desc, cpu, srcPitch, slot.state))
     {
         BackendLog(CATRA_LOG_ERROR, "interop: pool12 D3D12 upload failed");
         return CATRA_ERR_DEVICE;

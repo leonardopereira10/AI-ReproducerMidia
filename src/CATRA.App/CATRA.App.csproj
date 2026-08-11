@@ -16,22 +16,13 @@
   </ItemGroup>
 
   <!-- ST-12: deploy the native bridge DLL when it has been built.
-       scripts/build-native.ps1 installs it under native/catra-gpu/install/
-       runtimes/win-x64/native/. Copying it to the same relative path in the
-       output dir puts it on the .NET native probe path, so DllImport(
-       "catra-gpu.dll") resolves it. The Condition keeps `dotnet build` green
-       on machines where the native toolchain has not run (NativeBridge then
-       degrades to "unavailable"). -->
+       The DLL path is resolved after the native BeforeBuild runs, so the
+       Exists() check works on the FIRST build (no prior manual build needed).
+       Files are added dynamically in CopyNativeDlls target below. -->
   <PropertyGroup>
     <CatraNativeDir>$(MSBuildThisFileDirectory)..\..\native\catra-gpu\install\runtimes\win-x64\native</CatraNativeDir>
     <CatraNativeDll>$(CatraNativeDir)\catra-gpu.dll</CatraNativeDll>
   </PropertyGroup>
-  <ItemGroup Condition="Exists('$(CatraNativeDll)')">
-    <None Include="$(CatraNativeDll)" CopyToOutputDirectory="PreserveNewest" Link="runtimes\win-x64\native\catra-gpu.dll" Visible="false" />
-    <!-- ST-13: deploy ONNX Runtime DLLs next to catra-gpu.dll so the loader
-         finds the matching version (1.18.1) instead of a stale system-wide one. -->
-    <None Include="$(CatraNativeDir)\onnxruntime*.dll" CopyToOutputDirectory="PreserveNewest" Link="runtimes\win-x64\native\%(Filename)%(Extension)" Visible="false" Condition="Exists('$(CatraNativeDir)\onnxruntime.dll')" />
-  </ItemGroup>
 
   <!-- ST-27: deploy RIFE ONNX model when present in lib/rife/.
        The native bridge looks for rife_v4.onnx relative to the module directory.
@@ -56,5 +47,54 @@
          alongside the shared DLLs when the download script brought them in. -->
     <None Include="$(FfmpegLibDir)\*.exe" CopyToOutputDirectory="PreserveNewest" Link="lib\ffmpeg\%(Filename)%(Extension)" Visible="false" />
   </ItemGroup>
+
+  <!-- =====================================================================
+       NATIVE BUILD INTEGRATION (BeforeBuild target)
+       =====================================================================
+       Automatically builds the catra-gpu native bridge (C++/D3D12) before
+       building the .NET project. This ensures the native DLL is always
+       up-to-date when you press Ctrl+B / F6 in Visual Studio.
+       The script passes $(Configuration) so Debug/Release both work.
+       ===================================================================== -->
+  <Target Name="BuildNativeBridge" BeforeTargets="Build" Condition="'$(BuildingInsideVisualStudio)' == 'true' Or '$(DesignTimeBuild)' != 'true'">
+    <PropertyGroup>
+      <NativeBuildScript>$(MSBuildThisFileDirectory)..\..\scripts\build-native-vs.bat</NativeBuildScript>
+      <NativeBuildEnabled Condition="Exists('$(NativeBuildScript)')">true</NativeBuildEnabled>
+      <NativeBuildEnabled Condition="!Exists('$(NativeBuildScript)')">false</NativeBuildEnabled>
+      <CatraOutputNativeDir>$(OutDir)runtimes\win-x64\native</CatraOutputNativeDir>
+    </PropertyGroup>
+
+    <!-- Step 1: Compile the native bridge (Debug|Release) -->
+    <Message Importance="high" Text="[NativeBuild] Building catra-gpu native bridge ($(Configuration))..." Condition="'$(NativeBuildEnabled)' == 'true'" />
+    <Exec Command="&quot;$(NativeBuildScript)&quot; $(Configuration)"
+          WorkingDirectory="$(MSBuildThisFileDirectory)..\.."
+          ConsoleToMSBuild="true"
+          StandardOutputImportance="normal"
+          StandardErrorImportance="high"
+          IgnoreExitCode="false"
+          Condition="'$(NativeBuildEnabled)' == 'true'" />
+    <Message Importance="high" Text="[NativeBuild] Native build complete." Condition="'$(NativeBuildEnabled)' == 'true'" />
+    <Warning Text="[NativeBuild] build-native-vs.bat not found at $(NativeBuildScript). Skipping native build." Condition="'$(NativeBuildEnabled)' != 'true'" />
+
+    <!-- Step 2: Copy native DLLs/PDB directly into the output directory.
+         This runs inside the same target as the build, so it works on the
+         very first build (no prior DLL needed at project load time). -->
+    <MakeDir Directories="$(CatraOutputNativeDir)" Condition="'$(NativeBuildEnabled)' == 'true'" />
+    <Copy SourceFiles="$(CatraNativeDll)"
+          DestinationFolder="$(CatraOutputNativeDir)"
+          SkipUnchangedFiles="true"
+          Condition="'$(NativeBuildEnabled)' == 'true' And Exists('$(CatraNativeDll)')" />
+    <Copy SourceFiles="$(CatraNativeDir)\catra-gpu.pdb"
+          DestinationFolder="$(CatraOutputNativeDir)"
+          SkipUnchangedFiles="true"
+          Condition="'$(NativeBuildEnabled)' == 'true' And Exists('$(CatraNativeDir)\catra-gpu.pdb')" />
+    <ItemGroup Condition="'$(NativeBuildEnabled)' == 'true' And Exists('$(CatraNativeDir)\onnxruntime.dll')">
+      <_OnnxDlls Include="$(CatraNativeDir)\onnxruntime*.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_OnnxDlls)"
+          DestinationFolder="$(CatraOutputNativeDir)"
+          SkipUnchangedFiles="true"
+          Condition="'$(NativeBuildEnabled)' == 'true'" />
+  </Target>
 
 </Project>

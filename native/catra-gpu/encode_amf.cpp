@@ -485,13 +485,36 @@ int AmfEncoder::Encode(ID3D12Resource* texture, uint8_t** outBuf, int* outSize)
     // needed; AMF's encoder holds the surface reference in its internal input
     // queue (the 4-8 deep "surface pool" under USAGE_TRANSCONDING).
     
-    // Debug: log texture info before CreateSurfaceFromDX12Native
+    // Diagnostic: log full texture descriptor before CreateSurfaceFromDX12Native.
+    // This captures format, dimensions, resource flags, heap type and heap flags
+    // so we can diagnose AMF import failures without a debugger.
     ID3D12Device* texDevice = nullptr;
+    D3D12_RESOURCE_DESC texDesc = {};
+    D3D12_HEAP_PROPERTIES texHeapProps = {};
+    D3D12_HEAP_FLAGS texHeapFlags = static_cast<D3D12_HEAP_FLAGS>(0);
     if (SUCCEEDED(texture->GetDevice(IID_PPV_ARGS(&texDevice))))
     {
-        D3D12_RESOURCE_DESC desc = texture->GetDesc();
-        BackendLog(CATRA_LOG_INFO, "encode_amf: CreateSurfaceFromDX12Native texture=%p, device=%p, format=%d, width=%llu, height=%u, flags=%u",
-                   texture, texDevice, desc.Format, desc.Width, desc.Height, desc.Flags);
+        texDesc = texture->GetDesc();
+        // GetHeapProperties requires the resource to have been created with
+        // CreateCommittedResource (not placed/reserved). If it fails we just
+        // skip the heap info — the resource flags alone are usually sufficient.
+        if (FAILED(texture->GetHeapProperties(&texHeapProps, &texHeapFlags)))
+        {
+            texHeapProps.Type = static_cast<D3D12_HEAP_TYPE>(0xFF); // sentinel
+            texHeapFlags = static_cast<D3D12_HEAP_FLAGS>(0xFFFFFFFF);
+        }
+        BackendLog(CATRA_LOG_INFO,
+                   "encode_amf: CreateSurfaceFromDX12Native texture=%p device=%p "
+                   "fmt=%u(%s) %llux%u mip=%u arr=%u resFlags=0x%x heapType=%u heapFlags=0x%x",
+                   texture, texDevice,
+                   static_cast<unsigned>(texDesc.Format),
+                   texDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ? "BGRA" :
+                   texDesc.Format == DXGI_FORMAT_NV12 ? "NV12" : "other",
+                   texDesc.Width, texDesc.Height,
+                   texDesc.MipLevels, texDesc.DepthOrArraySize,
+                   static_cast<unsigned>(texDesc.Flags),
+                   static_cast<unsigned>(texHeapProps.Type),
+                   static_cast<unsigned>(texHeapFlags));
         texDevice->Release();
     }
     else
@@ -504,9 +527,173 @@ int AmfEncoder::Encode(ID3D12Resource* texture, uint8_t** outBuf, int* outSize)
     if (res != AMF_OK || surface == nullptr)
     {
         BackendLog(CATRA_LOG_ERROR,
-                   "encode_amf: CreateSurfaceFromDX12Native failed (res=%d)",
-                   static_cast<int>(res));
-        return CATRA_ERR_DEVICE;
+                   "encode_amf: CreateSurfaceFromDX12Native failed (res=%d) "
+                   "fmt=%u %llux%u resFlags=0x%x heapType=%u heapFlags=0x%x",
+                   static_cast<int>(res),
+                   static_cast<unsigned>(texDesc.Format),
+                   texDesc.Width, texDesc.Height,
+                   static_cast<unsigned>(texDesc.Flags),
+                   static_cast<unsigned>(texHeapProps.Type),
+                   static_cast<unsigned>(texHeapFlags));
+
+        // --- Fallback: AMF-allocated surface + D3D12 CopyResource -----------
+        // If CreateSurfaceFromDX12Native fails (e.g. driver quirk, unexpected
+        // resource flags), let AMF allocate its own DX12 surface and copy the
+        // caller's texture into it. This stays 100% on GPU (no CPU readback)
+        // and uses the same D3D12 device. The copy is one CopyResource on a
+        // temporary command list — cheap compared to the encode itself.
+        BackendLog(CATRA_LOG_INFO,
+                   "encode_amf: attempting AllocSurface(DX12) fallback copy");
+
+        AMFSurfacePtr allocSurface;
+        res = d.context->AllocSurface(AMF_MEMORY_DX12, AMF_SURFACE_BGRA,
+                                      static_cast<amf_int32>(texDesc.Width),
+                                      static_cast<amf_int32>(texDesc.Height),
+                                      &allocSurface);
+        if (res != AMF_OK || allocSurface == nullptr)
+        {
+            BackendLog(CATRA_LOG_ERROR,
+                       "encode_amf: AllocSurface(DX12 BGRA %llux%u) failed (res=%d)",
+                       texDesc.Width, texDesc.Height, static_cast<int>(res));
+            return CATRA_ERR_DEVICE;
+        }
+
+        // Get the native D3D12 resource from the AMF-allocated surface.
+        // AMFSurface::GetPlane(0)->GetNative() returns the ID3D12Resource*.
+        AMFPlanePtr plane = allocSurface->GetPlaneAt(0);
+        if (plane == nullptr)
+        {
+            BackendLog(CATRA_LOG_ERROR,
+                       "encode_amf: AllocSurface surface has no plane 0");
+            return CATRA_ERR_DEVICE;
+        }
+        void* nativePtr = plane->GetNative();
+        ID3D12Resource* amfRes = static_cast<ID3D12Resource*>(nativePtr);
+        if (amfRes == nullptr)
+        {
+            BackendLog(CATRA_LOG_ERROR,
+                       "encode_amf: AllocSurface plane native is null");
+            return CATRA_ERR_DEVICE;
+        }
+
+        // Log the AMF-allocated resource properties for comparison.
+        {
+            D3D12_RESOURCE_DESC amfDesc = amfRes->GetDesc();
+            D3D12_HEAP_PROPERTIES amfHp = {};
+            D3D12_HEAP_FLAGS amfHf = static_cast<D3D12_HEAP_FLAGS>(0);
+            amfRes->GetHeapProperties(&amfHp, &amfHf);
+            BackendLog(CATRA_LOG_INFO,
+                       "encode_amf: AMF-allocated surface res=%p fmt=%u %llux%u "
+                       "resFlags=0x%x heapType=%u heapFlags=0x%x",
+                       amfRes, static_cast<unsigned>(amfDesc.Format),
+                       amfDesc.Width, amfDesc.Height,
+                       static_cast<unsigned>(amfDesc.Flags),
+                       static_cast<unsigned>(amfHp.Type),
+                       static_cast<unsigned>(amfHf));
+        }
+
+        // Copy the caller's texture into the AMF surface via D3D12.
+        // Both resources are on the same device. We need a temporary command
+        // allocator + list for the copy. Use the interop module's queue.
+        {
+            // Get the D3D12 device from the texture to find the interop queue.
+            ID3D12Device* srcDev = nullptr;
+            texture->GetDevice(IID_PPV_ARGS(&srcDev));
+
+            // We need a command queue. The interop module owns one, but we
+            // don't have direct access from here. Instead, QI the texture's
+            // device and create a temporary command allocator + list.
+            // For an offline pipeline this one-time allocation per fallback
+            // frame is acceptable (the primary path never hits this).
+            ComPtr<ID3D12CommandAllocator> fbAlloc;
+            ComPtr<ID3D12GraphicsCommandList> fbCmd;
+            ComPtr<ID3D12Fence> fbFence;
+            HANDLE fbEvent = nullptr;
+            HRESULT hr = S_OK;
+
+            hr = srcDev->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(fbAlloc.GetAddressOf()));
+            if (SUCCEEDED(hr))
+            {
+                hr = srcDev->CreateCommandList(
+                    0, D3D12_COMMAND_LIST_TYPE_DIRECT, fbAlloc.Get(), nullptr,
+                    IID_PPV_ARGS(fbCmd.GetAddressOf()));
+            }
+            if (SUCCEEDED(hr))
+            {
+                hr = srcDev->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                         IID_PPV_ARGS(fbFence.GetAddressOf()));
+            }
+            if (SUCCEEDED(hr))
+            {
+                fbEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            }
+
+            if (FAILED(hr) || fbEvent == nullptr)
+            {
+                if (fbEvent) CloseHandle(fbEvent);
+                BackendLog(CATRA_LOG_ERROR,
+                           "encode_amf: fallback cmd objects hr=0x%08lX",
+                           static_cast<unsigned long>(hr));
+                if (srcDev) srcDev->Release();
+                return CATRA_ERR_DEVICE;
+            }
+
+            // Transition source to COPY_SOURCE and dest to COPY_DEST.
+            D3D12_RESOURCE_BARRIER barriers[2] = {};
+            barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barriers[0].Transition.pResource = texture;
+            barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+            barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barriers[1].Transition.pResource = amfRes;
+            barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+            barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+
+            fbCmd->ResourceBarrier(2, barriers);
+            fbCmd->CopyResource(amfRes, texture);
+
+            // Transition both back to COMMON.
+            barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+            barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+            fbCmd->ResourceBarrier(2, barriers);
+            fbCmd->Close();
+
+            // We need a command queue to execute on. Create a temporary one.
+            ComPtr<ID3D12CommandQueue> fbQueue;
+            D3D12_COMMAND_QUEUE_DESC qd = {};
+            qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            hr = srcDev->CreateCommandQueue(&qd, IID_PPV_ARGS(fbQueue.GetAddressOf()));
+            if (FAILED(hr))
+            {
+                CloseHandle(fbEvent);
+                BackendLog(CATRA_LOG_ERROR,
+                           "encode_amf: fallback queue hr=0x%08lX",
+                           static_cast<unsigned long>(hr));
+                srcDev->Release();
+                return CATRA_ERR_DEVICE;
+            }
+
+            ID3D12CommandList* lists[] = { fbCmd.Get() };
+            fbQueue->ExecuteCommandLists(1, lists);
+            fbQueue->Signal(fbFence.Get(), 1);
+            if (fbFence->GetCompletedValue() < 1)
+            {
+                fbFence->SetEventOnCompletion(1, fbEvent);
+                WaitForSingleObject(fbEvent, 5000);
+            }
+
+            CloseHandle(fbEvent);
+            srcDev->Release();
+        }
+
+        surface = allocSurface;
+        BackendLog(CATRA_LOG_INFO,
+                   "encode_amf: fallback copy succeeded, using AMF-allocated surface");
     }
 
     // --- Submit + query one output -----------------------------------------

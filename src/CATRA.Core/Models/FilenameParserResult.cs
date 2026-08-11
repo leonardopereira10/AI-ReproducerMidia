@@ -21,6 +21,13 @@ public sealed record FilenameParserResult
     /// <summary>Episode number (P1/P2/P3); <c>null</c> for fallback.</summary>
     public int? EpisodeNumber { get; init; }
 
+    /// <summary>
+    /// Release group / fansub / publisher tag (e.g. <c>DonghuaNoSekai</c>),
+    /// captured by <see cref="FilenamePattern.PublisherRelease"/>; <c>null</c> otherwise.
+    /// Kept verbatim (not title-cased) to preserve the group's original casing.
+    /// </summary>
+    public string? Publisher { get; init; }
+
     /// <summary>Which pattern matched.</summary>
     public FilenamePattern PatternUsed { get; init; }
 }

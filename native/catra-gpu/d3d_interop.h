@@ -165,6 +165,16 @@ int interop_copy_d3d11(ID3D11DeviceContext* ctx,
 // Idempotent. Call BEFORE releasing the caller's D3D11 device.
 void interop_shutdown();
 
+// NV12 → BGRA conversion via full-texture CopyResource + two Map calls.
+// AMD RDNA 4 workaround: bypasses av_hwframe_transfer_data (which produces
+// zeros for D3D11VA NV12 decoder textures on this driver). Uses the bridge's
+// D3D11 device + immediate context (must be initialized via interop_init).
+// Returns a standalone BGRA texture (ArraySize==1, caller owns the ref)
+// or nullptr on failure.
+ComPtr<ID3D11Texture2D> Nv12ToBgraStaging(ID3D11Texture2D* src,
+                                          const D3D11_TEXTURE2D_DESC& srcDesc,
+                                          unsigned int targetSlice);
+
 } // namespace catra
 
 #endif // CATRA_D3D_INTEROP_H

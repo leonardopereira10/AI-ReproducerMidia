@@ -11,6 +11,17 @@ project(catra-gpu
     DESCRIPTION "CATRA GPU native bridge (FSR 4, RIFE, AMF, DX12)"
     LANGUAGES CXX)
 
+# Default install prefix: relative to repo root so the BeforeBuild script and
+# manual `cmake --install` both land the DLL in the .NET probe path without
+# needing --prefix. Without this, CMake defaults to C:/Program Files (x86)/...
+# which requires admin rights and silently fails from Visual Studio.
+# Also overrides a stale cache entry pointing at Program Files.
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT
+   OR CMAKE_INSTALL_PREFIX MATCHES "[Pp]rogram [Ff]iles")
+    set(CMAKE_INSTALL_PREFIX "${CMAKE_SOURCE_DIR}/install"
+        CACHE PATH "Install path for catra-gpu DLL" FORCE)
+endif()
+
 # --- Language / toolchain ---------------------------------------------------
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -83,7 +94,113 @@ if(CATRA_WITH_RIFE)
     endif()
 endif()
 
-# --- DirectML execution provider (RIFE GPU acceleration, ST-13) -------------
+# --- PyTorch / ROCm (RIFE GPU acceleration, alternative to DirectML) --------
+# PyTorch with ROCm support provides an alternative GPU execution path for RIFE
+# inference. When both DirectML and ROCm are available, the runtime selects
+# DirectML first (more stable on Windows), then ROCm, then CPU fallback.
+# PyTorch is OPTIONAL; when absent the bridge uses DirectML/CPU only.
+option(CATRA_USE_PYTORCH "Enable PyTorch/libtorch backend for RIFE (ROCm support)" ON)
+
+set(CATRA_HAS_PYTORCH FALSE)
+if(CATRA_USE_PYTORCH)
+    # Try to find libtorch (PyTorch C++ API)
+    # Detection strategy:
+    #   1. Check CMake Torch_DIR variable (for standalone libtorch)
+    #   2. Check LIBTORCH_DIR environment variable
+    #   3. Try to find PyTorch in Python site-packages
+    #   4. Check common installation paths
+    
+    set(TORCH_FOUND FALSE)
+    set(TORCH_INCLUDE_DIRS "")
+    set(TORCH_LIBRARIES "")
+    
+    # Method 1: Check if Torch_DIR is set (standalone libtorch)
+    if(DEFINED Torch_DIR AND EXISTS "${Torch_DIR}/TorchConfig.cmake")
+        find_package(Torch QUIET PATHS "${Torch_DIR}")
+        if(TORCH_FOUND)
+            message(STATUS "catra-gpu: Found libtorch (standalone) at ${Torch_DIR}")
+        endif()
+    endif()
+    
+    # Method 2: Check LIBTORCH_DIR environment variable
+    if(NOT TORCH_FOUND AND DEFINED ENV{LIBTORCH_DIR})
+        set(ENV_LIBTORCH_DIR "$ENV{LIBTORCH_DIR}")
+        if(EXISTS "${ENV_LIBTORCH_DIR}/share/cmake/Torch/TorchConfig.cmake")
+            find_package(Torch QUIET PATHS "${ENV_LIBTORCH_DIR}/share/cmake/Torch")
+            if(TORCH_FOUND)
+                message(STATUS "catra-gpu: Found libtorch at $ENV{LIBTORCH_DIR}")
+            endif()
+        endif()
+    endif()
+    
+    # Method 3: Try to find PyTorch in Python site-packages
+    if(NOT TORCH_FOUND)
+        execute_process(
+            COMMAND python -c "import torch; import os; print(os.path.dirname(torch.__file__))"
+            OUTPUT_VARIABLE PYTORCH_PATH
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+            RESULT_VARIABLE PYTORCH_RESULT
+        )
+        
+        if(PYTORCH_RESULT EQUAL 0 AND EXISTS "${PYTORCH_PATH}")
+            message(STATUS "catra-gpu: Found PyTorch in Python at ${PYTORCH_PATH}")
+            
+            # Check if torch include directory exists AND has the required headers
+            if(EXISTS "${PYTORCH_PATH}/include/torch/torch.h")
+                set(TORCH_INCLUDE_DIRS "${PYTORCH_PATH}/include")
+                
+                # Find torch library (Windows: torch.lib, torch_cpu.lib, torch_cuda.lib)
+                if(EXISTS "${PYTORCH_PATH}/lib/torch_cpu.lib")
+                    set(TORCH_LIBRARIES "${PYTORCH_PATH}/lib/torch_cpu.lib")
+                    if(EXISTS "${PYTORCH_PATH}/lib/torch_cuda.lib")
+                        list(APPEND TORCH_LIBRARIES "${PYTORCH_PATH}/lib/torch_cuda.lib")
+                    endif()
+                    set(TORCH_FOUND TRUE)
+                    message(STATUS "catra-gpu: Using PyTorch from Python installation")
+                else()
+                    message(STATUS "catra-gpu: PyTorch found but torch_cpu.lib missing -> disabled")
+                endif()
+            else()
+                message(STATUS "catra-gpu: PyTorch found but headers incomplete (torch/torch.h missing)")
+                message(STATUS "catra-gpu: pip-installed PyTorch does not include C++ API headers")
+                message(STATUS "catra-gpu: Download libtorch from https://pytorch.org/get-started/locally/")
+            endif()
+        endif()
+    endif()
+    
+    # Method 4: Check common paths
+    if(NOT TORCH_FOUND)
+        set(TORCH_SEARCH_PATHS
+            "C:/pytorch/libtorch"
+            "C:/libtorch"
+            "$ENV{USERPROFILE}/libtorch"
+        )
+        
+        foreach(SEARCH_PATH ${TORCH_SEARCH_PATHS})
+            if(EXISTS "${SEARCH_PATH}/share/cmake/Torch/TorchConfig.cmake")
+                find_package(Torch QUIET PATHS "${SEARCH_PATH}/share/cmake/Torch")
+                if(TORCH_FOUND)
+                    message(STATUS "catra-gpu: Found libtorch at ${SEARCH_PATH}")
+                    break()
+                endif()
+            endif()
+        endforeach()
+    endif()
+    
+    if(TORCH_FOUND)
+        set(CATRA_HAS_PYTORCH TRUE)
+        message(STATUS "catra-gpu: PyTorch/libtorch found -> ROCm backend enabled")
+        if(DEFINED TORCH_VERSION)
+            message(STATUS "catra-gpu: PyTorch version: ${TORCH_VERSION}")
+        endif()
+    else()
+        message(STATUS "catra-gpu: PyTorch/libtorch NOT found -> ROCm backend disabled")
+        message(STATUS "catra-gpu: To enable:")
+        message(STATUS "catra-gpu:   1. Install PyTorch: .\\scripts\\install-pytorch-rocm.ps1")
+        message(STATUS "catra-gpu:   2. Or download libtorch from https://pytorch.org/get-started/locally/")
+    endif()
+endif()
 # interp_rife.cpp requests the DirectML EP (via the C export
 # OrtSessionOptionsAppendExecutionProvider_DML loaded through GetProcAddress)
 # only when USE_DML is defined. The detection below checks for the presence of
@@ -147,6 +264,35 @@ add_library(catra-gpu SHARED
 
 target_include_directories(catra-gpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
+# Link PyTorch/libtorch if found (ROCm backend)
+if(CATRA_HAS_PYTORCH)
+    target_compile_definitions(catra-gpu PRIVATE CATRA_HAS_PYTORCH=1)
+    
+    # Include PyTorch headers
+    if(TORCH_INCLUDE_DIRS)
+        target_include_directories(catra-gpu PRIVATE ${TORCH_INCLUDE_DIRS})
+    endif()
+    
+    # Link PyTorch libraries
+    # When using find_package(Torch), TORCH_LIBRARIES is set automatically
+    # When using Python pip install, we manually set the library paths
+    if(TORCH_LIBRARIES)
+        target_link_libraries(catra-gpu PRIVATE ${TORCH_LIBRARIES})
+    elseif(TORCH_FOUND)
+        # find_package(Torch) was successful, use its targets
+        target_link_libraries(catra-gpu PRIVATE torch torch_cpu)
+        if(TORCH_CUDA_FOUND)
+            target_link_libraries(catra-gpu PRIVATE torch_cuda)
+        endif()
+    endif()
+    
+    # Copy PyTorch DLLs to output directory (Windows only)
+    if(WIN32 AND DEFINED PYTORCH_PATH)
+        file(GLOB PYTORCH_DLLS "${PYTORCH_PATH}/lib/*.dll")
+        install(FILES ${PYTORCH_DLLS} DESTINATION runtimes/win-x64/native OPTIONAL)
+    endif()
+endif()
+
 target_compile_definitions(catra-gpu PRIVATE CATRA_GPU_BUILDING)
 
 if(MSVC)
@@ -154,6 +300,19 @@ if(MSVC)
     # promoted to errors to keep the native build as strict as the C# one.
     target_compile_options(catra-gpu PRIVATE /W4 /WX /permissive- /utf-8 /EHsc)
     target_compile_definitions(catra-gpu PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # --- Architecture optimizations (AMD RDNA 4 / RX 9070 XT) ---------------
+    # Enable AVX2 instruction set for vectorized operations. RDNA 4 GPUs support
+    # AVX2 via the CPU they run on (most modern AMD CPUs support AVX2).
+    # This accelerates CPU-side compute (e.g., NV12->BGRA conversion, color math).
+    target_compile_options(catra-gpu PRIVATE /arch:AVX2)
+
+    # Release-specific optimizations: maximum speed, whole-program optimization.
+    # /O2 = maximize speed, /GL = whole-program optimization (link-time code gen).
+    # These are applied per-configuration so Debug builds remain debuggable.
+    target_compile_options(catra-gpu PRIVATE $<$<CONFIG:Release>:/O2 /GL>)
+    # Link-time optimization for Release builds: enables cross-module inlining.
+    set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} /LTCG")
 endif()
 
 # System import libs ship with the Windows SDK. d3dcompiler provides
@@ -178,13 +337,13 @@ if(MSVC)
     target_compile_options(catra-interop-test PRIVATE /W3 /utf-8 /EHsc)
     target_compile_definitions(catra-interop-test PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
-target_link_libraries(catra-interop-test PRIVATE d3d12 dxgi d3d11 dxguid)
+target_link_libraries(catra-interop-test PRIVATE d3d12 dxgi d3d11 dxguid d3dcompiler)
 if(TARGET Microsoft::DirectX-Headers)
     target_link_libraries(catra-interop-test PRIVATE Microsoft::DirectX-Headers)
 endif()
 # The RIFE stage of the diagnostic tool needs ONNX Runtime (+DirectML) just
 # like the main DLL.
-target_sources(catra-interop-test PRIVATE interp_rife.cpp)
+target_sources(catra-interop-test PRIVATE interp_rife.cpp upscale_fsr1.cpp)
 if(CATRA_ONNXRUNTIME_TARGET)
     target_compile_definitions(catra-interop-test PRIVATE CATRA_HAS_ONNXRUNTIME=1)
     target_link_libraries(catra-interop-test PRIVATE ${CATRA_ONNXRUNTIME_TARGET})
@@ -316,6 +475,14 @@ install(TARGETS catra-gpu
     RUNTIME DESTINATION runtimes/win-x64/native
     LIBRARY DESTINATION runtimes/win-x64/native
     ARCHIVE DESTINATION lib)
+
+# Install PDB (debug symbols) alongside the DLL so Visual Studio can
+# debug into the native bridge code. Only present in Debug builds.
+if(MSVC)
+    install(FILES "$<TARGET_PDB_FILE:catra-gpu>"
+        DESTINATION runtimes/win-x64/native
+        OPTIONAL)
+endif()
 
 # Deploy the ONNX Runtime (+ DirectML) DLLs next to catra-gpu.dll so the loader
 # finds them at runtime. Best-effort: skipped silently when the location cannot

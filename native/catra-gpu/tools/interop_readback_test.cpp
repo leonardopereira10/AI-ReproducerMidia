@@ -10,12 +10,13 @@
 #include "../d3d_interop.h"
 #include "../encode_amf.h"
 #include "../interp_rife.h"
+#include "../upscale_fsr1.h"
 
 #include <d3d11.h>
 #include <d3d12.h>
+#include <d3dcompiler.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
-
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -424,14 +425,304 @@ bool TestRifeEncodePath()
     return true;
 }
 
+void DumpD3D12ValidationMessages()
+{
+    ComPtr<ID3D12InfoQueue> iq;
+    if (FAILED(g_d12->QueryInterface(IID_PPV_ARGS(&iq))) || !iq)
+    {
+        fprintf(stderr, "[diag] no ID3D12InfoQueue\n");
+        return;
+    }
+    UINT64 n = iq->GetNumStoredMessages();
+    fprintf(stderr, "[diag] %llu D3D12 validation messages\n",
+            (unsigned long long)n);
+    for (UINT64 i = 0; i < n && i < 40; ++i)
+    {
+        SIZE_T len = 0;
+        iq->GetMessage(i, nullptr, &len);
+        std::vector<char> buf(len);
+        if (SUCCEEDED(iq->GetMessage(i, reinterpret_cast<D3D12_MESSAGE*>(buf.data()), &len)))
+        {
+            auto* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+            fprintf(stderr, "[diag] #%llu sev=%d id=%d: %.*s\n",
+                    (unsigned long long)i, (int)msg->Severity, (int)msg->ID,
+                    (int)msg->DescriptionByteLength, msg->pDescription);
+        }
+    }
+    iq->ClearStoredMessages();
+}
+
+bool TestMinimalCompute()
+{
+    // Mirrors FSR1's exact resource/descriptor setup but with a trivial shader
+    // that writes a constant. Isolates whether ANY D3D12 compute UAV write
+    // lands on this driver.
+    ComPtr<ID3D12Device> dev = g_d12;
+    const char* hlsl =
+        "RWTexture2D<float4> Out : register(u0);\n"
+        "[numthreads(16,16,1)] void CSMain(uint3 gid : SV_DispatchThreadID)\n"
+        "{ Out[int2(gid.xy)] = float4(1.0,0.0,1.0,1.0); }\n";
+    ComPtr<ID3DBlob> blob, err;
+    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "min", nullptr, nullptr, "CSMain",
+                            "cs_5_1", 0, 0, blob.GetAddressOf(), err.GetAddressOf());
+    if (FAILED(hr)) { fprintf(stderr, "[MIN] compile fail\n"); return false; }
+
+    // Root sig: single UAV descriptor table.
+    D3D12_DESCRIPTOR_RANGE range = {};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    range.NumDescriptors = 1;
+    range.BaseShaderRegister = 0;
+    D3D12_ROOT_PARAMETER param = {};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    param.DescriptorTable.NumDescriptorRanges = 1;
+    param.DescriptorTable.pDescriptorRanges = &range;
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    rsd.NumParameters = 1; rsd.pParameters = &param;
+    ComPtr<ID3DBlob> rsBlob, rsErr;
+    D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1,
+                                rsBlob.GetAddressOf(), rsErr.GetAddressOf());
+    ComPtr<ID3D12RootSignature> rs;
+    dev->CreateRootSignature(0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(),
+                             IID_PPV_ARGS(&rs));
+    D3D12_COMPUTE_PIPELINE_STATE_DESC psd = {};
+    psd.pRootSignature = rs.Get();
+    psd.CS = { blob->GetBufferPointer(), blob->GetBufferSize() };
+    ComPtr<ID3D12PipelineState> pso;
+    dev->CreateComputePipelineState(&psd, IID_PPV_ARGS(&pso));
+
+    const UINT W = 256, H = 256;
+    D3D12_RESOURCE_DESC od = {};
+    od.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    od.Width = W; od.Height = H; od.DepthOrArraySize = 1; od.MipLevels = 1;
+    od.Format = DXGI_FORMAT_B8G8R8A8_UNORM; od.SampleDesc.Count = 1;
+    od.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    D3D12_HEAP_PROPERTIES dhp = {}; dhp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    ComPtr<ID3D12Resource> uav;
+    dev->CreateCommittedResource(&dhp, D3D12_HEAP_FLAG_NONE, &od,
+                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                 IID_PPV_ARGS(&uav));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 1;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap));
+    dev->CreateUnorderedAccessView(uav.Get(), nullptr, nullptr,
+                                   heap->GetCPUDescriptorHandleForHeapStart());
+
+    ComPtr<ID3D12CommandAllocator> alloc;
+    ComPtr<ID3D12GraphicsCommandList> cl;
+    ComPtr<ID3D12CommandQueue> q;
+    D3D12_COMMAND_QUEUE_DESC qd = {}; qd.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q));
+    dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&alloc));
+    dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, alloc.Get(),
+                           pso.Get(), IID_PPV_ARGS(&cl));
+    cl->SetComputeRootSignature(rs.Get());
+    ID3D12DescriptorHeap* heaps[] = { heap.Get() };
+    cl->SetDescriptorHeaps(1, heaps);
+    cl->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    cl->Dispatch(W / 16, H / 16, 1);
+    cl->Close();
+    ID3D12CommandList* lists[] = { cl.Get() };
+    q->ExecuteCommandLists(1, lists);
+    ComPtr<ID3D12Fence> f; dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f));
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    q->Signal(f.Get(), 1);
+    if (f->GetCompletedValue() < 1) { f->SetEventOnCompletion(1, ev); WaitForSingleObject(ev, 5000); }
+
+    // Read back.
+    std::vector<UINT64> rp; auto data = ReadBack12(uav.Get(), 1, rp);
+    const uint8_t* px = data.data() + (size_t)(H / 2) * rp[0] + (size_t)(W / 2) * 4;
+    fprintf(stderr, "[MIN] centre=%u,%u,%u,%u (expect 255,0,255,255)\n",
+            px[0], px[1], px[2], px[3]);
+    CloseHandle(ev);
+    return px[0] > 200 && px[2] > 200;
+}
+
+bool TestSrvCompute()
+{
+    // Minimal compute + SRV read + input COMMON->NON_PIXEL barrier, mirroring
+    // FSR1's additions over TestMinimalCompute. Isolates whether the SRV/barrier
+    // combo is what kills the UAV write on this driver.
+    ComPtr<ID3D12Device> dev = g_d12;
+    const char* hlsl =
+        "Texture2D<float4> In : register(t0);\n"
+        "RWTexture2D<float4> Out : register(u0);\n"
+        "[numthreads(16,16,1)] void CSMain(uint3 gid : SV_DispatchThreadID)\n"
+        "{ Out[int2(gid.xy)] = In.Load(int3((int)gid.x,(int)gid.y,0)); }\n";
+    ComPtr<ID3DBlob> blob, err;
+    D3DCompile(hlsl, strlen(hlsl), "srv", nullptr, nullptr, "CSMain", "cs_5_1", 0, 0,
+               blob.GetAddressOf(), err.GetAddressOf());
+
+    D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; ranges[0].NumDescriptors = 1;
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; ranges[1].NumDescriptors = 1;
+    D3D12_ROOT_PARAMETER param = {};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    param.DescriptorTable.NumDescriptorRanges = 2;
+    param.DescriptorTable.pDescriptorRanges = ranges;
+    D3D12_ROOT_SIGNATURE_DESC rsd = {}; rsd.NumParameters = 1; rsd.pParameters = &param;
+    ComPtr<ID3DBlob> rsBlob, rsErr;
+    D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, rsBlob.GetAddressOf(), rsErr.GetAddressOf());
+    ComPtr<ID3D12RootSignature> rs;
+    dev->CreateRootSignature(0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(), IID_PPV_ARGS(&rs));
+    D3D12_COMPUTE_PIPELINE_STATE_DESC psd = {}; psd.pRootSignature = rs.Get();
+    psd.CS = { blob->GetBufferPointer(), blob->GetBufferSize() };
+    ComPtr<ID3D12PipelineState> pso; dev->CreateComputePipelineState(&psd, IID_PPV_ARGS(&pso));
+
+    const UINT W = 256, H = 256;
+    // Input texture: upload a pattern via a staging->default copy on D3D12.
+    D3D12_HEAP_PROPERTIES dhp = {}; dhp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; td.Width = W; td.Height = H;
+    td.DepthOrArraySize = 1; td.MipLevels = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    ComPtr<ID3D12Resource> inTex;
+    dev->CreateCommittedResource(&dhp, D3D12_HEAP_FLAG_NONE, &td,
+                                 D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&inTex));
+    // Fill via upload buffer.
+    D3D12_RESOURCE_DESC rd = inTex->GetDesc();
+    UINT rows; UINT64 rowSize, total; D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
+    dev->GetCopyableFootprints(&rd, 0, 1, 0, &fp, &rows, &rowSize, &total);
+    D3D12_HEAP_PROPERTIES uhp = {}; uhp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bd = {}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = total; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> up; dev->CreateCommittedResource(&uhp, D3D12_HEAP_FLAG_NONE, &bd,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&up));
+    uint8_t* mp; up->Map(0, nullptr, (void**)&mp);
+    for (UINT y = 0; y < H; y++)
+        for (UINT x = 0; x < W; x++) {
+            uint8_t* p = mp + fp.Offset + y * fp.Footprint.RowPitch + x * 4;
+            p[0] = (uint8_t)x; p[1] = (uint8_t)y; p[2] = 200; p[3] = 255;
+        }
+    up->Unmap(0, nullptr);
+
+    D3D12_RESOURCE_DESC od = td; od.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ComPtr<ID3D12Resource> uav;
+    dev->CreateCommittedResource(&dhp, D3D12_HEAP_FLAG_NONE, &od,
+                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&uav));
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {}; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 2; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    ComPtr<ID3D12DescriptorHeap> heap; dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap));
+    UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE h0 = heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd = {}; sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; sd.Texture2D.MipLevels = 1;
+    dev->CreateShaderResourceView(inTex.Get(), &sd, h0);
+    D3D12_CPU_DESCRIPTOR_HANDLE h1 = { h0.ptr + inc };
+    dev->CreateUnorderedAccessView(uav.Get(), nullptr, nullptr, h1);
+
+    ComPtr<ID3D12CommandQueue> q; D3D12_COMMAND_QUEUE_DESC qd = {}; qd.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q));
+    ComPtr<ID3D12CommandAllocator> alloc;
+    dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&alloc));
+    ComPtr<ID3D12GraphicsCommandList> cl;
+    dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, alloc.Get(), pso.Get(), IID_PPV_ARGS(&cl));
+    cl->SetComputeRootSignature(rs.Get());
+    ID3D12DescriptorHeap* heaps[] = { heap.Get() };
+    cl->SetDescriptorHeaps(1, heaps);
+    cl->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    // Upload the pattern into inTex first: COMMON->COPY_DEST, copy,
+    // COPY_DEST->NON_PIXEL (then the dispatch reads it).
+    D3D12_RESOURCE_BARRIER ub = {}; ub.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    ub.Transition.pResource = inTex.Get(); ub.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    ub.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    ub.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    cl->ResourceBarrier(1, &ub);
+    D3D12_TEXTURE_COPY_LOCATION dstL = {}; dstL.pResource = inTex.Get();
+    dstL.Type = static_cast<D3D12_TEXTURE_COPY_TYPE>(0); dstL.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION srcL = {}; srcL.pResource = up.Get();
+    srcL.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; srcL.PlacedFootprint = fp;
+    cl->CopyTextureRegion(&dstL, 0, 0, 0, &srcL, nullptr);
+    D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = inTex.Get(); b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    cl->ResourceBarrier(1, &b);
+    cl->Dispatch(W / 16, H / 16, 1);
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    cl->ResourceBarrier(1, &b);
+    cl->Close();
+    ID3D12CommandList* lists[] = { cl.Get() };
+    q->ExecuteCommandLists(1, lists);
+    ComPtr<ID3D12Fence> f; dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f));
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    q->Signal(f.Get(), 1);
+    if (f->GetCompletedValue() < 1) { f->SetEventOnCompletion(1, ev); WaitForSingleObject(ev, 5000); }
+
+    std::vector<UINT64> rp; auto data = ReadBack12(uav.Get(), 1, rp);
+    const uint8_t* px = data.data() + (size_t)(H / 2) * rp[0] + (size_t)(W / 2) * 4;
+    fprintf(stderr, "[SRV] centre=%u,%u,%u,%u (expect ~128,128,200,255)\n", px[0], px[1], px[2], px[3]);
+    CloseHandle(ev);
+    return px[2] > 100;
+}
+
+bool TestFsr1Upscale()
+{
+    const int sw = 960, sh = 540, dw = 1280, dh = 720;
+    ComPtr<ID3D11Texture2D> src = MakePattern11(DXGI_FORMAT_B8G8R8A8_UNORM, sw, sh);
+
+    std::unique_ptr<catra::Fsr1Upscaler> up;
+    int rc = catra::Fsr1Upscaler::Create(g_d11.Get(), sw, sh, dw, dh, up);
+    if (rc != 0 || !up) { fprintf(stderr, "[FSR1] FAIL create rc=%d\n", rc); return false; }
+
+    ID3D12Resource* out = nullptr;
+    rc = up->Process(src.Get(), &out);
+    if (rc != 0 || !out) { fprintf(stderr, "[FSR1] FAIL process rc=%d\n", rc); return false; }
+    {
+        HRESULT rem = g_d12->GetDeviceRemovedReason();
+        fprintf(stderr, "[FSR1] post-process deviceRemoved=0x%08lX\n",
+                (unsigned long)rem);
+    }
+
+    std::vector<UINT64> pitches;
+    auto data = ReadBack12(out, 1, pitches);
+    // Sample centre + a few points; count non-black pixels.
+    const UINT rp = static_cast<UINT>(pitches[0]);
+    long nonblack = 0, total = 0;
+    for (int y = 0; y < dh; y += 8)
+    {
+        for (int x = 0; x < dw; x += 8)
+        {
+            const uint8_t* px = data.data() + (size_t)y * rp + (size_t)x * 4;
+            ++total;
+            if (px[0] > 8 || px[1] > 8 || px[2] > 8) ++nonblack;
+        }
+    }
+    const uint8_t* c = data.data() + (size_t)(dh / 2) * rp + (size_t)(dw / 2) * 4;
+    fprintf(stderr, "[FSR1] centre=%u,%u,%u,%u nonblack=%ld/%ld\n",
+            c[0], c[1], c[2], c[3], nonblack, total);
+    out->Release();
+    bool ok = nonblack > total / 2;
+    fprintf(stderr, "[FSR1] %s\n", ok ? "PASS" : "FAIL-BLACK");
+    return ok;
+}
+
 int main()
 {
+    // D3D12 debug layer BEFORE any device creation: the FSR1 dispatch drops
+    // UAV writes on this driver and we need the validation messages to see
+    // why. Messages are pulled from ID3D12InfoQueue after Process().
+    ComPtr<ID3D12Debug> dbg;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg))))
+    {
+        dbg->EnableDebugLayer();
+        fprintf(stderr, "[diag] D3D12 debug layer enabled\n");
+    }
     InitDevices();
+    bool minc = TestMinimalCompute();
+    fprintf(stderr, "[MIN] %s\n", minc ? "PASS" : "FAIL");
+    bool fsr1 = TestFsr1Upscale();
+    DumpD3D12ValidationMessages();
     bool bgra = TestFormat(DXGI_FORMAT_B8G8R8A8_UNORM, "BGRA", 1);
     bool nv12 = TestFormat(DXGI_FORMAT_NV12, "NV12", 2);
     bool amf = TestAmfEncode();
     bool rife = TestRifeEncodePath();
-    fprintf(stderr, "RESULT: BGRA=%s NV12=%s AMF=%s RIFE=%s\n", bgra ? "PASS" : "FAIL",
-            nv12 ? "PASS" : "FAIL", amf ? "PASS" : "FAIL", rife ? "PASS" : "FAIL");
-    return (bgra && nv12 && amf && rife) ? 0 : 2;
+    fprintf(stderr, "RESULT: BGRA=%s NV12=%s AMF=%s RIFE=%s FSR1=%s\n", bgra ? "PASS" : "FAIL",
+            nv12 ? "PASS" : "FAIL", amf ? "PASS" : "FAIL", rife ? "PASS" : "FAIL", fsr1 ? "PASS" : "FAIL");
+    return (bgra && nv12 && amf && rife && fsr1) ? 0 : 2;
 }

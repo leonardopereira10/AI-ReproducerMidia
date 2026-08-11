@@ -445,7 +445,7 @@ public sealed class LibraryScanner : ILibraryScanner
     private static string BuildDisplayTitle(FilenameParserResult parse, string folderTitle) =>
         parse.PatternUsed switch
         {
-            FilenamePattern.Pattern1 or FilenamePattern.Pattern2
+            FilenamePattern.Pattern1 or FilenamePattern.Pattern2 or FilenamePattern.PublisherRelease
                 => $"Episódio {parse.EpisodeNumber ?? 0}",
             FilenamePattern.Pattern3
                 => $"S{(parse.SeasonNumber ?? 1):D2}E{(parse.EpisodeNumber ?? 0):D2}",

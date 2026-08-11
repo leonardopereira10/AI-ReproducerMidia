@@ -505,7 +505,8 @@ public class ProcessingPipelineTests : IDisposable
         bridge.LastEncodeWidth.Should().Be(1920);
         bridge.LastEncodeHeight.Should().Be(1080);
         bridge.LastEncodeBitrate.Should().Be(20_000);
-        bridge.LastEncodeFps.Should().Be(135);
+        // ST-30 floor mode: encoder fps = srcFps * floor(target/src) = 24 * 5 = 120.
+        bridge.LastEncodeFps.Should().Be(120);
     }
 
     // --- graceful degradation: interp unavailable ----------------------------

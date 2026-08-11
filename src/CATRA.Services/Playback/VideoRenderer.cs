@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using CATRA.Core.Interfaces;
+using CATRA.Core.Library;
 using CATRA.Core.Models;
 using FFmpeg.AutoGen;
 using SharpGen.Runtime;
@@ -106,6 +107,9 @@ public sealed unsafe class VideoRenderer : IVideoRenderer
 
             // Paint black so the host shows a clean surface before the first frame.
             ClearCore();
+
+            DiagnosticsLogger.Info(
+                $"[VideoRenderer] Initialized: hwnd=0x{_windowHandle:X} size={_width}x{_height}");
         }
     }
 
@@ -117,8 +121,19 @@ public sealed unsafe class VideoRenderer : IVideoRenderer
         lock (_gate)
         {
             EnsureInitialized();
-            PresentCore(frame);
-            _swapChain!.Present(1, PresentFlags.None);
+            try
+            {
+                PresentCore(frame);
+                _swapChain!.Present(1, PresentFlags.None);
+            }
+            catch (Exception ex)
+            {
+                DiagnosticsLogger.Error(
+                    $"[VideoRenderer] Present failed (size={_width}x{_height}, " +
+                    $"hw={frame.IsHardwareFrame}, frame={frame.Width}x{frame.Height}, " +
+                    $"deviceRemoved={GetDeviceRemovedReason()})", ex);
+                throw;
+            }
         }
     }
 
@@ -143,9 +158,22 @@ public sealed unsafe class VideoRenderer : IVideoRenderer
 
             // Back-buffer views must be released before ResizeBuffers can succeed.
             ReleaseBackBufferViews();
-            _swapChain!.ResizeBuffers(2, width, height, Format.B8G8R8A8_UNorm, SwapChainFlags.None);
+            try
+            {
+                _swapChain!.ResizeBuffers(2, width, height, Format.B8G8R8A8_UNorm, SwapChainFlags.None);
+            }
+            catch (Exception ex)
+            {
+                DiagnosticsLogger.Error(
+                    $"[VideoRenderer] ResizeBuffers failed -> {width}x{height} " +
+                    $"(deviceRemoved={GetDeviceRemovedReason()})", ex);
+                throw;
+            }
+
             CreateBackBufferViews();
             ClearCore();
+
+            DiagnosticsLogger.Info($"[VideoRenderer] Resized -> {width}x{height}");
         }
     }
 
@@ -472,6 +500,32 @@ public sealed unsafe class VideoRenderer : IVideoRenderer
         if (!_initialized)
         {
             throw new InvalidOperationException("Video renderer has not been initialized.");
+        }
+    }
+
+    /// <summary>
+    /// Queries the D3D11 device-removed reason (DXGI_ERROR_DEVICE_REMOVED /
+    /// _RESET / _HUNG ...). A non-SUCCESS value here is the typical root cause
+    /// behind WPF render-pipeline failures (<c>MediaContext.RenderMessageHandlerCore</c>)
+    /// and is included in every render error log.
+    /// </summary>
+    private string GetDeviceRemovedReason()
+    {
+        try
+        {
+            if (_device is null)
+            {
+                return "no-device";
+            }
+
+            Result reason = _device.DeviceRemovedReason;
+            return reason.Success
+                ? "S_OK (device healthy)"
+                : $"{reason.Description} (0x{reason.Code:X8})";
+        }
+        catch (Exception ex)
+        {
+            return $"query-failed: {ex.Message}";
         }
     }
 

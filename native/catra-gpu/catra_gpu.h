@@ -242,6 +242,30 @@ CATRA_API int  catra_nv12_bgra_convert(void* d3d11_device, void* d3d11_ctx,
 CATRA_API void catra_nv12_bgra_shutdown(void);
 
 // ===========================================================================
+// NV12 → BGRA CPU staging path — AMD RDNA 4 workaround
+// ===========================================================================
+//
+// On AMD RDNA 4, the D3D11VA decoder texture (bind=0x200, DECODER only) is
+// not shader-bindable (the GPU compute shader path fails) and
+// av_hwframe_transfer_data produces zeros (CopySubresourceRegion bug).
+// This function uses the PROVEN working mechanism: full-texture CopyResource
+// into an NV12 staging texture + two Map calls (Y and UV subresources
+// separately) + CPU BT.601 conversion + upload to a standalone BGRA texture.
+//
+// Requires catra_init to have run (uses the bridge's D3D11 device + context).
+// `nv12_tex` is the decoder's ID3D11Texture2D* (typically ArraySize>1, NV12).
+// `array_slice` is the slice index (from AVFrame->data[1]).
+// `width`/`height` are the visible frame dimensions.
+// On success writes an AddRef'd ID3D11Texture2D* (BGRA, ArraySize==1) to
+// *out_bgra_tex. Caller owns the reference (catra_release_texture when done).
+// *out_bgra_tex stays null on every failure path.
+CATRA_API int  catra_nv12_staging_convert(void* nv12_tex,
+                                          unsigned int array_slice,
+                                          unsigned int width,
+                                          unsigned int height,
+                                          void** out_bgra_tex);
+
+// ===========================================================================
 // Encode (AMF H.265 / HEVC) — ST-16
 // ===========================================================================
 //

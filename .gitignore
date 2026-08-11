@@ -85,3 +85,4 @@ lib/fsr-sdk/
 lib/amf/
 native/catra-gpu/vcpkg_installed/
 native/catra-gpu/build/
+native/catra-gpu/install/

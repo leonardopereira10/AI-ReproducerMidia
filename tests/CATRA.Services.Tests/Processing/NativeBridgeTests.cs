@@ -223,6 +223,9 @@ internal sealed class FakeNativeLibrary : INativeLibrary
     public int Nv12BgraInitCallCount { get; private set; }
     public int Nv12BgraConvertCallCount { get; private set; }
     public int Nv12BgraShutdownCallCount { get; private set; }
+    public int Nv12StagingConvertResult { get; set; }
+    public IntPtr Nv12StagingConvertOutTex { get; set; }
+    public int Nv12StagingConvertCallCount { get; private set; }
 
     public int Nv12BgraInit(IntPtr d3d11Device)
     {
@@ -242,6 +245,14 @@ internal sealed class FakeNativeLibrary : INativeLibrary
     public void Nv12BgraShutdown()
     {
         Nv12BgraShutdownCallCount++;
+    }
+
+    public int Nv12StagingConvert(IntPtr nv12Tex, uint arraySlice,
+        uint width, uint height, out IntPtr outBgraTex)
+    {
+        Nv12StagingConvertCallCount++;
+        outBgraTex = Nv12StagingConvertOutTex;
+        return Nv12StagingConvertResult;
     }
 }
 
@@ -1241,7 +1252,7 @@ public class NativeBridgePInvokeSignatureTests
             .Where(m => m.GetCustomAttribute<DllImportAttribute>() is not null)
             .ToList();
 
-        imports.Should().HaveCount(21, "the full catra_gpu.h C ABI must be declared");
+        imports.Should().HaveCount(22, "the full catra_gpu.h C ABI must be declared");
         imports.Should().OnlyContain(m => m.IsPrivate);
     }
 
