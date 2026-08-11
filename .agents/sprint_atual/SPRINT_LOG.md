@@ -370,3 +370,19 @@ resource state: D3D12_RESOURCE_STATE_COMMON (após barrier)
 **Commit:** 5ffa04d (logs de debug)
 
 **Status:** Perfil Local 100% funcional. Perfil DLNA bloqueado até resolver upscale.
+
+---
+
+## 🐛 Hotfix: FfmpegException code -11 no AudioDecoder (fast-path)
+
+**Data:** 2026-07 (report runtime)
+
+**Sintoma:** `FfmpegException: avcodec_receive_frame failed: Resource temporarily unavailable (code -11)` ao reproduzir áudio (ex.: AAC) — `AudioDecoder.TryReceiveAudio()` linha 247.
+
+**Causa raiz:** `AudioDecoder` comparava o retorno do avcodec com `ffmpeg.EAGAIN` (**+11**, errno cru no FFmpeg.AutoGen 8.1). As APIs `avcodec_send_packet`/`avcodec_receive_frame` retornam **`-EAGAIN` (-11)**. A comparação nunca casava → EAGAIN caía no ramo `result < 0` → exceção. `VideoDecoder` e `FrameDecoder` já usavam `-ffmpeg.EAGAIN` corretamente.
+
+**Fix:** 2 comparações em `src/CATRA.Services/Playback/AudioDecoder.cs` → `-ffmpeg.EAGAIN` (alinha com convenção do projeto).
+
+**Validação:** repro harness com AAC gerado por ffmpeg.exe: antes → exceção idêntica ao report; depois → 87 frames / 88200 samples (2s @ 44100 Hz mono) até EOF. Build solution 0 erros; testes 408/408 em CATRA.Services.Tests. Falha pré-existente em CATRA.Data.Tests (`local_target_fps` seed "60" vs teste "135", já no HEAD) — não relacionada.
+
+**Lição:** FFmpeg.AutoGen expõe errno como positivo; avcodec retorna `AVERROR(errno)` negativo. Sempre comparar com `-ffmpeg.EAGAIN` (convenção: VideoDecoder.cs/FrameDecoder.cs).
