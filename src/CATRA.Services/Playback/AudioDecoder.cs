@@ -214,8 +214,9 @@ public sealed unsafe class AudioDecoder : IAudioDecoder
     /// </summary>
     private int SendPacketDraining(AVPacket* packet)
     {
+        // avcodec returns AVERROR(EAGAIN) == -EAGAIN (-11), not the raw errno.
         int result = ffmpeg.avcodec_send_packet(_codecContext, packet);
-        while (result == ffmpeg.EAGAIN)
+        while (result == -ffmpeg.EAGAIN)
         {
             while (true)
             {
@@ -237,7 +238,7 @@ public sealed unsafe class AudioDecoder : IAudioDecoder
     private AudioFrame? TryReceiveAudio()
     {
         int result = ffmpeg.avcodec_receive_frame(_codecContext, _frame);
-        if (result == ffmpeg.EAGAIN || result == ffmpeg.AVERROR_EOF)
+        if (result == -ffmpeg.EAGAIN || result == ffmpeg.AVERROR_EOF)
         {
             return null;
         }
