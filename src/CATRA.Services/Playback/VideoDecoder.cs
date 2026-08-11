@@ -12,10 +12,12 @@ namespace CATRA.Services.Playback;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Hardware frames carry an <c>ID3D11Texture2D*</c> in <c>AVFrame.data[0]</c>; the
-/// backing <c>AVFrame</c> is moved into a private frame whose lifetime is tied to the
-/// <see cref="VideoFrame"/> via a releaser callback, so the COM texture reference
-/// stays valid until the renderer is done with it.
+/// D3D11VA frames are read back to system memory here (via
+/// <c>av_hwframe_transfer_data</c>) and converted to BGRA before being handed to
+/// the renderer. The decoded textures live on FFmpeg's private d3d11va device,
+/// while the renderer owns a separate D3D11 device: passing those textures over
+/// would force cross-device <c>CopySubresourceRegion</c>/<c>Map</c>, which silently
+/// corrupts the D3D11 runtime and crashes with an access violation.
 /// </para>
 /// <para>
 /// Not unit-tested directly (requires FFmpeg binaries + a GPU); validated manually.
@@ -361,32 +363,41 @@ public sealed unsafe class VideoDecoder : IVideoDecoder
 
         if ((AVPixelFormat)frame->format == AVPixelFormat.AV_PIX_FMT_D3D11)
         {
-            IntPtr texture = (IntPtr)frame->data[0];
-            int arraySlice = (int)(long)frame->data[1];
-
-            // Transfer the reference into a privately-owned AVFrame so the texture
-            // stays alive until the VideoFrame is disposed by the renderer.
-            AVFrame* owned = ffmpeg.av_frame_alloc();
-            if (owned == null)
+            // Read the GPU picture back on FFmpeg's own device (legal) instead of
+            // exposing the texture to the renderer's different device (undefined
+            // behaviour — see class remarks). Future optimisation: wrap the
+            // renderer's device in the FFmpeg hw-device context so hardware frames
+            // can be copied zero-copy.
+            AVFrame* software = ffmpeg.av_frame_alloc();
+            if (software == null)
             {
                 throw new OutOfMemoryException("av_frame_alloc returned null.");
             }
 
-            ffmpeg.av_frame_move_ref(owned, frame);
-            IntPtr ownedPtr = (IntPtr)owned;
+            int transfer = ffmpeg.av_hwframe_transfer_data(software, frame, 0);
+            if (transfer < 0)
+            {
+                ffmpeg.av_frame_free(&software);
+                throw new FfmpegException(transfer, "av_hwframe_transfer_data");
+            }
 
-            return VideoFrame.CreateHardware(pts, width, height, texture, arraySlice, () => ReleaseFrame(ownedPtr));
+            // av_hwframe_transfer_data copies frame properties but not the
+            // decoder-derived best-effort timestamp.
+            software->best_effort_timestamp = frame->best_effort_timestamp;
+
+            try
+            {
+                byte[] bgra = ConvertToBgra(software, width, height);
+                return VideoFrame.CreateSoftware(pts, width, height, bgra);
+            }
+            finally
+            {
+                ffmpeg.av_frame_free(&software);
+            }
         }
 
-        byte[] bgra = ConvertToBgra(frame, width, height);
-        return VideoFrame.CreateSoftware(pts, width, height, bgra);
-    }
-
-    private static void ReleaseFrame(IntPtr framePtr)
-    {
-        AVFrame* frame = (AVFrame*)framePtr;
-        ffmpeg.av_frame_unref(frame);
-        ffmpeg.av_frame_free(&frame);
+        byte[] softwareBgra = ConvertToBgra(frame, width, height);
+        return VideoFrame.CreateSoftware(pts, width, height, softwareBgra);
     }
 
     private byte[] ConvertToBgra(AVFrame* frame, int width, int height)
@@ -468,8 +479,7 @@ public sealed unsafe class VideoDecoder : IVideoDecoder
             ffmpeg.avcodec_flush_buffers(_codecContext);
             _eofSent = false;
 
-            // Queued frames belong to the pre-seek timeline: drop them (disposing
-            // releases the COM texture reference of hardware frames).
+            // Queued frames belong to the pre-seek timeline: drop them.
             ClearBufferedFrames();
         }
     }
