@@ -386,3 +386,17 @@ resource state: D3D12_RESOURCE_STATE_COMMON (após barrier)
 **Validação:** repro harness com AAC gerado por ffmpeg.exe: antes → exceção idêntica ao report; depois → 87 frames / 88200 samples (2s @ 44100 Hz mono) até EOF. Build solution 0 erros; testes 408/408 em CATRA.Services.Tests. Falha pré-existente em CATRA.Data.Tests (`local_target_fps` seed "60" vs teste "135", já no HEAD) — não relacionada.
 
 **Lição:** FFmpeg.AutoGen expõe errno como positivo; avcodec retorna `AVERROR(errno)` negativo. Sempre comparar com `-ffmpeg.EAGAIN` (convenção: VideoDecoder.cs/FrameDecoder.cs).
+
+---
+
+## 🐛 Hotfix: Access violation (0xC0000005) no primeiro Present de frame D3D11VA (fast-path)
+
+**Sintoma:** processo morre com `0xc0000005` logo após `[VideoRenderer] Resized -> ...` — primeiro present de vídeo. Recém-exposto pelo hotfix do EAGAIN (antes o áudio derrubava o loop antes de qualquer present).
+
+**Causa raiz (comprovada com repro isolado):** texturas D3D11VA vivem no device privado do FFmpeg (`av_hwdevice_ctx_create`); o `VideoRenderer` cria OUTRO device D3D11 para o swapchain. `CopySubresourceRegion` entre devices diferentes é operação inválida: corrompe o runtime silenciosamente → AV no próximo `Map`/uso. Controles executados: copy cross-device + Map = SEGFAULT; Map sem copy = OK; copy same-device + Map = OK.
+
+**Fix (`src/CATRA.Services/Playback/VideoDecoder.cs`):** frames D3D11 agora sofrem readback via `av_hwframe_transfer_data` no próprio device do FFmpeg e seguem para o renderer como software BGRA (mesmo custo do readback que o renderer já faria). Zero-copy com device compartilhado registrado como otimização futura (exige device do renderer existir no `OpenAsync` do decoder — mudança de interface).
+
+**Validação:** harness com janela real + h264 1280x720 gerado por ffmpeg.exe: antes → SEGFAULT no present #0 (idêntico ao crash do usuário); depois → 30 frames apresentados incluindo resize mid-stream. Build solution 0 erros. CATRA.Services.Tests 408/408. Falhas restantes (1 Data + 3 UI) pré-existentes: divergência `local_target_fps` seed "60" vs testes "135" (verificado no HEAD, sem relação).
+
+**Lição:** D3D11 — nunca cruzar resources entre devices (copy/map/render); runtime não valida em release e o estado corrompe de forma diferida (crash no próximo call, não no call culpado).
