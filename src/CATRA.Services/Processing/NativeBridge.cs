@@ -266,6 +266,13 @@ public sealed class NativeBridge : INativeBridge
     // so the delegate must not be garbage-collected while in use.
     private NativeLogCallback? _logSink;
     private bool _initialized;
+    // The device the native bridge currently runs on. Each FrameDecoder creates
+    // its own D3D11VA device, so consecutive episodes bring DIFFERENT devices;
+    // the bridge must re-init when the device changes, otherwise its GPU stages
+    // (interp / upscale / encode) run on the previous episode's device while the
+    // new episode's textures live on the new one — a cross-device use that
+    // crashes the GPU.
+    private IntPtr _initializedDevice;
     private bool _disposed;
 
     /// <summary>Creates the bridge backed by the real native loader.</summary>
@@ -306,10 +313,30 @@ public sealed class NativeBridge : INativeBridge
 
         lock (_gate)
         {
+            if (_initialized && _initializedDevice == d3d11Device)
+            {
+                return; // already bound to this exact device
+            }
+
+            if (_initialized)
+            {
+                // Different device (the next episode's fresh D3D11VA decoder
+                // device): tear down and re-init so every GPU stage runs on the
+                // same device the incoming textures were created on. Native
+                // catra_shutdown destroys all backend contexts, the NV12→BGRA
+                // cache and the D3D11<->DX12 interop, so no context may be live
+                // at this point — true between episodes (the pipeline destroys
+                // every context in its per-episode finally).
+                _library.Shutdown();
+                _initialized = false;
+                _initializedDevice = IntPtr.Zero;
+            }
+
             InstallLogSink();
             int resultCode = _library.Init(d3d11Device);
             ThrowIfError(resultCode, "catra_init");
             _initialized = true;
+            _initializedDevice = d3d11Device;
         }
     }
 
@@ -324,6 +351,7 @@ public sealed class NativeBridge : INativeBridge
             }
 
             _initialized = false;
+            _initializedDevice = IntPtr.Zero;
         }
     }
 
@@ -520,6 +548,7 @@ public sealed class NativeBridge : INativeBridge
 
             _logSink = null;
             _initialized = false;
+            _initializedDevice = IntPtr.Zero;
             _disposed = true;
         }
     }

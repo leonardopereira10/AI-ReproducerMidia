@@ -34,6 +34,12 @@ public interface INativeBridge : IDisposable
     /// <c>ID3D11Device*</c>). Throws a native-bridge exception when the library
     /// is unavailable or the native call fails.
     /// </summary>
+    /// <remarks>
+    /// Device-aware and idempotent: a repeat call with the SAME device is a
+    /// no-op, while a call with a DIFFERENT device tears the bridge down and
+    /// re-initializes it on the new device, so every GPU stage always runs on
+    /// the device that created the textures it processes.
+    /// </remarks>
     void Initialize(IntPtr d3d11Device);
 
     /// <summary>Tears down the bridge and releases native resources. Idempotent; no-op when unavailable.</summary>

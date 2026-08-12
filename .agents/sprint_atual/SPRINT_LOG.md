@@ -400,3 +400,20 @@ resource state: D3D12_RESOURCE_STATE_COMMON (após barrier)
 **Validação:** harness com janela real + h264 1280x720 gerado por ffmpeg.exe: antes → SEGFAULT no present #0 (idêntico ao crash do usuário); depois → 30 frames apresentados incluindo resize mid-stream. Build solution 0 erros. CATRA.Services.Tests 408/408. Falhas restantes (1 Data + 3 UI) pré-existentes: divergência `local_target_fps` seed "60" vs testes "135" (verificado no HEAD, sem relação).
 
 **Lição:** D3D11 — nunca cruzar resources entre devices (copy/map/render); runtime não valida em release e o estado corrompe de forma diferida (crash no próximo call, não no call culpado).
+
+---
+
+## 🐛 Hotfix: crash na GPU ao iniciar o próximo vídeo da fila de processamento (fast-path)
+
+**Sintoma:** batch/fila de processamento — o primeiro episódio completa, mas ao começar o próximo a GPU crasha (device removed/TDR) já nos primeiros frames.
+
+**Causa raiz:** cada `FrameDecoder` cria seu próprio device D3D11VA (`av_hwdevice_ctx_create` por `Open`). O `NativeBridge` (singleton) era inicializado UMA vez, no device do primeiro episódio — `ProcessingPipeline` pulava a init quando `IsInitialized`. Nos episódios seguintes as texturas dos frames nasciam no device NOVO do decoder, enquanto interp/upscale/encoder AMF do bridge operavam no device ANTIGO do episódio 1 → uso cross-device de texturas → crash (mesma família do AV 0xC0000005 corrigido em 10042a3, mas agora entre decoders, não entre decoder/renderer).
+
+**Fix:**
+- `NativeBridge.Initialize(IntPtr)` agora é device-aware: mesmo device = no-op; device diferente = `Shutdown()` nativo (destrói contexts, cache NV12→BGRA e interop D3D11↔DX12) + re-init no device novo. Rastreia `_initializedDevice`; `Shutdown()`/`Dispose()` limpam.
+- `ProcessingPipeline` chama `_bridge.Initialize(decoder.D3D11DevicePtr)` SEMPRE (antes: só se `!IsInitialized`). Seguro porque entre episódios todos os contexts nativos já foram destruídos no `finally` do episódio anterior.
+- `INativeBridge.Initialize` documentado com a nova semântica.
+
+**Validação:** build solution 0w/0e; 2 testes novos (`Initialize_SameDeviceTwice_IsNoOp`, `Initialize_DifferentDevice_RebindsBridge`); NativeBridge+ProcessingPipeline 64/64 verdes. Falhas restantes (1 Casting AVI + 1 Data seed + 3 UI) pré-existentes no working tree/HEAD, sem relação. Validação real em GPU (fila com 2+ episódios) pendente — requer execução manual.
+
+**Lição:** singleton de GPU + objeto-per-job que cria device próprio = o singleton precisa re-vincular ao device de cada job (ou os jobs precisam compartilhar UM device).

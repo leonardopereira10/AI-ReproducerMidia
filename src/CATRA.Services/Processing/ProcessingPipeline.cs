@@ -174,22 +174,24 @@ public sealed class ProcessingPipeline : IProcessingPipeline
             decoder.Open(episode.FilePath);
             FrameSourceMetadata meta = decoder.Metadata;
 
-            // 1b. Initialize the native bridge on the decoder's D3D11 device so
-            //     the GPU backends (upscale, interp, encode) can consume the
-            //     decoder's D3D11 textures. Must happen before any Create* call.
-            if (decoder.D3D11DevicePtr != IntPtr.Zero && !_bridge.IsInitialized)
+            // 1b. Bind the native bridge to THIS decoder's D3D11 device so the GPU
+            //     backends (upscale, interp, encode) consume textures on the device
+            //     that created them. Must happen before any Create* call.
+            //     Every FrameDecoder creates its own D3D11VA device, so each
+            //     episode brings a different device pointer; Initialize is
+            //     device-aware (no-op for the same device, shutdown + re-init on a
+            //     new one). Skipping re-init here made the bridge keep the first
+            //     episode's device while later episodes fed it textures from a
+            //     different device — a cross-device use that crashed the GPU when
+            //     the next video started.
+            if (decoder.D3D11DevicePtr != IntPtr.Zero)
             {
-                System.Diagnostics.Trace.WriteLine($"[ProcessingPipeline] Initializing bridge with device 0x{decoder.D3D11DevicePtr:X}");
+                System.Diagnostics.Trace.WriteLine($"[ProcessingPipeline] Ensuring bridge bound to device 0x{decoder.D3D11DevicePtr:X}");
                 _bridge.Initialize(decoder.D3D11DevicePtr);
-                System.Diagnostics.Trace.WriteLine("[ProcessingPipeline] Bridge initialized successfully");
             }
-            else if (decoder.D3D11DevicePtr == IntPtr.Zero)
+            else
             {
                 System.Diagnostics.Trace.WriteLine("[ProcessingPipeline] WARNING: decoder has no D3D11 device (software decode?)");
-            }
-            else if (_bridge.IsInitialized)
-            {
-                System.Diagnostics.Trace.WriteLine("[ProcessingPipeline] Bridge already initialized, skipping");
             }
 
             // 2. RN-07 skip decisions.

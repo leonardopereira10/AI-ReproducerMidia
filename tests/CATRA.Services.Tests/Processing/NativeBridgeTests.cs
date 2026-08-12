@@ -357,6 +357,43 @@ public class NativeBridgeTests
     }
 
     [Fact]
+    public void Available_Initialize_SameDeviceTwice_IsNoOp()
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = true, InitResult = 0 };
+        var bridge = new NativeBridge(lib);
+        var device = new IntPtr(0x1234);
+
+        bridge.Initialize(device);
+        bridge.Initialize(device);
+
+        lib.InitCallCount.Should().Be(1);
+        lib.ShutdownCallCount.Should().Be(0);
+        bridge.IsInitialized.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Available_Initialize_DifferentDevice_RebindsBridge()
+    {
+        // Each FrameDecoder creates its own D3D11VA device, so the next episode
+        // arrives with a different device pointer. The bridge must shut down and
+        // re-init on the new device — staying on the old one makes every GPU
+        // stage consume another device's textures (cross-device) and crashes
+        // the GPU when the next video starts.
+        var lib = new FakeNativeLibrary { IsAvailable = true, InitResult = 0 };
+        var bridge = new NativeBridge(lib);
+        var firstDevice = new IntPtr(0x1111);
+        var nextDevice = new IntPtr(0x2222);
+
+        bridge.Initialize(firstDevice);
+        bridge.Initialize(nextDevice);
+
+        lib.InitCallCount.Should().Be(2);
+        lib.ShutdownCallCount.Should().Be(1);
+        lib.LastInitDevice.Should().Be(nextDevice);
+        bridge.IsInitialized.Should().BeTrue();
+    }
+
+    [Fact]
     public void Available_Initialize_NativeError_ThrowsWithCode()
     {
         var lib = new FakeNativeLibrary { IsAvailable = true, InitResult = -1 };
