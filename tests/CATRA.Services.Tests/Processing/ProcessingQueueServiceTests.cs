@@ -367,6 +367,135 @@ public sealed class ProcessingQueueServiceTests : IDisposable
         _jobs.GetAll().Single().Status.Should().Be(JobStatus.Failed);
     }
 
+    // ── orphaned Queued recovery (subtask 02) ──────────────────────────────────
+
+    /// <summary>
+    /// Blocks the pipeline until released so queued jobs stay observable. When
+    /// <paramref name="entered"/> is supplied it is signalled the moment the handler
+    /// runs — deterministic proof the pipeline was invoked (JobStarted fires before
+    /// the pipeline call, so awaiting JobStarted alone is not enough under load).
+    /// </summary>
+    private void BlockPipeline(TaskCompletionSource release, TaskCompletionSource? entered = null) =>
+        _pipeline.Handler = async (_, _, _, ct) =>
+        {
+            entered?.TrySetResult();
+            await release.Task.WaitAsync(ct);
+            return new ProcessResult(true, Path.Combine(_outputFolder, "x.mp4"), 1, TimeSpan.Zero, null);
+        };
+
+    [Fact]
+    public async Task StartAsync_RecoversPersistedQueuedJobs_BackIntoMemoryQueue()
+    {
+        var e1 = SeedEpisode(number: 1);
+        var e2 = SeedEpisode(number: 2);
+        DateTime baseline = DateTime.UtcNow;
+
+        // Inserted newer FIRST, older SECOND: recovery must order by CreatedAt, not row id.
+        var newer = _jobs.Insert(new ProcessJob
+        {
+            EpisodeId = e1.Id, Profile = ProcessProfile.Local, Status = JobStatus.Queued,
+            CreatedAt = baseline,
+        });
+        var older = _jobs.Insert(new ProcessJob
+        {
+            EpisodeId = e2.Id, Profile = ProcessProfile.Local, Status = JobStatus.Queued,
+            CreatedAt = baseline.AddMinutes(-10),
+        });
+
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        BlockPipeline(release);
+
+        Task<ProcessJob> started = WaitStartedAsync();
+        await _service.StartAsync();
+        ProcessJob first = await started;
+
+        first.Id.Should().Be(older.Id, "recovery resumes the oldest Queued job first");
+
+        List<ProcessJob> waiting = _service.QueuedJobs;
+        waiting.Should().ContainSingle("the second persisted Queued job is back in the in-memory queue");
+        waiting.Single().Id.Should().Be(newer.Id);
+        waiting.Single().Status.Should().Be(JobStatus.Queued, "recovery does not touch the job status");
+
+        _jobs.GetById(newer.Id)!.Status.Should().Be(JobStatus.Queued, "no status re-processing in the database");
+        release.SetResult();
+    }
+
+    [Fact]
+    public async Task StartAsync_RecoversQueuedJobs_AfterCrashRecovery()
+    {
+        var epCrashed = SeedEpisode(number: 1);
+        var epQueued = SeedEpisode(number: 2);
+        _jobs.Insert(new ProcessJob
+        {
+            EpisodeId = epCrashed.Id, Profile = ProcessProfile.Local, Status = JobStatus.Processing,
+            StartedAt = DateTime.UtcNow,
+        });
+        var queued = _jobs.Insert(new ProcessJob
+        {
+            EpisodeId = epQueued.Id, Profile = ProcessProfile.Local, Status = JobStatus.Queued,
+            CreatedAt = DateTime.UtcNow,
+        });
+
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var enteredPipeline = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        BlockPipeline(release, enteredPipeline);
+
+        Task<ProcessJob> started = WaitStartedAsync();
+        await _service.StartAsync();
+        ProcessJob resumed = await started;
+
+        resumed.Id.Should().Be(queued.Id, "the persisted Queued job is resumed by the same StartAsync call");
+        _jobs.GetAll().Single(j => j.EpisodeId == epCrashed.Id).Status
+            .Should().Be(JobStatus.Failed, "crash recovery still marks orphaned Processing jobs Failed");
+        _jobs.GetById(queued.Id)!.Status.Should().Be(JobStatus.Processing);
+        await enteredPipeline.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        _pipeline.CallCount.Should().Be(1, "only the Queued job reaches the pipeline");
+        release.SetResult();
+    }
+
+    [Fact]
+    public async Task StartAsync_NoQueuedJobs_QueueRemainsEmpty()
+    {
+        var ep = SeedEpisode();
+        _jobs.Insert(new ProcessJob { EpisodeId = ep.Id, Profile = ProcessProfile.Local, Status = JobStatus.Processing });
+
+        await _service.StartAsync();
+
+        _service.QueuedJobs.Should().BeEmpty("there are no persisted Queued jobs to recover");
+        _jobs.GetAll().Single().Status.Should().Be(JobStatus.Failed, "crash recovery stays intact");
+        _pipeline.CallCount.Should().Be(0, "nothing was written to the channel");
+    }
+
+    [Fact]
+    public async Task StartAsync_SecondCall_DoesNotDuplicateRecoveredJobs()
+    {
+        var e1 = SeedEpisode(number: 1);
+        var e2 = SeedEpisode(number: 2);
+        _jobs.Insert(new ProcessJob
+        {
+            EpisodeId = e1.Id, Profile = ProcessProfile.Local, Status = JobStatus.Queued, CreatedAt = DateTime.UtcNow,
+        });
+        _jobs.Insert(new ProcessJob
+        {
+            EpisodeId = e2.Id, Profile = ProcessProfile.Local, Status = JobStatus.Queued, CreatedAt = DateTime.UtcNow,
+        });
+
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var enteredPipeline = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        BlockPipeline(release, enteredPipeline);
+
+        Task<ProcessJob> started = WaitStartedAsync();
+        await _service.StartAsync();
+        await _service.StartAsync(); // idempotent — recovery must not run twice
+        await started;
+        await enteredPipeline.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        _service.QueuedJobs.Should().HaveCount(1, "one job is active, one waits — no duplicates");
+        _jobs.GetAll().Should().HaveCount(2);
+        _pipeline.CallCount.Should().Be(1);
+        release.SetResult();
+    }
+
     // ── progress propagation ───────────────────────────────────────────────
 
     [Fact]

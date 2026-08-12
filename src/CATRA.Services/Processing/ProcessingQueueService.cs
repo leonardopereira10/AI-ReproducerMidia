@@ -25,6 +25,13 @@ namespace CATRA.Services.Processing;
 /// <c>ErrorMessage == "Cancelled"</c> rather than throwing; both that and a thrown
 /// <see cref="OperationCanceledException"/> map to <see cref="JobStatus.Cancelled"/>.
 /// </para>
+/// <para>
+/// On start-up (<see cref="StartAsync"/>) the service first runs crash recovery
+/// (orphaned <see cref="JobStatus.Processing"/> jobs → <see cref="JobStatus.Failed"/>)
+/// and then re-enqueues every persisted <see cref="JobStatus.Queued"/> job back into
+/// the in-memory queue (oldest <c>CreatedAt</c> first), so jobs survive a clean
+/// shutdown or crash instead of staying stuck forever.
+/// </para>
 /// </remarks>
 public sealed class ProcessingQueueService : IProcessingQueueService, IDisposable
 {
@@ -226,6 +233,11 @@ public sealed class ProcessingQueueService : IProcessingQueueService, IDisposabl
     }
 
     /// <inheritdoc />
+    /// <remarks>
+    /// Order matters: crash recovery runs first (orphaned <see cref="JobStatus.Processing"/>
+    /// → <see cref="JobStatus.Failed"/>), then persisted <see cref="JobStatus.Queued"/> jobs
+    /// are re-enqueued — so a job is never resumed and failed in the same start.
+    /// </remarks>
     public Task StartAsync()
     {
         lock (_gate)
@@ -236,6 +248,7 @@ public sealed class ProcessingQueueService : IProcessingQueueService, IDisposabl
             }
 
             RecoverCrashedJobs();
+            RecoverOrphanedQueuedJobs();
 
             _workerCts = new CancellationTokenSource();
             CancellationToken token = _workerCts.Token;
@@ -298,6 +311,34 @@ public sealed class ProcessingQueueService : IProcessingQueueService, IDisposabl
             job.ErrorMessage = "Interrupted by application restart (crash recovery).";
             job.CompletedAt = DateTime.UtcNow;
             _jobs.Update(job);
+        }
+    }
+
+    /// <summary>
+    /// Orphaned-queue recovery (story 02): every job persisted as
+    /// <see cref="JobStatus.Queued"/> (left behind by a clean shutdown or crash) is
+    /// re-enqueued into the in-memory queue, ordered by <c>CreatedAt</c> ascending to
+    /// preserve the original FIFO order. Jobs already tracked in memory are skipped
+    /// (no-op dedup, same invariant as <see cref="EnqueueAsync"/>), so the recovery
+    /// can never duplicate an active job. Must run inside <c>lock (_gate)</c>, after
+    /// <see cref="RecoverCrashedJobs"/> and before the worker loop starts.
+    /// </summary>
+    private void RecoverOrphanedQueuedJobs()
+    {
+        List<ProcessJob> orphaned = _jobs.GetAll()
+            .Where(j => j.Status == JobStatus.Queued)
+            .OrderBy(j => j.CreatedAt)
+            .ToList();
+
+        foreach (ProcessJob job in orphaned)
+        {
+            if (_queuedJobs.Any(j => j.Id == job.Id) || (_currentJob is not null && _currentJob.Id == job.Id))
+            {
+                continue; // already active in memory — never duplicate
+            }
+
+            _queuedJobs.Add(job);
+            _channel.Writer.TryWrite(job);
         }
     }
 

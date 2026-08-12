@@ -16,7 +16,8 @@ namespace CATRA.Core.Interfaces;
 /// Backed by <c>System.Threading.Channels</c> (unbounded, thread-safe). Every job is
 /// persisted so its status survives a restart; on startup, jobs left in
 /// <see cref="JobStatus.Processing"/> by a crash are recovered to
-/// <see cref="JobStatus.Failed"/>. Cancellation is cooperative via a per-job
+/// <see cref="JobStatus.Failed"/> and persisted <see cref="JobStatus.Queued"/> jobs
+/// are re-enqueued for processing. Cancellation is cooperative via a per-job
 /// <see cref="CancellationTokenSource"/>.
 /// </remarks>
 public interface IProcessingQueueService
@@ -58,7 +59,14 @@ public interface IProcessingQueueService
     /// </summary>
     Task ClearQueueAsync();
 
-    /// <summary>Starts the background worker (idempotent). Runs crash recovery first.</summary>
+    /// <summary>
+    /// Starts the background worker (idempotent). Runs crash recovery first: jobs left
+    /// in <see cref="JobStatus.Processing"/> by an unclean shutdown are marked
+    /// <see cref="JobStatus.Failed"/>. Then every persisted
+    /// <see cref="JobStatus.Queued"/> job is re-enqueued into the in-memory queue
+    /// (oldest first), so jobs that survived a restart are resumed instead of staying
+    /// stuck. Jobs already active in memory are never duplicated.
+    /// </summary>
     Task StartAsync();
 
     /// <summary>Stops the background worker, waiting briefly for the loop to exit.</summary>
