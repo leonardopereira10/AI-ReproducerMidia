@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using CATRA.Core.Interfaces;
+using CATRA.Core.Library;
 using CATRA.Core.Processing;
 using CATRA.Services.Playback;
 using FFmpeg.AutoGen;
@@ -24,9 +25,12 @@ namespace CATRA.Services.Processing;
 /// decode (valid frames, no COM/GPU leak over a batch) is validated manually.
 /// </para>
 /// <para>
-/// The pipeline's GPU stages need D3D11 textures, so a source that only decodes to a
-/// software pixel format (no GPU device) throws rather than silently producing frames
-/// the native bridge cannot consume.
+/// The pipeline's GPU stages need D3D11 textures. When D3D11VA hwaccel does not
+/// negotiate (e.g. H.264 Baseline on this AMD RDNA4 driver: 'Failed setup for
+/// format d3d11'), FFmpeg silently falls back to software decode; those frames
+/// are converted on the CPU (sws_scale → BGRA) and uploaded to a standalone
+/// D3D11 texture (bugfix_04). Only when no D3D11 device is available at all
+/// does decoding a software format throw.
 /// </para>
 /// </remarks>
 public sealed unsafe class FrameDecoder : IFrameDecoder
@@ -51,6 +55,7 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
     private SwsContext* _scaler;
     private int _scalerW;
     private int _scalerH;
+    private AVPixelFormat _scalerSrcFormat;
 
     private FrameSourceMetadata? _metadata;
     private IntPtr _d3d11DevicePtr;
@@ -64,6 +69,10 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
     private bool _gpuNv12InitAttempted;
     private bool _gpuNv12Available;
     private readonly NativeLibraryLoader _nativeLib = new();
+
+    // bugfix_04: software-decode fallback (D3D11VA not negotiated) is logged once
+    // per decoder instance, on the first software frame.
+    private bool _softwareFallbackLogged;
 
     /// <inheritdoc />
     public IntPtr D3D11DevicePtr => _d3d11DevicePtr;
@@ -168,7 +177,7 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
         {
             // No D3D11 device (headless / no GPU): the pipeline cannot run without GPU
             // textures. Leave hw_device_ctx null; decode will then yield software frames
-            // which TryReadFrame rejects with a clear error.
+            // which OwnFrame rejects with a clear error (no D3D11 device to upload to).
             return;
         }
 
@@ -377,14 +386,20 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
     ///    Direct D3D11 copies of NV12 decoder array slices (CopyResource /
     ///    CopySubresourceRegion into staging) read ZEROS on this driver —
     ///    the native staging path is intentionally NOT used here.
+    /// 3. <b>Software-decode fallback</b> (bugfix_04): when D3D11VA hwaccel never
+    ///    negotiates (frame-&gt;format != D3D11, e.g. H.264 Baseline on this AMD
+    ///    RDNA4 driver), the frame is system-memory YUV; it goes through
+    ///    <see cref="ConvertAndUploadSoftware"/> (sws_scale → BGRA + staging upload).
     /// </summary>
     private IntPtr OwnFrame(AVFrame* frame)
     {
         if ((AVPixelFormat)frame->format != AVPixelFormat.AV_PIX_FMT_D3D11)
         {
-            throw new FfmpegException(
-                ffmpeg.AVERROR(ffmpeg.EINVAL),
-                "avcodec_receive_frame (pipeline requires D3D11VA hardware frames)");
+            // bugfix_04: D3D11VA hwaccel was not negotiated for this source
+            // (FFmpeg fell back to software decode). Convert + upload on the CPU
+            // instead of failing the job. Still throws when there is no D3D11
+            // device at all — the pipeline remains GPU-only by design.
+            return OwnSoftwareFrame(frame);
         }
 
         // 1. Try GPU NV12→BGRA compute shader path (ST-23).
@@ -464,6 +479,173 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
         {
             ffmpeg.av_frame_free(&sw);
         }
+    }
+
+    /// <summary>
+    /// bugfix_04: owns a frame that was decoded in software because D3D11VA hwaccel
+    /// did not negotiate for this source (e.g. H.264 Baseline: 'Failed setup for
+    /// format d3d11' on this AMD RDNA4 driver). Converts the native software pixel
+    /// format to BGRA via sws_scale and uploads it as a standalone D3D11 texture,
+    /// mirroring the CPU-fallback ownership pattern of the D3D11 path
+    /// (<c>_ownedFrames</c> entry: owned texture, <c>framePtr == IntPtr.Zero</c>).
+    /// </summary>
+    private IntPtr OwnSoftwareFrame(AVFrame* frame)
+    {
+        LogSoftwareFallbackOnce();
+
+        if (_vorticeDevice == null || _vorticeContext == null || _d3d11DevicePtr == IntPtr.Zero)
+        {
+            throw new FfmpegException(
+                ffmpeg.AVERROR(ffmpeg.EINVAL),
+                "avcodec_receive_frame (software-decoded frame and no D3D11 device available to upload to; pipeline requires D3D11 textures)");
+        }
+
+        try
+        {
+            IntPtr standalone = ConvertAndUploadSoftware(frame);
+            _ownedFrames.Add((standalone, IntPtr.Zero));
+            return standalone;
+        }
+        finally
+        {
+            // The frame contents have been copied into the standalone texture
+            // (or the conversion failed): drop the decoder frame reference either
+            // way, exactly like the D3D11 CPU-fallback path.
+            ffmpeg.av_frame_unref(frame);
+        }
+    }
+
+    /// <summary>
+    /// Logs the software-decode fallback once per decoder instance (first
+    /// software frame). Trace.WriteLine is the channel captured by the VS
+    /// debug log; DiagnosticsLogger mirrors it to the rolling file log.
+    /// </summary>
+    private void LogSoftwareFallbackOnce()
+    {
+        if (_softwareFallbackLogged)
+        {
+            return;
+        }
+
+        _softwareFallbackLogged = true;
+        const string message =
+            "[FrameDecoder] D3D11VA não negociado para esta fonte (provavelmente perfil sem suporte do driver); " +
+            "fallback software decode + upload GPU ativo";
+        System.Diagnostics.Trace.WriteLine(message);
+        DiagnosticsLogger.Warn(message);
+    }
+
+    /// <summary>
+    /// Converts a system-memory software-decoded <c>AVFrame</c> (any sws-supported
+    /// format, typically yuv420p for H.264 Baseline) into BGRA on the CPU and
+    /// uploads it as a standalone BGRA D3D11 texture (ArraySize == 1). Same
+    /// staging/upload pattern as <see cref="ConvertAndUploadNv12"/>. Returns an
+    /// AddRef'd ID3D11Texture2D* that the caller must Release.
+    /// </summary>
+    /// <remarks>
+    /// Colorspace: Baseline sources usually carry no color tags, so sws_scale
+    /// applies its default BT.601 coefficients while the hw path runs BT.709 —
+    /// a slight color difference is accepted (bugfix_04 risk assessment).
+    /// </remarks>
+    private IntPtr ConvertAndUploadSoftware(AVFrame* sw)
+    {
+        if (_vorticeDevice == null || _vorticeContext == null)
+        {
+            throw new InvalidOperationException(
+                "D3D11 device/context not available; cannot create frame texture.");
+        }
+
+        AVPixelFormat srcFormat = (AVPixelFormat)sw->format;
+        if (srcFormat == AVPixelFormat.AV_PIX_FMT_NONE)
+        {
+            throw new NotSupportedException("FrameDecoder: software frame has no pixel format.");
+        }
+
+        int dstW = _metadata?.Width ?? sw->width;
+        int dstH = _metadata?.Height ?? sw->height;
+
+        // Native software format (e.g. yuv420p) -> BGRA via sws_scale. The scaler
+        // is keyed by size AND source format, so the NV12 hw-fallback scaler and
+        // this one never collide.
+        EnsureScaler(dstW, dstH, srcFormat);
+        byte[] bgra = new byte[dstW * dstH * 4];
+        unsafe
+        {
+            // Pass all four planes/strides; sws_scale reads only the planes the
+            // source format actually uses (3 for planar YUV, 2 for NV12, 1 for packed).
+            byte*[] srcSlices = { sw->data[0], sw->data[1], sw->data[2], sw->data[3] };
+            int[] srcStrides = { sw->linesize[0], sw->linesize[1], sw->linesize[2], sw->linesize[3] };
+            fixed (byte* dst = bgra)
+            {
+                byte*[] dstSlices = { dst, null, null, null };
+                int[] dstStrides = { dstW * 4, 0, 0, 0 };
+                // Convert only the visible dstH rows (source height may be aligned).
+                int rows = ffmpeg.sws_scale(_scaler, srcSlices, srcStrides, 0, dstH, dstSlices, dstStrides);
+                if (rows < 0)
+                {
+                    throw new FfmpegException(rows, "sws_scale");
+                }
+            }
+        }
+
+        // Upload the BGRA bytes into a standalone BGRA texture
+        // (identical staging/upload pattern to ConvertAndUploadNv12).
+        var bgraStagingDesc = new Texture2DDescription
+        {
+            Width = dstW,
+            Height = dstH,
+            MipLevels = 1,
+            ArraySize = 1,
+            Format = Format.B8G8R8A8_UNorm,
+            SampleDescription = new(1, 0),
+            Usage = ResourceUsage.Staging,
+            BindFlags = BindFlags.None,
+            CPUAccessFlags = CpuAccessFlags.Write,
+            MiscFlags = ResourceOptionFlags.None
+        };
+        VDX.ID3D11Texture2D bgraStaging;
+        try { bgraStaging = _vorticeDevice.CreateTexture2D(bgraStagingDesc); }
+        catch (Exception ex) { Console.Error.WriteLine($"[SoftwareUpload] FAIL create BGRA staging: {ex.Message}"); Console.Error.Flush(); throw; }
+        unsafe
+        {
+            MappedSubresource box;
+            try { box = _vorticeContext.Map(bgraStaging, 0, MapMode.Write, MapFlags.None); }
+            catch (Exception ex) { Console.Error.WriteLine($"[SoftwareUpload] FAIL Map(BGRA write): {ex.Message}"); Console.Error.Flush(); throw; }
+            byte* dst = (byte*)box.DataPointer;
+            fixed (byte* src = bgra)
+            {
+                for (int y = 0; y < dstH; y++)
+                {
+                    System.Buffer.MemoryCopy(src + (long)y * dstW * 4, dst + (long)y * box.RowPitch, dstW * 4, dstW * 4);
+                }
+            }
+            _vorticeContext.Unmap(bgraStaging, 0);
+        }
+
+        var dstDesc = new Texture2DDescription
+        {
+            Width = dstW,
+            Height = dstH,
+            MipLevels = 1,
+            ArraySize = 1,
+            Format = Format.B8G8R8A8_UNorm,
+            SampleDescription = new(1, 0),
+            Usage = ResourceUsage.Default,
+            BindFlags = BindFlags.ShaderResource,
+            CPUAccessFlags = CpuAccessFlags.None,
+            MiscFlags = ResourceOptionFlags.None
+        };
+        VDX.ID3D11Texture2D dst2;
+        try { dst2 = _vorticeDevice.CreateTexture2D(dstDesc); }
+        catch (Exception ex) { Console.Error.WriteLine($"[SoftwareUpload] FAIL create BGRA GPU tex: {ex.Message}"); Console.Error.Flush(); throw; }
+        try { _vorticeContext.CopyResource(dst2, bgraStaging); }
+        catch (Exception ex) { Console.Error.WriteLine($"[SoftwareUpload] FAIL CopyResource(BGRA upload): {ex.Message}"); Console.Error.Flush(); throw; }
+        bgraStaging.Dispose();
+
+        IntPtr result = dst2.NativePointer;
+        Marshal.AddRef(result); // caller's reference
+        dst2.Dispose();         // releases Vortice's reference
+        return result;
     }
 
     /// <summary>
@@ -625,7 +807,7 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
         int uvPitch = sw->linesize[1];
 
         // NV12 -> BGRA via FFmpeg sws_scale (SIMD; same approach as VideoRenderer).
-        EnsureScaler(dstW, dstH);
+        EnsureScaler(dstW, dstH, AVPixelFormat.AV_PIX_FMT_NV12);
         byte[] bgra = new byte[dstW * dstH * 4];
         unsafe
         {
@@ -713,11 +895,14 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
         v < 0f ? (byte)0 : v > 255f ? (byte)255 : (byte)(v + 0.5f);
 
     /// <summary>
-    /// Creates (or reuses) a 1:1 NV12 -> BGRA sws context for the given size.
+    /// Creates (or reuses) a 1:1 <paramref name="srcFormat"/> -> BGRA sws context
+    /// for the given size. The cache key includes the source format so the NV12
+    /// hw-fallback scaler and the software-decode fallback scaler (bugfix_04)
+    /// never collide.
     /// </summary>
-    private void EnsureScaler(int width, int height)
+    private void EnsureScaler(int width, int height, AVPixelFormat srcFormat)
     {
-        if (_scaler != null && _scalerW == width && _scalerH == height)
+        if (_scaler != null && _scalerW == width && _scalerH == height && _scalerSrcFormat == srcFormat)
         {
             return;
         }
@@ -729,16 +914,17 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
         }
 
         _scaler = ffmpeg.sws_getContext(
-            width, height, AVPixelFormat.AV_PIX_FMT_NV12,
+            width, height, srcFormat,
             width, height, AVPixelFormat.AV_PIX_FMT_BGRA,
             (int)FFmpeg.AutoGen.SwsFlags.SWS_BILINEAR, null, null, null);
         if (_scaler == null)
         {
-            throw new InvalidOperationException("sws_getContext failed (NV12 -> BGRA).");
+            throw new InvalidOperationException($"sws_getContext failed ({srcFormat} -> BGRA).");
         }
 
         _scalerW = width;
         _scalerH = height;
+        _scalerSrcFormat = srcFormat;
     }
 
     /// <inheritdoc />

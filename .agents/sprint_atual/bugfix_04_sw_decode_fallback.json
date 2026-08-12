@@ -1,0 +1,48 @@
+{
+  "id": "bugfix_04",
+  "tipo": "fix_bug",
+  "titulo": "FrameDecoder: fallback software decode + upload GPU quando D3D11VA falha (H.264 Baseline)",
+  "complexidade": "alta",
+  "agente": "developer-alto",
+  "bug": {
+    "descricao": "Jobs de processamento falham em ~0,5s com 'avcodec_receive_frame (pipeline requires D3D11VA hardware frames) failed: Invalid argument (code -22)' para fontes H.264 Baseline profile.",
+    "causa_raiz": "Nesta GPU AMD (RDNA4) + FFmpeg 8 (avcodec-63), o setup do hwaccel D3D11VA/DXVA2 falha para H.264 Baseline ('Failed setup for format d3d11: hwaccel initialisation returned error' / 'No decoder device for codec found'). FFmpeg cai silenciosamente para decode software (frame->format = yuv420p) e OwnFrame (FrameDecoder.cs:385) exige AV_PIX_FMT_D3D11 e lança exceção.",
+    "reproducao": "lib/ffmpeg/ffmpeg.exe -hwaccel d3d11va -i '[Ep. 015]...mp4' -frames:v 30 -f null - → 'Failed setup for format d3d11'. Mesmo comando em [Ep. 001] (Main) funciona. -hwaccel d3d12va funciona para Baseline.",
+    "evidencia_producao": "catra.db: jobs 3-16 (EP001-014, Main) completed; jobs 17-31 (EP015+, Baseline) failed com o mesmo erro, desde 04:09 UTC de 2026-08-12."
+  },
+  "escopo": {
+    "arquivos": [
+      "src/CATRA.Services/Processing/FrameDecoder.cs",
+      "tests/CATRA.Services.Tests/Processing/* (somente se houver cobertura viável sem GPU)"
+    ],
+    "implementacao": [
+      "Em OwnFrame: frame->format != AV_PIX_FMT_D3D11 NÃO lança mais exceção; segue novo caminho software.",
+      "Novo caminho: ConvertAndUploadSoftware(AVFrame* sw): sws_scale(frame sw, formato nativo → BGRA) + upload para textura D3D11 standalone — mesmo padrão staging/upload de ConvertAndUploadNv12 (reutilizar EnsureScaler e código de upload; generalizarEnsureScaler para src format do frame se necessário).",
+      "Manter throw APENAS quando não há device D3D11 disponível (_vorticeDevice/_d3d11DevicePtr nulos) — pipeline segue GPU-only por design.",
+      "Log UMA vez por instância no primeiro frame software: Trace.WriteLine + DiagnosticsLogger.Warning: '[FrameDecoder] D3D11VA não negociado para esta fonte (provavelmente perfil sem suporte do driver); fallback software decode + upload GPU ativo'.",
+      "NÃO alterar o caminho D3D11 existente (GPU convert + CPU fallback NV12) — fontes Main continuam 100% no caminho atual.",
+      "Frames software entram em _ownedFrames igual ao fallback CPU existente (textura owned, framePtr IntPtr.Zero)."
+    ],
+    "fora_de_escopo": [
+      "Troca para D3D12VA",
+      "Fallback do pipeline inteiro para CPU",
+      "Mudanças em ProcessingPipeline/queue"
+    ]
+  },
+  "criterios_aceite": [
+    "EP015 (Baseline): app processa o episódio até o fim gerando mp4 válido (validação manual)",
+    "EP001 (Main): caminho hw intacto, sem regressão (validação manual + testes existentes)",
+    "Fallback logado uma vez (Trace + DiagnosticsLogger)",
+    "dotnet build CATRA.sln 0w/0e + dotnet test sem falhas novas"
+  ],
+  "risk_assessment": {
+    "nivel": "medio",
+    "riscos": [
+      "Código unsafe FFmpeg/D3D11 — erro de lifetime/ownership da textura vaza ou corrompe; mitigação: espelhar exatamente o padrão de _ownedFrames do fallback CPU existente.",
+      "Regressão no caminho hw (Main profile); mitigação: zero alterações no caminho existente + teste manual A/B EP001 vs EP015.",
+      "Colorspace: fontes Baseline sem tags de cor (yuv420p progressive); sws_scale usa default BT.601 vs caminho hw bt709 — possível leve diferença de cor; aceitável, documentar.",
+      "Performance: decode CPU-bound para fontes Baseline; aceitável vs falha total."
+    ]
+  },
+  "validacao": "QA roda harness console scratch (FrameDecoder abrindo EP015 e EP001) + build/test + usuário valida processamento completo na UI."
+}
