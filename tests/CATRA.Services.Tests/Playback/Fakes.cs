@@ -14,15 +14,17 @@ internal sealed class FakeVideoDecoder : IVideoDecoder
     private readonly Queue<VideoFrame> _frames = new();
     private readonly List<AudioTrack> _audioTracks = new();
 
-    public VideoMetadata Metadata { get; set; } = new(
-        Duration: TimeSpan.FromSeconds(10),
-        Fps: 30,
-        Width: 4,
-        Height: 4,
-        VideoCodec: "fake",
-        AudioCodec: "fake-audio",
-        Title: "fake-title",
-        IsHardwareAccelerated: false);
+    public VideoMetadata Metadata { get; set; } = new VideoMetadata
+    {
+        Duration = TimeSpan.FromSeconds(10),
+        Fps = 30,
+        Width = 4,
+        Height = 4,
+        VideoCodec = "fake",
+        AudioCodec = "fake-audio",
+        Title = "fake-title",
+        IsHardwareAccelerated = false
+    };
 
     public IReadOnlyList<AudioTrack> AudioTracks => _audioTracks;
 
@@ -45,7 +47,7 @@ internal sealed class FakeVideoDecoder : IVideoDecoder
     {
         if (duration is not null)
         {
-            Metadata = Metadata with { Duration = duration.Value };
+            Metadata.Duration = duration.Value;
         }
 
         lock (_gate)
@@ -181,6 +183,8 @@ internal sealed class FakeVideoRenderer : IVideoRenderer
 
     public List<(int Width, int Height)> ResizeCalls { get; } = new();
 
+    public int DisposeCount { get; private set; }
+
     public void Initialize(IntPtr windowHandle, int width, int height)
     {
         lock (_gate)
@@ -224,6 +228,13 @@ internal sealed class FakeVideoRenderer : IVideoRenderer
 
     public void Dispose()
     {
+        lock (_gate)
+        {
+            // Mirrors VideoRenderer: a disposed renderer is unusable; the
+            // engine must take a fresh one from its factory to rebind.
+            DisposeCount++;
+            IsInitialized = false;
+        }
     }
 }
 

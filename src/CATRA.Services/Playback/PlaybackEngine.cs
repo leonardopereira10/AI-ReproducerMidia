@@ -174,13 +174,26 @@ public sealed class PlaybackEngine : IPlaybackEngine
 
             DiagnosticsLogger.Info($"[PlaybackEngine] SetOutputWindow hwnd=0x{windowHandle:X}");
 
+            // The player screen destroys its host window when it unloads, and
+            // the engine outlives the screen: the surviving renderer's swap
+            // chain stays bound to the dead HWND, so every later session would
+            // present into a destroyed window (broken output). Rebuild the
+            // renderer whenever a window arrives so it is always bound to the
+            // live one. Serialised against the decode loop so a Present never
+            // races the disposal.
+            lock (_loopGate)
+            {
+                if (_videoRenderer is { IsInitialized: true })
+                {
+                    _videoRenderer.Dispose();
+                    _videoRenderer = null;
+                }
+            }
+
             // The handle may arrive after Play() already created the renderer
             // unbound; bind it as soon as it becomes available so Resize and
             // Present never hit an uninitialized renderer.
-            if (_videoRenderer is { IsInitialized: false })
-            {
-                EnsureRendererInitialized();
-            }
+            EnsureRendererInitialized();
         }
     }
 
@@ -562,15 +575,24 @@ public sealed class PlaybackEngine : IPlaybackEngine
             _videoRenderer = _videoRendererFactory();
         }
 
-        if (_windowHandle != IntPtr.Zero && !_videoRenderer.IsInitialized)
+        if (_windowHandle == IntPtr.Zero || _videoRenderer.IsInitialized)
         {
-            int width = _outputWidth > 0 ? _outputWidth : _metadata!.Width;
-            int height = _outputHeight > 0 ? _outputHeight : _metadata!.Height;
-            DiagnosticsLogger.Info(
-                $"[PlaybackEngine] Initializing renderer hwnd=0x{_windowHandle:X} size={width}x{height}");
-            _videoRenderer.Initialize(_windowHandle, width, height);
-            _videoRenderer.Clear();
+            return;
         }
+
+        int width = _outputWidth > 0 ? _outputWidth : (_metadata?.Width ?? 0);
+        int height = _outputHeight > 0 ? _outputHeight : (_metadata?.Height ?? 0);
+        if (width <= 0 || height <= 0)
+        {
+            // Size not known yet (e.g. the window arrived between Stop and the
+            // next OpenAsync); ResizeOutput or Play will retry.
+            return;
+        }
+
+        DiagnosticsLogger.Info(
+            $"[PlaybackEngine] Initializing renderer hwnd=0x{_windowHandle:X} size={width}x{height}");
+        _videoRenderer.Initialize(_windowHandle, width, height);
+        _videoRenderer.Clear();
     }
 
     private TimeSpan ClampToDuration(TimeSpan position)

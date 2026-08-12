@@ -285,6 +285,33 @@ public class PlaybackEngineTests
     }
 
     [Fact]
+    public async Task SetOutputWindow_AfterLeavingScreen_RebindsRendererToNewWindow()
+    {
+        using var h = TestEngines.Create();
+        h.AudioDecoder.Infinite = true;
+        await h.Engine.OpenAsync("movie.mp4");
+
+        // First session: bind, play, then leave the screen (Stop + the view
+        // destroys the host window).
+        h.Engine.SetOutputWindow(new IntPtr(0x1111));
+        h.Engine.ResizeOutput(867, 486);
+        h.Engine.Play();
+        h.Engine.Stop();
+
+        // Regression: reopening the screen creates a fresh host HWND; the
+        // singleton engine kept its swap chain bound to the destroyed window,
+        // so every subsequent session rendered broken output.
+        h.Engine.SetOutputWindow(new IntPtr(0x2222));
+
+        h.VideoRenderer.DisposeCount.Should().Be(1,
+            "the renderer bound to the dead window must be rebuilt");
+        h.VideoRenderer.IsInitialized.Should().BeTrue();
+        h.VideoRenderer.InitializedWindow.Should().Be(new IntPtr(0x2222));
+        h.VideoRenderer.InitializedWidth.Should().Be(867);
+        h.VideoRenderer.InitializedHeight.Should().Be(486);
+    }
+
+    [Fact]
     public async Task ResizeOutput_ForwardsToRenderer()
     {
         using var h = TestEngines.Create();
