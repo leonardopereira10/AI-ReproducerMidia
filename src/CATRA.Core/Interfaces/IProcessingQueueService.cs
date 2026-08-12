@@ -25,10 +25,24 @@ public interface IProcessingQueueService
     /// Enqueues episodes for processing under <paramref name="profile"/>. Each episode
     /// becomes a persisted <see cref="ProcessJob"/> in <see cref="JobStatus.Queued"/>.
     /// Re-enqueueing an episode that already has an active (queued/processing) job is a
-    /// no-op; a terminal (completed/failed/cancelled) job is reactivated in place (the
-    /// <c>ProcessJob</c> table is unique per episode+profile).
+    /// no-op; a failed/cancelled job is reactivated in place (the <c>ProcessJob</c>
+    /// table is unique per episode+profile).
     /// </summary>
-    Task EnqueueAsync(List<int> episodeIds, ProcessProfile profile);
+    /// <param name="episodeIds">Episodes to enqueue.</param>
+    /// <param name="profile">Processing profile for the jobs.</param>
+    /// <param name="forceReprocess">
+    /// When <c>true</c>, bypasses the completed-job skip and reactivates even a valid
+    /// <see cref="JobStatus.Completed"/> job. Defaults to <c>false</c>.
+    /// </param>
+    /// <remarks>
+    /// A <see cref="JobStatus.Completed"/> job is skipped (stays completed, nothing
+    /// queued) when its (episode, profile) <see cref="ProcessedFile"/> is valid: the
+    /// output file exists on disk and its <c>SourceHash</c> matches the episode's
+    /// current <c>FileHash</c> (a null/empty episode hash counts as valid — not stale).
+    /// Missing output file, stale hash or missing processed-file record re-enqueue the
+    /// job instead. Pass <paramref name="forceReprocess"/> = <c>true</c> to bypass.
+    /// </remarks>
+    Task EnqueueAsync(List<int> episodeIds, ProcessProfile profile, bool forceReprocess = false);
 
     /// <summary>
     /// Cooperatively cancels the job currently being processed (if any). The pipeline

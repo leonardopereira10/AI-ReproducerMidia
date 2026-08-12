@@ -33,6 +33,7 @@ public sealed class ProcessingQueueService : IProcessingQueueService, IDisposabl
     private readonly IProcessedFileRepository _processedFiles;
     private readonly IProcessingPipeline _pipeline;
     private readonly IAppSettingsRepository _settings;
+    private readonly Func<string, bool> _fileExists;
 
     private readonly Channel<ProcessJob> _channel =
         Channel.CreateUnbounded<ProcessJob>(new UnboundedChannelOptions { SingleReader = true });
@@ -47,18 +48,24 @@ public sealed class ProcessingQueueService : IProcessingQueueService, IDisposabl
     private bool _disposed;
 
     /// <summary>Creates the queue service over its dependencies.</summary>
+    /// <param name="fileExists">
+    /// Optional filesystem probe used by the completed-job skip check; defaults to
+    /// <see cref="File.Exists"/>. Injectable so tests can stub disk state.
+    /// </param>
     public ProcessingQueueService(
         IProcessJobRepository jobs,
         IEpisodeRepository episodes,
         IProcessedFileRepository processedFiles,
         IProcessingPipeline pipeline,
-        IAppSettingsRepository settings)
+        IAppSettingsRepository settings,
+        Func<string, bool>? fileExists = null)
     {
         _jobs = jobs ?? throw new ArgumentNullException(nameof(jobs));
         _episodes = episodes ?? throw new ArgumentNullException(nameof(episodes));
         _processedFiles = processedFiles ?? throw new ArgumentNullException(nameof(processedFiles));
         _pipeline = pipeline ?? throw new ArgumentNullException(nameof(pipeline));
         _settings = settings ?? throw new ArgumentNullException(nameof(settings));
+        _fileExists = fileExists ?? File.Exists;
     }
 
     /// <inheritdoc />
@@ -86,14 +93,29 @@ public sealed class ProcessingQueueService : IProcessingQueueService, IDisposabl
     }
 
     /// <inheritdoc />
-    public Task EnqueueAsync(List<int> episodeIds, ProcessProfile profile)
+    public Task EnqueueAsync(List<int> episodeIds, ProcessProfile profile, bool forceReprocess = false)
     {
         ArgumentNullException.ThrowIfNull(episodeIds);
 
+        // Phase 1 — resolve the completed-job skip OUTSIDE the lock: repository lookups,
+        // File.Exists and hash comparison are I/O-ish work that must not hold _gate.
+        var resolution = new List<(int EpisodeId, bool Skip)>(episodeIds.Count);
+        foreach (int episodeId in episodeIds)
+        {
+            resolution.Add((episodeId, !forceReprocess && ShouldSkipCompleted(episodeId, profile)));
+        }
+
+        // Phase 2 — mutation only, under the lock (reactivation / insert / channel write).
         lock (_gate)
         {
-            foreach (int episodeId in episodeIds)
+            foreach ((int episodeId, bool skip) in resolution)
             {
+                if (skip)
+                {
+                    // Completed with a valid ProcessedFile: stays Completed, nothing queued.
+                    continue;
+                }
+
                 ProcessJob? existing = FindJob(episodeId, profile);
                 ProcessJob job;
 
@@ -135,6 +157,38 @@ public sealed class ProcessingQueueService : IProcessingQueueService, IDisposabl
         }
 
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Skip check for a <see cref="JobStatus.Completed"/> job: the (episode, profile)
+    /// pair has a valid <see cref="ProcessedFile"/> when the output file still exists on
+    /// disk and its <c>SourceHash</c> matches the episode's current <c>FileHash</c> (a
+    /// null/empty episode hash counts as valid — not stale). Only ever called outside
+    /// <c>lock (_gate)</c>; any race is benign because the worker re-reads the job from
+    /// the database before processing.
+    /// </summary>
+    private bool ShouldSkipCompleted(int episodeId, ProcessProfile profile)
+    {
+        ProcessJob? existing = FindJob(episodeId, profile);
+        if (existing is null || existing.Status != JobStatus.Completed)
+        {
+            return false;
+        }
+
+        ProcessedFile? processed = _processedFiles.GetByEpisodeAndProfile(episodeId, profile);
+        if (processed is null || string.IsNullOrEmpty(processed.FilePath) || !_fileExists(processed.FilePath))
+        {
+            return false; // no record, empty path or file vanished from disk → re-enqueue
+        }
+
+        Episode? episode = _episodes.GetById(episodeId);
+        if (episode is null)
+        {
+            return false; // cannot validate → re-enqueue; worker will FailJob it
+        }
+
+        // Null/empty source hash = not stale (coherent with EpisodeProcessStatusMapper).
+        return string.IsNullOrEmpty(episode.FileHash) || episode.FileHash == processed.SourceHash;
     }
 
     /// <inheritdoc />

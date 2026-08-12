@@ -117,9 +117,9 @@ internal sealed class FakeProcessedFileUsage : IProcessedFileUsage
 internal sealed class FakeProcessingQueue : IProcessingQueueService
 {
     private readonly object _gate = new();
-    private readonly List<(List<int> Ids, ProcessProfile Profile)> _enqueueCalls = new();
+    private readonly List<(List<int> Ids, ProcessProfile Profile, bool ForceReprocess)> _enqueueCalls = new();
 
-    public IReadOnlyList<(List<int> Ids, ProcessProfile Profile)> EnqueueCalls
+    public IReadOnlyList<(List<int> Ids, ProcessProfile Profile, bool ForceReprocess)> EnqueueCalls
     {
         get { lock (_gate) { return _enqueueCalls.ToList(); } }
     }
@@ -138,11 +138,11 @@ internal sealed class FakeProcessingQueue : IProcessingQueueService
 
     public List<ProcessJob> QueuedJobs { get; } = new();
 
-    public Task EnqueueAsync(List<int> episodeIds, ProcessProfile profile)
+    public Task EnqueueAsync(List<int> episodeIds, ProcessProfile profile, bool forceReprocess = false)
     {
         lock (_gate)
         {
-            _enqueueCalls.Add((episodeIds.ToList(), profile));
+            _enqueueCalls.Add((episodeIds.ToList(), profile, forceReprocess));
         }
 
         return Task.CompletedTask;

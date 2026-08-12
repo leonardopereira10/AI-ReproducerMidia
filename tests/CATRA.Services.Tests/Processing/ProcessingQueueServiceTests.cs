@@ -72,6 +72,46 @@ public sealed class ProcessingQueueServiceTests : IDisposable
             FilePath = Path.Combine(_workDirectory, $"s{mediaItemId}-ep{number}.mkv"),
         });
 
+    /// <summary>Creates a queue service sharing the test repositories but with a stubbed filesystem probe.</summary>
+    private ProcessingQueueService CreateService(Func<string, bool> fileExists) =>
+        new(_jobs, _episodes, _processedFiles, _pipeline, _settings, fileExists);
+
+    /// <summary>
+    /// Seeds an episode + <see cref="JobStatus.Completed"/> job + matching
+    /// <see cref="ProcessedFile"/> so the skip logic can be exercised without running
+    /// the worker. Filesystem state itself is stubbed via the injected fileExists probe.
+    /// </summary>
+    private (Episode Ep, ProcessJob Job, ProcessedFile Processed) SeedCompletedJob(
+        string? episodeFileHash,
+        string sourceHash,
+        string filePath = @"C:\fake\output.mp4")
+    {
+        Episode ep = SeedEpisode();
+        ep.FileHash = episodeFileHash;
+        _episodes.Update(ep);
+
+        ProcessJob job = _jobs.Insert(new ProcessJob
+        {
+            EpisodeId = ep.Id,
+            Profile = ProcessProfile.Local,
+            Status = JobStatus.Completed,
+            ProgressPct = 100d,
+            CompletedAt = DateTime.UtcNow,
+        });
+
+        ProcessedFile processed = _processedFiles.Insert(new ProcessedFile
+        {
+            EpisodeId = ep.Id,
+            Profile = ProcessProfile.Local,
+            FilePath = filePath,
+            FileSizeBytes = 14,
+            SourceHash = sourceHash,
+            ProcessedAt = DateTime.UtcNow,
+        });
+
+        return (ep, job, processed);
+    }
+
     /// <summary>Waits for <paramref name="count"/> terminal (completed/failed) job events.</summary>
     private Task WaitTerminalAsync(int count, int timeoutMs = 10_000)
     {
@@ -363,13 +403,173 @@ public sealed class ProcessingQueueServiceTests : IDisposable
         await first;
         _jobs.GetAll().Single().Status.Should().Be(JobStatus.Completed);
 
+        // The job now has a valid ProcessedFile (file written + matching hash), so a
+        // plain re-enqueue would skip it — reactivation requires forceReprocess.
         Task second = WaitTerminalAsync(1);
-        await _service.EnqueueAsync(new List<int> { ep.Id }, ProcessProfile.Local);
+        await _service.EnqueueAsync(new List<int> { ep.Id }, ProcessProfile.Local, forceReprocess: true);
         await second;
 
         _jobs.GetAll().Should().HaveCount(1, "the unique (episode, profile) row is reused");
         _jobs.GetAll().Single().Status.Should().Be(JobStatus.Completed);
         _pipeline.CallCount.Should().Be(2);
+    }
+
+    // ── completed-job skip (subtask 01) ─────────────────────────────────────
+
+    [Fact]
+    public async Task Enqueue_CompletedWithValidProcessedFile_Skips()
+    {
+        var (ep, _, _) = SeedCompletedJob(episodeFileHash: "hash-1", sourceHash: "hash-1");
+        using ProcessingQueueService service = CreateService(_ => true);
+
+        await service.EnqueueAsync(new List<int> { ep.Id }, ProcessProfile.Local);
+
+        _jobs.GetAll().Single().Status.Should().Be(JobStatus.Completed, "a valid ProcessedFile skips the job");
+        service.QueuedJobs.Should().BeEmpty("nothing may reach the channel");
+        _pipeline.CallCount.Should().Be(0);
+    }
+
+    [Fact]
+    public async Task Enqueue_CompletedWithValidProcessedFile_ForceReprocess_Reactivates()
+    {
+        var (ep, _, _) = SeedCompletedJob(episodeFileHash: "hash-1", sourceHash: "hash-1");
+        using ProcessingQueueService service = CreateService(_ => true);
+
+        await service.EnqueueAsync(new List<int> { ep.Id }, ProcessProfile.Local, forceReprocess: true);
+
+        ProcessJob job = _jobs.GetAll().Single();
+        job.Status.Should().Be(JobStatus.Queued, "forceReprocess bypasses the skip");
+        job.ProgressPct.Should().Be(0d);
+        service.QueuedJobs.Should().HaveCount(1);
+    }
+
+    [Fact]
+    public async Task Enqueue_CompletedWithMissingFile_Reenqueues()
+    {
+        var (ep, _, _) = SeedCompletedJob(episodeFileHash: "hash-1", sourceHash: "hash-1");
+        using ProcessingQueueService service = CreateService(_ => false);
+
+        await service.EnqueueAsync(new List<int> { ep.Id }, ProcessProfile.Local);
+
+        _jobs.GetAll().Single().Status.Should().Be(JobStatus.Queued, "the output file vanished from disk");
+        service.QueuedJobs.Should().HaveCount(1);
+    }
+
+    [Fact]
+    public async Task Enqueue_CompletedWithStaleHash_Reenqueues()
+    {
+        var (ep, _, _) = SeedCompletedJob(episodeFileHash: "new-hash", sourceHash: "old-hash");
+        using ProcessingQueueService service = CreateService(_ => true);
+
+        await service.EnqueueAsync(new List<int> { ep.Id }, ProcessProfile.Local);
+
+        _jobs.GetAll().Single().Status.Should().Be(JobStatus.Queued, "source changed since processing (stale)");
+        service.QueuedJobs.Should().HaveCount(1);
+    }
+
+    [Fact]
+    public async Task Enqueue_CompletedWithNullEpisodeHash_AndExistingFile_Skips()
+    {
+        var (ep, _, _) = SeedCompletedJob(episodeFileHash: null, sourceHash: string.Empty);
+        using ProcessingQueueService service = CreateService(_ => true);
+
+        await service.EnqueueAsync(new List<int> { ep.Id }, ProcessProfile.Local);
+
+        _jobs.GetAll().Single().Status.Should().Be(JobStatus.Completed, "null source hash counts as not-stale");
+        service.QueuedJobs.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task Enqueue_CompletedWithEmptyFilePath_Reenqueues()
+    {
+        var (ep, _, _) = SeedCompletedJob(episodeFileHash: "hash-1", sourceHash: "hash-1", filePath: string.Empty);
+        using ProcessingQueueService service = CreateService(_ => true);
+
+        await service.EnqueueAsync(new List<int> { ep.Id }, ProcessProfile.Local);
+
+        _jobs.GetAll().Single().Status.Should().Be(JobStatus.Queued, "an empty FilePath can never be valid");
+        service.QueuedJobs.Should().HaveCount(1);
+    }
+
+    [Fact]
+    public async Task Enqueue_CompletedWithoutProcessedFileRecord_Reenqueues()
+    {
+        var ep = SeedEpisode();
+        ep.FileHash = "hash-1";
+        _episodes.Update(ep);
+        _jobs.Insert(new ProcessJob
+        {
+            EpisodeId = ep.Id,
+            Profile = ProcessProfile.Local,
+            Status = JobStatus.Completed,
+            CompletedAt = DateTime.UtcNow,
+        });
+        using ProcessingQueueService service = CreateService(_ => true);
+
+        await service.EnqueueAsync(new List<int> { ep.Id }, ProcessProfile.Local);
+
+        _jobs.GetAll().Single().Status.Should().Be(JobStatus.Queued, "no ProcessedFile record means nothing to validate");
+        service.QueuedJobs.Should().HaveCount(1);
+    }
+
+    [Theory]
+    [InlineData(JobStatus.Failed)]
+    [InlineData(JobStatus.Cancelled)]
+    public async Task Enqueue_FailedOrCancelled_IsReactivated_RegardlessOfFileState(JobStatus status)
+    {
+        var ep = SeedEpisode();
+        _jobs.Insert(new ProcessJob
+        {
+            EpisodeId = ep.Id,
+            Profile = ProcessProfile.Local,
+            Status = status,
+            ErrorMessage = "boom",
+            CompletedAt = DateTime.UtcNow,
+        });
+        // Even a stub reporting an existing file must not skip non-Completed terminals.
+        using ProcessingQueueService service = CreateService(_ => true);
+
+        await service.EnqueueAsync(new List<int> { ep.Id }, ProcessProfile.Local);
+
+        ProcessJob job = _jobs.GetAll().Single();
+        job.Status.Should().Be(JobStatus.Queued, $"a {status} job is always reactivated");
+        job.ErrorMessage.Should().BeNull();
+        service.QueuedJobs.Should().HaveCount(1);
+    }
+
+    [Theory]
+    [InlineData(JobStatus.Queued)]
+    [InlineData(JobStatus.Processing)]
+    public async Task Enqueue_ActiveJob_IsNoOp(JobStatus status)
+    {
+        var ep = SeedEpisode();
+        _jobs.Insert(new ProcessJob
+        {
+            EpisodeId = ep.Id,
+            Profile = ProcessProfile.Local,
+            Status = status,
+            CreatedAt = DateTime.UtcNow,
+        });
+        using ProcessingQueueService service = CreateService(_ => true);
+
+        await service.EnqueueAsync(new List<int> { ep.Id }, ProcessProfile.Local);
+
+        ProcessJob job = _jobs.GetAll().Single();
+        job.Status.Should().Be(status, "active jobs are never duplicated nor touched");
+        service.QueuedJobs.Should().BeEmpty("no-op adds nothing to the channel");
+    }
+
+    [Fact]
+    public async Task Enqueue_FakeRecords_ForceReprocessFlag()
+    {
+        var fake = new FakeProcessingQueue();
+
+        await fake.EnqueueAsync(new List<int> { 1 }, ProcessProfile.Local);
+        await fake.EnqueueAsync(new List<int> { 2 }, ProcessProfile.Dlna, forceReprocess: true);
+
+        fake.EnqueueCalls[0].ForceReprocess.Should().BeFalse();
+        fake.EnqueueCalls[1].ForceReprocess.Should().BeTrue();
+        fake.EnqueueCalls[1].Profile.Should().Be(ProcessProfile.Dlna);
     }
 
     // ── lifecycle ──────────────────────────────────────────────────────────
