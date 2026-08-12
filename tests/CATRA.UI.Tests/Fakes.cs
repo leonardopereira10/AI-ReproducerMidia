@@ -14,15 +14,17 @@ namespace CATRA.UI.Tests;
 /// </summary>
 internal sealed class FakePlaybackEngine : IPlaybackEngine
 {
-    public VideoMetadata Metadata { get; set; } = new(
-        Duration: TimeSpan.FromMinutes(22),
-        Fps: 135,
-        Width: 1920,
-        Height: 1080,
-        VideoCodec: "hevc",
-        AudioCodec: "aac",
-        Title: "fake",
-        IsHardwareAccelerated: true);
+    public VideoMetadata Metadata { get; set; } = new VideoMetadata
+    {
+        Duration = TimeSpan.FromMinutes(22),
+        Fps = 135,
+        Width = 1920,
+        Height = 1080,
+        VideoCodec = "hevc",
+        AudioCodec = "aac",
+        Title = "fake",
+        IsHardwareAccelerated = true
+    };
 
     public Exception? ThrowOnOpen { get; set; }
 
@@ -541,7 +543,7 @@ internal sealed class FakeSlidingWindowService : ISlidingWindowService
 /// </summary>
 internal sealed class FakeProcessingQueueService : IProcessingQueueService
 {
-    public List<(List<int> EpisodeIds, ProcessProfile Profile)> EnqueueCalls { get; } = new();
+    public List<(List<int> EpisodeIds, ProcessProfile Profile, bool ForceReprocess)> EnqueueCalls { get; } = new();
 
     public int CancelCurrentCount { get; private set; }
 
@@ -563,9 +565,9 @@ internal sealed class FakeProcessingQueueService : IProcessingQueueService
 
     public event EventHandler<CATRA.Core.Processing.PipelineProgress>? ProgressChanged;
 
-    public Task EnqueueAsync(List<int> episodeIds, ProcessProfile profile)
+    public Task EnqueueAsync(List<int> episodeIds, ProcessProfile profile, bool forceReprocess = false)
     {
-        EnqueueCalls.Add((episodeIds, profile));
+        EnqueueCalls.Add((episodeIds, profile, forceReprocess));
         return Task.CompletedTask;
     }
 
