@@ -95,6 +95,19 @@
           DestinationFolder="$(CatraOutputNativeDir)"
           SkipUnchangedFiles="true"
           Condition="'$(NativeBuildEnabled)' == 'true'" />
+
+    <!-- SPRINT_04 ST-01: deploy the 8 FFX runtime DLLs (list A1) + MIT license
+         (FFX-LICENSE.txt) next to catra-gpu.dll so ffx_runtime's LoadLibrary
+         resolves the sibling DLLs from the module directory. Mirrors the
+         _OnnxDlls pattern above; the Exists() gate keeps the build green on
+         machines without a native install. -->
+    <ItemGroup Condition="'$(NativeBuildEnabled)' == 'true' And Exists('$(CatraNativeDir)\amd_fidelityfx_loader_dx12.dll')">
+      <_FfxDlls Include="$(CatraNativeDir)\amd_fidelityfx_loader_dx12.dll;$(CatraNativeDir)\amd_fidelityfx_upscaler_dx12.dll;$(CatraNativeDir)\amd_fidelityfx_framegeneration_dx12.dll;$(CatraNativeDir)\amd_ags_x64.dll;$(CatraNativeDir)\amd_acs_x64.dll;$(CatraNativeDir)\D3D12Core.dll;$(CatraNativeDir)\dxcompiler.dll;$(CatraNativeDir)\dxil.dll;$(CatraNativeDir)\FFX-LICENSE.txt" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_FfxDlls)"
+          DestinationFolder="$(CatraOutputNativeDir)"
+          SkipUnchangedFiles="true"
+          Condition="'$(NativeBuildEnabled)' == 'true' And Exists('$(CatraNativeDir)\amd_fidelityfx_loader_dx12.dll')" />
   </Target>
 
 </Project>

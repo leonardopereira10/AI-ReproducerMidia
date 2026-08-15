@@ -43,6 +43,27 @@ endif()
 # dxguid.lib comes from the Windows SDK (linked below as a system lib).
 find_package(directx-headers CONFIG QUIET)
 
+# --- FidelityFX SDK 2.3.0 (SPRINT_04 ST-01) ---------------------------------
+# The FFX API is RUNTIME-LOADED (LoadLibrary/GetProcAddress via ffx_runtime.cpp):
+# there is NO build-time dependency on any FFX import lib. The API headers are
+# vendored (MIT) at lib/FidelityFX-SDK-2.3.0 and the 8 runtime DLLs come from
+# the prebuilt FidelityFX Samples package (user-supplied, not committed).
+set(CATRA_FFX_SDK_HEADERS "${CMAKE_SOURCE_DIR}/../../lib/FidelityFX-SDK-2.3.0"
+    CACHE PATH "Vendored FidelityFX SDK 2.3.0 headers (MIT)")
+set(CATRA_FFX_DLL_DIR "${CMAKE_SOURCE_DIR}/../../lib/FidelityFX-Samples-v2.3.0-prebuilt/Samples/Upscalers/FidelityFX_FSR/dx12/x64/Release"
+    CACHE PATH "Prebuilt FFX runtime DLLs (samples package)")
+# List A1: the 8 FFX runtime DLLs deployed next to catra-gpu.dll.
+set(CATRA_FFX_DLLS amd_fidelityfx_loader_dx12.dll amd_fidelityfx_upscaler_dx12.dll
+    amd_fidelityfx_framegeneration_dx12.dll amd_ags_x64.dll amd_acs_x64.dll
+    D3D12Core.dll dxcompiler.dll dxil.dll)
+
+if(NOT EXISTS "${CATRA_FFX_SDK_HEADERS}/api/include/ffx_api.h")
+    message(FATAL_ERROR
+        "catra-gpu: vendored FFX API headers not found at "
+        "${CATRA_FFX_SDK_HEADERS}/api/include/ffx_api.h. ffx_runtime requires "
+        "the vendored FidelityFX SDK 2.3.0 headers (lib/FidelityFX-SDK-2.3.0).")
+endif()
+
 # --- ONNX Runtime (RIFE frame interpolation, ST-13) -------------------------
 # Resolved from vcpkg (onnxruntime-gpu) by default. A manual install can be
 # pointed at via -DCATRA_ONNXRUNTIME_ROOT=<prefix> (expects include/ + lib/
@@ -257,12 +278,22 @@ add_library(catra-gpu SHARED
     catra_gpu.cpp
     d3d_interop.cpp
     encode_amf.cpp
+    ffx_runtime.cpp
     interp_rife.cpp
     nv12_to_bgra_shader.cpp
     upscale_fsr1.cpp
     upscale_fsr4.cpp)
 
 target_include_directories(catra-gpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Vendored FFX API headers (runtime-loaded only — NO FFX .lib is linked).
+# The layout of lib/FidelityFX-SDK-2.3.0 mirrors the SDK, so the headers'
+# internal relative includes (e.g. ffx_upscale.h -> ../../api/include/ffx_api.h)
+# resolve as-is; do not restructure that directory.
+target_include_directories(catra-gpu PRIVATE
+    "${CATRA_FFX_SDK_HEADERS}/api/include"
+    "${CATRA_FFX_SDK_HEADERS}/upscalers/include"
+    "${CATRA_FFX_SDK_HEADERS}/framegeneration/include")
 
 # Link PyTorch/libtorch if found (ROCm backend)
 if(CATRA_HAS_PYTORCH)
@@ -350,6 +381,39 @@ if(CATRA_ONNXRUNTIME_TARGET)
 endif()
 if(CATRA_HAS_DML)
     target_compile_definitions(catra-interop-test PRIVATE USE_DML=1)
+endif()
+
+# --- FFX runtime smoke test (SPRINT_04 ST-01, NOT installed/shipped) --------
+# Loads the 8 FFX runtime DLLs (list A1), resolves the 5 ffx exports via
+# catra::ffx::FfxRuntime and validates ffxQueryDescGetVersions reports an
+# FFX 2.3.x upscale provider. Exit codes: 1 DLL load, 2 export resolution,
+# 3 no DX12 adapter, 4 version mismatch. The POST_BUILD copies co-locate the
+# runtime DLLs with the exe (LoadLibrary search order resolves them there).
+add_executable(catra-ffx-load-test
+    tools/ffx_load_smoke_test.cpp
+    ffx_runtime.cpp)
+target_include_directories(catra-ffx-load-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    "${CATRA_FFX_SDK_HEADERS}/api/include"
+    "${CATRA_FFX_SDK_HEADERS}/upscalers/include"
+    "${CATRA_FFX_SDK_HEADERS}/framegeneration/include")
+if(MSVC)
+    target_compile_options(catra-ffx-load-test PRIVATE /W3 /utf-8 /EHsc)
+    target_compile_definitions(catra-ffx-load-test PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+target_link_libraries(catra-ffx-load-test PRIVATE d3d12 dxgi dxguid)
+
+if(EXISTS "${CATRA_FFX_DLL_DIR}")
+    foreach(_dll IN LISTS CATRA_FFX_DLLS)
+        add_custom_command(TARGET catra-ffx-load-test POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${CATRA_FFX_DLL_DIR}/${_dll}" "$<TARGET_FILE_DIR:catra-ffx-load-test>/${_dll}"
+            COMMAND_EXPAND_LISTS)
+    endforeach()
+else()
+    message(WARNING
+        "catra-gpu: FFX prebuilt DLL dir not found at ${CATRA_FFX_DLL_DIR} -> "
+        "catra-ffx-load-test builds but cannot run (runtime DLLs missing).")
 endif()
 
 # Optional vcpkg-provided packages (linked when the toolchain resolved them).
@@ -495,3 +559,14 @@ if(CATRA_ONNXRUNTIME_TARGET)
         install(FILES ${_ort_runtime_dlls} DESTINATION runtimes/win-x64/native OPTIONAL)
     endif()
 endif()
+
+# Deploy the 8 FFX runtime DLLs (list A1) + the MIT license next to
+# catra-gpu.dll (SPRINT_04 ST-01; plan adjustments A1 + A7). The loader
+# resolves the sibling DLLs from the module directory at runtime. OPTIONAL
+# keeps `cmake --install` green on clones without the prebuilt samples package.
+foreach(_dll IN LISTS CATRA_FFX_DLLS)
+    install(FILES "${CATRA_FFX_DLL_DIR}/${_dll}"
+            DESTINATION runtimes/win-x64/native OPTIONAL)
+endforeach()
+install(FILES "${CATRA_FFX_SDK_HEADERS}/LICENSE"
+        DESTINATION runtimes/win-x64/native RENAME FFX-LICENSE.txt OPTIONAL)
