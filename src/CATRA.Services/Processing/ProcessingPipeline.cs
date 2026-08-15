@@ -235,15 +235,26 @@ public sealed class ProcessingPipeline : IProcessingPipeline
             // ST-30: Calculate effective fps for encoder (floor-based).
             // With floor mode, the actual output fps is srcFps * floor(targetFps/srcFps).
             // Example: src=25fps, target=60Hz -> floor(2.4)=2 -> effective=50fps.
-            double effectiveFps = config.TargetFps;
+            //
+            // bugfix_06: this SAME rate is handed to the audio mux, so the muxed video
+            // timestamps match the encoded frame rate exactly. When interpolation is
+            // skipped the frames arrive at the SOURCE fps (not TargetFps), so that is
+            // the effective rate — using TargetFps there would stretch/shrink the video
+            // track against the audio by TargetFps/srcFps.
+            double effectiveFps;
             if (needInterp && meta.Fps > 0)
             {
                 double ratio = config.TargetFps / meta.Fps;
                 int intRatio = (int)Math.Floor(ratio);
-                if (intRatio > 0)
-                {
-                    effectiveFps = meta.Fps * intRatio;
-                }
+                effectiveFps = intRatio > 0 ? meta.Fps * intRatio : config.TargetFps;
+            }
+            else if (meta.Fps > 0)
+            {
+                effectiveFps = meta.Fps; // pass-through: frames keep the source rate
+            }
+            else
+            {
+                effectiveFps = config.TargetFps; // unknown source fps: best available guess
             }
 
             encodeContext = _bridge.CreateEncoder(
@@ -277,8 +288,10 @@ public sealed class ProcessingPipeline : IProcessingPipeline
                 weights, loopStep, timer.Elapsed);
 
             // 6. Mux audio (2-pass): combine source audio with the encoded video.
+            //    bugfix_06: pass the exact encode fps — the raw H.265 stream carries no
+            //    container timestamps, and the mux must not guess the rate (A/V drift).
             ReportMuxProgress(progress, episodeIndex, episodeCount, weights, 0, timer.Elapsed);
-            _audioMuxer.Mux(episode.FilePath, tempVideoPath, outputPath);
+            _audioMuxer.Mux(episode.FilePath, tempVideoPath, outputPath, effectiveFps);
             ReportMuxProgress(progress, episodeIndex, episodeCount, weights, 100, timer.Elapsed);
 
             TryDelete(tempVideoPath);

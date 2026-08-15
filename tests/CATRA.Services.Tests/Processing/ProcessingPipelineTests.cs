@@ -103,12 +103,12 @@ internal sealed class FakeAudioMuxer : IAudioMuxer
 
     public bool Fail { get; set; }
 
-    public List<(string Source, string Video, string Final)> Calls { get; } = new();
+    public List<(string Source, string Video, string Final, double Fps)> Calls { get; } = new();
 
-    public void Mux(string sourcePath, string encodedVideoPath, string finalOutputPath)
+    public void Mux(string sourcePath, string encodedVideoPath, string finalOutputPath, double videoFps)
     {
         MuxCallCount++;
-        Calls.Add((sourcePath, encodedVideoPath, finalOutputPath));
+        Calls.Add((sourcePath, encodedVideoPath, finalOutputPath, videoFps));
         if (Fail)
         {
             throw new IOException("mux failed");
@@ -507,6 +507,55 @@ public class ProcessingPipelineTests : IDisposable
         bridge.LastEncodeBitrate.Should().Be(20_000);
         // ST-30 floor mode: encoder fps = srcFps * floor(target/src) = 24 * 5 = 120.
         bridge.LastEncodeFps.Should().Be(120);
+    }
+
+    // --- bugfix_06: mux must receive the exact encode fps (A/V sync) --------
+
+    [Fact]
+    public async Task Bugfix06_Mux_ReceivesEffectiveInterpFps()
+    {
+        // 24 fps source, 135 fps target -> floor(135/24)=5 -> effective 120 fps.
+        // The mux must get the SAME rate the encoder used, otherwise the muxed
+        // video timestamps drift against the audio.
+        string folder = NewTempFolder();
+        var spec = new FakeDecoderSpec
+        {
+            Metadata = new FrameSourceMetadata(24, 1280, 720, TimeSpan.FromSeconds(2), 3),
+            FrameCount = 3,
+        };
+        var (pipeline, bridge, muxer, _) = Build(spec);
+
+        ProcessResult result = await pipeline.ProcessAsync(
+            Ep(1, Path.Combine(folder, "s.mp4")), LocalConfig(folder), new CapturingProgress(), CancellationToken.None);
+
+        result.Success.Should().BeTrue();
+        bridge.LastEncodeFps.Should().Be(120);
+        muxer.MuxCallCount.Should().Be(1);
+        muxer.Calls[0].Fps.Should().Be(bridge.LastEncodeFps,
+            "the mux must timestamp the video with the exact encode fps");
+    }
+
+    [Fact]
+    public async Task Bugfix06_Mux_PassThrough_ReceivesSourceFps_NotTargetFps()
+    {
+        // No interpolation (source already meets the target): frames arrive at the
+        // SOURCE fps, so both encoder and mux must use it — using TargetFps would
+        // stretch the video track against the audio by TargetFps/srcFps.
+        string folder = NewTempFolder();
+        var spec = new FakeDecoderSpec
+        {
+            Metadata = new FrameSourceMetadata(60, 1920, 1080, TimeSpan.FromSeconds(2), 4),
+            FrameCount = 4,
+        };
+        var (pipeline, bridge, muxer, _) = Build(spec);
+
+        ProcessResult result = await pipeline.ProcessAsync(
+            Ep(2, Path.Combine(folder, "s.mp4")), DlnaConfig(folder), new CapturingProgress(), CancellationToken.None);
+
+        result.Success.Should().BeTrue();
+        bridge.InterpCreateCount.Should().Be(0, "source fps (60) already meets the dlna target (55)");
+        bridge.LastEncodeFps.Should().Be(60, "pass-through encodes at the source rate");
+        muxer.Calls[0].Fps.Should().Be(60);
     }
 
     // --- graceful degradation: interp unavailable ----------------------------
