@@ -402,9 +402,11 @@ int catra_get_upscale_mode(void)
 
 int catra_is_fsr4_available(void)
 {
-    // Probes the active adapter (AMD + RDNA 4 + a throw-away FidelityFX context).
-    // Returns 0 before catra_init (no active adapter) and whenever the bridge
-    // was built without the FSR 4 SDK or the adapter is not RDNA 4.
+    // Probes the active adapter with RUNTIME-LOAD semantics (SPRINT_04 subtask
+    // 02 — no build-time gate): FFX loader + 5 ffx exports, the 8 FFX runtime
+    // DLLs next to catra-gpu.dll and a throw-away FFX upscale context on the
+    // adapter (the FFX runtime picks FSR 4 ML on RDNA 4, FSR 3.1 elsewhere).
+    // Returns 0 before catra_init (no active adapter) and on any probe failure.
     return GuardCabi([&]() -> int {
         return catra::Fsr4IsAvailable(g_device.Get()) ? 1 : 0;
     });
@@ -541,8 +543,9 @@ int catra_upscale_create(int src_w, int src_h,
                     "catra_upscale_create: unknown method %d -> passthrough", method);
         }
 
-        // Resolve the effective method: FSR 4 downgrades to FSR 1 when the SDK
-        // is absent or the adapter is not RDNA 4 (RN-07 / risk mitigation). The
+        // Resolve the effective method: FSR 4 downgrades to FSR 1 when the
+        // FFX runtime is unavailable (loader/8 DLLs missing or the throw-away
+        // context probe fails on the adapter — RN-07 / risk mitigation). The
         // (potentially expensive) availability probe runs ONLY when FSR 4 was
         // actually requested; for passthrough/FSR 1 we pass false, which
         // ResolveUpscaleMethod ignores for those methods.
@@ -653,6 +656,27 @@ int catra_upscale_process(int ctx, void* src_texture, void** dst_texture)
         }
         *dst_texture = dst12; // caller owns the reference
         return CATRA_OK;
+    });
+}
+
+int catra_upscale_reset(int ctx)
+{
+    // Scene-cut signal (SPRINT_04 subtask 02, additive — D-PO-1): the next
+    // FSR 4/3.1 dispatch on this context runs with reset=true, flushing the
+    // temporal accumulation. FSR 1 / passthrough have no temporal state ->
+    // no-op CATRA_OK. Unknown handle -> CATRA_ERR_CONTEXT.
+    return GuardCabi([&]() -> int {
+        UpscaleContext* c = LookupUpscale(ctx);
+        if (c == nullptr)
+        {
+            log_msg(CATRA_LOG_ERROR, "catra_upscale_reset: unknown context %d", ctx);
+            return CATRA_ERR_CONTEXT;
+        }
+        if (c->method == CATRA_UPSCALE_FSR4 && c->fsr4 != nullptr)
+        {
+            return c->fsr4->RequestSceneCut();
+        }
+        return CATRA_OK; // fsr1 / passthrough: nothing to reset
     });
 }
 

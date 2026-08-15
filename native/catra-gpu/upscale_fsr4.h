@@ -1,26 +1,36 @@
-// upscale_fsr4.h — FSR 4 (FidelityFX SDK) ML upscale backend (ST-14).
+// upscale_fsr4.h — FSR 4/3.1 (FidelityFX API 2.x) temporal upscale backend
+// (ST-14, SPRINT_04 subtask 02 — rewritten from the compile-gated stub).
 //
-// FSR 4 is AMD's machine-learning upscaler: it runs on the dedicated ML
-// accelerators of RDNA 4 GPUs (RX 9070 series) through DX12 compute shaders
-// shipped by the FidelityFX SDK. Unlike FSR 1 (spatial, self-contained — see
-// upscale_fsr1.h), FSR 4 depends on an EXTERNAL, license-gated SDK that is NOT
-// vendored into this repository:
+// The backend is ALWAYS compiled and RUNTIME-LOADED through the FFX API 2.x
+// flat C surface: catra::ffx::FfxRuntime (ffx_runtime.h, SPRINT_04 subtask 01)
+// LoadLibrary's amd_fidelityfx_loader_dx12.dll and resolves the 5 ffx entry
+// points (ffxCreateContext / ffxDestroyContext / ffxConfigure / ffxQuery /
+// ffxDispatch) via GetProcAddress. There is NO build-time dependency on any
+// FidelityFX import lib — only the vendored MIT headers in
+// lib/FidelityFX-SDK-2.3.0 (api/include + upscalers/include).
 //
-//   * The SDK is downloaded by the integrator from GPUOpen
-//     (https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) and pointed
-//     at via -DCATRA_FSR_SDK_ROOT=<path> at CMake configure time.
-//   * When that path is absent, CMake does NOT define CATRA_HAS_FSR4 and this
-//     backend compiles to an inert stub: Fsr4IsCompiled() == false,
-//     Fsr4IsAvailable() == false, Create() == CATRA_ERR_NOT_IMPL. The bridge
-//     then downgrades method=2 (FSR 4) to method=1 (FSR 1) so upscaling still
-//     works (RN-07 / risk mitigation). FSR 1 carries the Phase-2 MVP.
+// AVAILABILITY (runtime, not build time):
+//   Fsr4IsAvailable() == true only when the loader DLL + all 8 FFX runtime
+//   DLLs (list A1) are present next to catra-gpu.dll AND a throw-away upscale
+//   context initializes on the bridge's D3D12 adapter. The FFX runtime itself
+//   decides between FSR 4 ML (RDNA 4) and the FSR 3.1 fallback on the adapter
+//   — the backend does NOT pre-filter by vendor/device ID.
+//   When unavailable the bridge downgrades method=2 (FSR 4) to method=1
+//   (FSR 1 EASU, upscale_fsr1.h — untouched) so upscaling always works.
 //
-// API SURFACE (when CATRA_HAS_FSR4 is defined)
-//   The backend drives ffx::ContextUpscale (ffx_api/ffx_upscale.hpp). Create
-//   builds the context with maxRenderSize/displaySize = dst and a qualityMode
-//   mapped 1:1 from catra::UpscaleQualityMode; Process feeds the shared DX12
-//   input resource and reads back the upscaled output. The D3D11<->DX12 sharing
-//   reuses catra::ShareTexture (ST-15; a stub returning E_NOTIMPL for now).
+// VIDEO MODE (zero-MV): the FFX upscale API is temporal and expects color,
+// depth, motionVectors and jitterOffset from a game engine. CATRA is a video
+// pipeline with no engine MVs, so the backend feeds persistent zeroed dummies:
+//   * motionVectors: R32G32_FLOAT, srcW x srcH, cleared to 0
+//   * depth:         R32_FLOAT,    srcW x srcH, cleared to 0
+//   * jitterOffset:  (0, 0) every frame
+//   * reset=true on the first frame and after RequestSceneCut() (scene cut)
+// Quality limitation (ghosting across cuts until a reset is signalled) is
+// documented; FSR 1 (EASU) remains the export default.
+//
+// OUTPUT CONTRACT (PO decision D-PO-4): Process writes dstW x dstH
+// DXGI_FORMAT_B8G8R8A8_UNORM (BGRA — aligns with FSR 1 and AMF_SURFACE_BGRA;
+// RGBA was explicitly rejected, see docs/FSR_AMF_ISSUE_CONTEXT.md).
 //
 // THREADING: a single Fsr4Upscaler is not safe for concurrent Process calls.
 
@@ -39,16 +49,16 @@ namespace catra {
 
 class Fsr4Upscaler;
 
-// True iff the bridge was compiled against the FidelityFX SDK (CATRA_HAS_FSR4).
-// When false, every other FSR 4 entry point degrades gracefully.
-bool Fsr4IsCompiled();
-
-// Probes whether FSR 4 can actually run on the bridge's adapter:
-//   1. Fsr4IsCompiled() must be true (SDK present at build time),
-//   2. the DXGI adapter behind `d3d11Device` must be AMD (VendorID 0x1002) and
-//      RDNA 4 (device-ID heuristic + feature level),
-//   3. a throw-away FSR 4 context must initialize (the definitive check — the
-//      ML accelerators either exist or they do not).
+// Probes whether the FFX upscale runtime can actually run on the bridge's
+// adapter (runtime-load semantics — no build-time gate):
+//   1. the FFX loader loads (amd_fidelityfx_loader_dx12.dll + the 5 ffx
+//      exports resolve; catra::ffx::FfxRuntime::Load),
+//   2. all 8 FFX runtime DLLs (list A1) exist next to the module
+//      (FfxRuntime::ProbeDependencyDlls),
+//   3. a throw-away 64x64 -> 128x128 upscale context initializes on the D3D12
+//      device of `d3d11Device`'s adapter (the definitive check — the FFX
+//      runtime either finds a usable provider on this adapter or it does not;
+//      it picks FSR 4 ML on RDNA 4 and FSR 3.1 elsewhere).
 // Returns false on any failure; never throws. A null device returns false.
 bool Fsr4IsAvailable(ID3D11Device* d3d11Device);
 
@@ -61,21 +71,32 @@ public:
     Fsr4Upscaler(const Fsr4Upscaler&) = delete;
     Fsr4Upscaler& operator=(const Fsr4Upscaler&) = delete;
 
-    // Creates the ffx::ContextUpscale. Returns a CATRA_* code:
+    // Creates the ffx upscale context (flat C, runtime-loaded). `quality` has
+    // no field in the FFX 2.x create descriptor — it is kept for logging /
+    // diagnostics only (see upscale_fsr1.h SelectQualityMode). Returns a
+    // CATRA_* code:
     //   CATRA_OK              context ready
-    //   CATRA_ERR_NOT_IMPL    built without the FidelityFX SDK (CATRA_HAS_FSR4 off)
     //   CATRA_ERR_INVALID_ARG null device / non-positive dimensions
-    //   CATRA_ERR_DEVICE      adapter not RDNA 4 / context init failed /
-    //                         ST-15 interop not wired yet
+    //   CATRA_ERR_DEVICE      FFX runtime not loadable / DLLs missing /
+    //                         D3D12 device or ffxCreateContext failed
     static int Create(ID3D11Device* d3d11Device,
                       int srcW, int srcH, int dstW, int dstH,
                       UpscaleQualityMode quality,
                       std::unique_ptr<Fsr4Upscaler>& out);
 
-    // Upscales one frame: shares the D3D11 source into DX12, dispatches FSR 4,
-    // and writes an AddRef'd ID3D12Resource* (dstW x dstH) to *outDst (caller
-    // owns the reference). Returns a CATRA_* code.
+    // Upscales one frame: shares the D3D11 source into DX12, dispatches the
+    // FFX upscale effect (zero-MV video mode), and writes an AddRef'd
+    // ID3D12Resource* (dstW x dstH, B8G8R8A8_UNORM) to *outDst (caller owns
+    // the reference). Returns a CATRA_* code.
     int Process(ID3D11Texture2D* src, ID3D12Resource** outDst);
+
+    // Marks a scene cut: the NEXT Process dispatches with reset=true, which
+    // flushes the temporal accumulation (a hard cut would otherwise ghost the
+    // previous scene into the new one). No GPU work happens here — the flag
+    // is consumed by the next dispatch. The very first Process after Create
+    // always runs with reset=true. Returns CATRA_OK.
+    // THREADING: same rule as Process — not thread-safe per instance.
+    int RequestSceneCut();
 
     int SrcWidth() const { return m_srcW; }
     int SrcHeight() const { return m_srcH; }

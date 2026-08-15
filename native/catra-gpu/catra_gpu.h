@@ -25,10 +25,13 @@
 // interpolation and upscale are implemented. The RIFE backend is live when the
 // bridge is built with ONNX Runtime (CATRA_HAS_ONNXRUNTIME; DirectML EP when
 // USE_DML is detected, CPU fallback otherwise); without it, interp reports
-// unavailable and returns CATRA_ERR_NOT_IMPL. Upscale (ST-14) runs FSR 4 when
-// the bridge is built against the FidelityFX SDK (CATRA_HAS_FSR4) on an RDNA 4
-// adapter and downgrades to the self-contained FSR 1 (EASU) otherwise.
-// catra_init now also creates the shared D3D12 device + DIRECT command queue
+// unavailable and returns CATRA_ERR_NOT_IMPL. Upscale (ST-14; SPRINT_04
+// subtask 02) runs FSR 4/3.1 through the FFX API 2.x RUNTIME-LOADED backend
+// (ffx_runtime: amd_fidelityfx_loader_dx12.dll + GetProcAddress, no build-time
+// SDK) when the loader, the 8 FFX runtime DLLs and a throw-away upscale
+// context probe succeed on the active adapter (the FFX runtime picks FSR 4 ML
+// on RDNA 4 and the FSR 3.1 fallback elsewhere); otherwise it downgrades to
+// the self-contained FSR 1 (EASU). catra_init now also creates the shared D3D12 device + DIRECT command queue
 // on the D3D11 adapter via the D3D11<->DX12 interop (ST-15: NT shared
 // handles + keyed mutex + a pooled GPU-GPU copy fallback); when D3D12 is
 // unavailable the bridge soft-fails and the D3D11-only paths keep working.
@@ -116,9 +119,13 @@ CATRA_API void catra_shutdown(void);
 // requested FSR 4 on a non-RDNA 4 adapter sees CATRA_UPSCALE_FSR1 here.
 CATRA_API int  catra_get_upscale_mode(void);
 
-// Non-zero if FSR 4 is usable on the active adapter: built with the FidelityFX
-// SDK (CATRA_HAS_FSR4), AMD adapter (VendorID 0x1002), RDNA 4, and a throw-away
-// FSR 4 context initializes. 0 before catra_init or when any check fails.
+// Non-zero if the FFX upscale runtime is usable on the active adapter
+// (runtime-load semantics, SPRINT_04 subtask 02 — NOT build-time gated): the
+// FFX loader DLL loads with all 5 ffx exports, all 8 FFX runtime DLLs (list
+// A1) sit next to catra-gpu.dll, a DX12 adapter exists and a throw-away FFX
+// upscale context initializes on it. The FFX runtime itself selects FSR 4 ML
+// (RDNA 4) or the FSR 3.1 fallback on the adapter. 0 before catra_init or
+// when any check fails.
 CATRA_API int  catra_is_fsr4_available(void);
 
 // Active interpolation method (CATRA_INTERP_*). Returns CATRA_INTERP_RIFE
@@ -188,8 +195,10 @@ CATRA_API void catra_interp_destroy(int ctx);
 // ===========================================================================
 
 // Creates an upscale job. `method`: 0 = off (passthrough copy), 1 = FSR 1
-// (EASU, always available), 2 = FSR 4 (FidelityFX SDK, RDNA 4). When method=2
-// but FSR 4 is unavailable (no SDK / not RDNA 4) the bridge logs a warning and
+// (EASU, always available), 2 = FSR 4/3.1 via the FFX API 2.x runtime-loaded
+// backend (SPRINT_04 subtask 02: loader + 8 FFX runtime DLLs present next to
+// catra-gpu.dll + a working adapter — no build-time SDK dependency). When
+// method=2 but the FFX runtime is unavailable the bridge logs a warning and
 // downgrades to FSR 1; catra_get_upscale_mode then reports CATRA_UPSCALE_FSR1.
 // On success writes a handle to *out_ctx.
 CATRA_API int  catra_upscale_create(int src_w, int src_h,
@@ -206,6 +215,17 @@ CATRA_API int  catra_upscale_create(int src_w, int src_h,
 CATRA_API int  catra_upscale_process(int ctx,
                                      void* src_texture,
                                      void** dst_texture);
+
+// Marks a scene cut on an upscale context (SPRINT_04 subtask 02, additive
+// entry point approved by D-PO-1). The NEXT catra_upscale_process on this
+// context dispatches FSR 4/3.1 with reset=true, flushing the temporal
+// accumulation — a hard cut would otherwise ghost the previous scene into the
+// new one. No GPU work is performed here; the flag is consumed by the next
+// dispatch. FSR 1 (spatial) and passthrough contexts have no temporal state:
+// the call is a no-op returning CATRA_OK. The first dispatch of every context
+// always runs with reset=true. Returns CATRA_OK, or CATRA_ERR_CONTEXT for an
+// unknown/stale handle.
+CATRA_API int  catra_upscale_reset(int ctx);
 
 // Destroys an upscale job. No-op for an unknown handle.
 CATRA_API void catra_upscale_destroy(int ctx);

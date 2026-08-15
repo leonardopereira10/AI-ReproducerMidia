@@ -5,12 +5,17 @@
 // reads the returned D3D12 resource back to CPU and prints samples.
 //
 // Build: added as target catra-interop-test in CMakeLists.txt.
-// Usage: catra-interop-test.exe   (prints PASS/FAIL per format)
+// Usage: catra-interop-test.exe               (prints PASS/FAIL per format)
+//        catra-interop-test.exe --fsr4-smoke  (SPRINT_04 subtask 02: FSR 4/3.1
+//                                              zero-MV backend smoke; exits 0
+//                                              with a SKIP message when the FFX
+//                                              runtime is unavailable)
 
 #include "../d3d_interop.h"
 #include "../encode_amf.h"
 #include "../interp_rife.h"
 #include "../upscale_fsr1.h"
+#include "../upscale_fsr4.h"
 
 #include <d3d11.h>
 #include <d3d12.h>
@@ -21,7 +26,6 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
-
 using Microsoft::WRL::ComPtr;
 
 // d3d_interop.cpp links against this log shim (normally provided by
@@ -425,6 +429,111 @@ bool TestRifeEncodePath()
     return true;
 }
 
+// SPRINT_04 subtask 02 — FSR 4/3.1 zero-MV backend smoke: 320x180 -> 640x360
+// (the C ABI method=2 path, driven through the same C++ classes), gradient
+// input, N dispatches including a scene-cut reset, then readback + contract
+// checks: dimensions, BGRA output format (PO decision D-PO-4) and
+// non-corrupted pixels. GRACEFUL SKIP (exit 0 + message) when the FFX
+// runtime is unavailable (no loader/DLLs/adapter) — the skip keeps CI green.
+bool TestFsr4Smoke(bool& skipped)
+{
+    skipped = false;
+    if (!catra::Fsr4IsAvailable(g_d11.Get()))
+    {
+        fprintf(stderr, "[FSR4] SKIP: FFX upscale runtime unavailable on this machine\n");
+        skipped = true;
+        return true;
+    }
+
+    const int sw = 320, sh = 180, dw = 640, dh = 360;
+    ComPtr<ID3D11Texture2D> src = MakePattern11(DXGI_FORMAT_B8G8R8A8_UNORM, sw, sh);
+
+    std::unique_ptr<catra::Fsr4Upscaler> up;
+    int rc = catra::Fsr4Upscaler::Create(g_d11.Get(), sw, sh, dw, dh,
+                                         catra::UpscaleQualityMode::Quality, up);
+    if (rc != 0 || !up)
+    {
+        fprintf(stderr, "[FSR4] FAIL create rc=%d\n", rc);
+        return false;
+    }
+
+    // Three temporal frames; the third follows a RequestSceneCut (reset=true).
+    for (int i = 0; i < 3; ++i)
+    {
+        if (i == 2)
+        {
+            rc = up->RequestSceneCut();
+            if (rc != 0)
+            {
+                fprintf(stderr, "[FSR4] FAIL scene-cut reset rc=%d\n", rc);
+                return false;
+            }
+        }
+        ID3D12Resource* frameOut = nullptr;
+        rc = up->Process(src.Get(), &frameOut);
+        if (rc != 0 || !frameOut)
+        {
+            fprintf(stderr, "[FSR4] FAIL process frame %d rc=%d\n", i, rc);
+            return false;
+        }
+        frameOut->Release();
+    }
+
+    // Final frame: the one we read back and validate.
+    ID3D12Resource* out = nullptr;
+    rc = up->Process(src.Get(), &out);
+    if (rc != 0 || !out)
+    {
+        fprintf(stderr, "[FSR4] FAIL final process rc=%d\n", rc);
+        return false;
+    }
+
+    bool ok = true;
+    D3D12_RESOURCE_DESC od = out->GetDesc();
+    if (od.Width != static_cast<UINT>(dw) || od.Height != static_cast<UINT>(dh))
+    {
+        fprintf(stderr, "[FSR4] FAIL output dims %llux%u (expect %dx%d)\n",
+                static_cast<unsigned long long>(od.Width), od.Height, dw, dh);
+        ok = false;
+    }
+    if (od.Format != DXGI_FORMAT_B8G8R8A8_UNORM)
+    {
+        fprintf(stderr, "[FSR4] FAIL output format %d (expect B8G8R8A8_UNORM — D-PO-4)\n",
+                static_cast<int>(od.Format));
+        ok = false;
+    }
+    if (ok)
+    {
+        fprintf(stderr, "[FSR4] output %dx%d format=BGRA (D-PO-4) OK\n", dw, dh);
+    }
+
+    if (ok)
+    {
+        std::vector<UINT64> pitches;
+        auto data = ReadBack12(out, 1, pitches);
+        const UINT rp = static_cast<UINT>(pitches[0]);
+        long nonblack = 0, total = 0;
+        for (int y = 0; y < dh; y += 4)
+        {
+            for (int x = 0; x < dw; x += 4)
+            {
+                const uint8_t* px = data.data() + static_cast<size_t>(y) * rp +
+                                    static_cast<size_t>(x) * 4;
+                ++total;
+                if (px[0] > 8 || px[1] > 8 || px[2] > 8) ++nonblack;
+            }
+        }
+        const uint8_t* c = data.data() + static_cast<size_t>(dh / 2) * rp +
+                           static_cast<size_t>(dw / 2) * 4;
+        fprintf(stderr, "[FSR4] centre=%u,%u,%u,%u nonblack=%ld/%ld\n",
+                c[0], c[1], c[2], c[3], nonblack, total);
+        ok = nonblack > total / 2;
+        fprintf(stderr, "[FSR4] %s\n", ok ? "PASS" : "FAIL-CORRUPT");
+    }
+    out->Release();
+    return ok;
+}
+
 void DumpD3D12ValidationMessages()
 {
     ComPtr<ID3D12InfoQueue> iq;
@@ -702,8 +811,10 @@ bool TestFsr1Upscale()
     return ok;
 }
 
-int main()
+int main(int argc, char** argv)
 {
+    const bool fsr4Smoke = (argc > 1 && strcmp(argv[1], "--fsr4-smoke") == 0);
+
     // D3D12 debug layer BEFORE any device creation: the FSR1 dispatch drops
     // UAV writes on this driver and we need the validation messages to see
     // why. Messages are pulled from ID3D12InfoQueue after Process().
@@ -714,6 +825,18 @@ int main()
         fprintf(stderr, "[diag] D3D12 debug layer enabled\n");
     }
     InitDevices();
+
+    if (fsr4Smoke)
+    {
+        bool skipped = false;
+        const bool ok = TestFsr4Smoke(skipped);
+        DumpD3D12ValidationMessages();
+        fprintf(stderr, "RESULT: FSR4=%s\n",
+                skipped ? "SKIP" : (ok ? "PASS" : "FAIL"));
+        // A graceful SKIP is exit 0: missing FFX runtime is a supported state.
+        return ok ? 0 : 2;
+    }
+
     bool minc = TestMinimalCompute();
     fprintf(stderr, "[MIN] %s\n", minc ? "PASS" : "FAIL");
     bool fsr1 = TestFsr1Upscale();
