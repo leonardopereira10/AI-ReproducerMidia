@@ -10,6 +10,14 @@
 //                                              zero-MV backend smoke; exits 0
 //                                              with a SKIP message when the FFX
 //                                              runtime is unavailable)
+//        catra-interop-test.exe --encode-d3d12-workaround
+//                                              (SPRINT_04 subtask 03: AMF encode
+//                                              workaround smoke — user-created
+//                                              D3D12 BGRA textures (shareable AND
+//                                              non-shareable heap) through
+//                                              interop_copy_d3d12_for_encode into
+//                                              the AmfEncoder; SKIP (exit 0) when
+//                                              built without CATRA_HAS_AMF)
 
 #include "../d3d_interop.h"
 #include "../encode_amf.h"
@@ -534,6 +542,179 @@ bool TestFsr4Smoke(bool& skipped)
     return ok;
 }
 
+// SPRINT_04 subtask 03 — AMF encode workaround smoke. Mirrors the pipeline's
+// encode boundary for D3D12 inputs (FSR 1/FSR 4 upscale outputs): a
+// user-created BGRA D3D12 texture goes through
+// interop_copy_d3d12_for_encode (the generic D3D12 -> D3D11 pool copy) and
+// the returned pool-slot resource is fed to AmfEncoder::Encode.
+//
+// Two variants cover both helper routes:
+//   (a) D3D12_HEAP_FLAG_SHARED  -> CreateSharedHandle probe succeeds, the
+//       texture is opened directly on the D3D11 side;
+//   (b) D3D12_HEAP_FLAG_NONE    -> probe fails, the cached shared staging
+//       copy path runs (FSR 4 output case).
+// Pass criterion per variant: every Encode returns CATRA_OK and the total
+// encoded byte count is > 0 (the dump is discarded — pixel checks live in the
+// other modes).
+ComPtr<ID3D12Resource> MakePattern12(int w, int h, D3D12_HEAP_FLAGS heapFlags)
+{
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = static_cast<UINT>(w);
+    td.Height = static_cast<UINT>(h);
+    td.DepthOrArraySize = 1;
+    td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    ComPtr<ID3D12Resource> tex;
+    HRESULT hr = g_d12->CreateCommittedResource(&hp, heapFlags, &td,
+                                                D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                IID_PPV_ARGS(tex.GetAddressOf()));
+    if (FAILED(hr)) Fail("workaround src create", hr);
+
+    // Same gradient as MakePattern11(BGRA), staged through an upload buffer.
+    UINT rows = 0;
+    UINT64 rowSize = 0, total = 0;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+    g_d12->GetCopyableFootprints(&td, 0, 1, 0, &fp, &rows, &rowSize, &total);
+    D3D12_HEAP_PROPERTIES uhp = {};
+    uhp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bd = {};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = total;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> up;
+    hr = g_d12->CreateCommittedResource(&uhp, D3D12_HEAP_FLAG_NONE, &bd,
+                                        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                        IID_PPV_ARGS(&up));
+    if (FAILED(hr)) Fail("workaround upload create", hr);
+    uint8_t* mp = nullptr;
+    up->Map(0, nullptr, reinterpret_cast<void**>(&mp));
+    for (int y = 0; y < h; ++y)
+    {
+        for (int x = 0; x < w; ++x)
+        {
+            uint8_t* p = mp + fp.Offset + static_cast<size_t>(y) * fp.Footprint.RowPitch + x * 4;
+            p[0] = static_cast<uint8_t>(x & 0xFF); // B
+            p[1] = static_cast<uint8_t>(y & 0xFF); // G
+            p[2] = 200;                            // R
+            p[3] = 255;
+        }
+    }
+    up->Unmap(0, nullptr);
+
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = tex.Get();
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    g_cl->ResourceBarrier(1, &b);
+    D3D12_TEXTURE_COPY_LOCATION dstL = {};
+    dstL.pResource = tex.Get();
+    dstL.Type = static_cast<D3D12_TEXTURE_COPY_TYPE>(0);
+    dstL.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION srcL = {};
+    srcL.pResource = up.Get();
+    srcL.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    srcL.PlacedFootprint = fp;
+    g_cl->CopyTextureRegion(&dstL, 0, 0, 0, &srcL, nullptr);
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    g_cl->ResourceBarrier(1, &b);
+    GpuWait(); // fence-waited, left in COMMON — the workaround input contract
+    return tex;
+}
+
+bool TestEncodeD3D12Workaround(bool& skipped)
+{
+    skipped = false;
+    if (!catra::AmfIsCompiled())
+    {
+        fprintf(stderr, "[WA] SKIP (no AMF — built without CATRA_HAS_AMF)\n");
+        skipped = true;
+        return true;
+    }
+
+    const int w = 640, h = 360; // small but HEVC-legal (320x180 is rejected by AMF Init)
+    struct Variant { const char* name; D3D12_HEAP_FLAGS flags; };
+    const Variant variants[2] = {
+        { "shared", D3D12_HEAP_FLAG_SHARED },
+        { "none->staging", D3D12_HEAP_FLAG_NONE },
+    };
+
+    for (const Variant& v : variants)
+    {
+        ComPtr<ID3D12Resource> src = MakePattern12(w, h, v.flags);
+
+        std::unique_ptr<catra::AmfEncoder> enc;
+        int rc = catra::AmfEncoder::Create(g_d12.Get(), w, h, 5000, 25.0, enc);
+        if (rc != 0 || !enc)
+        {
+            fprintf(stderr, "[WA] FAIL encoder create (%s) rc=%d\n", v.name, rc);
+            return false;
+        }
+
+        long long totalBytes = 0;
+        bool frameOk = true;
+        for (int i = 0; i < 8; ++i)
+        {
+            ID3D12Resource* pooled = nullptr;
+            HANDLE handle = nullptr;
+            rc = catra::interop_copy_d3d12_for_encode(src.Get(), &pooled, &handle);
+            if (rc != 0 || pooled == nullptr)
+            {
+                fprintf(stderr, "[WA] FAIL workaround copy (%s) frame %d rc=%d\n", v.name, i, rc);
+                frameOk = false;
+                break;
+            }
+
+            uint8_t* buf = nullptr;
+            int size = 0;
+            const int erc = enc->Encode(pooled, &buf, &size);
+            fprintf(stderr, "[WA] %s frame %d: Encode rc=%d size=%d\n", v.name, i, erc, size);
+            if (erc != 0)
+            {
+                fprintf(stderr, "[WA] FAIL Encode (%s) frame %d rc=%d\n", v.name, i, erc);
+                frameOk = false;
+            }
+            else if (size > 0)
+            {
+                totalBytes += size;
+            }
+            if (handle != nullptr) CloseHandle(handle);
+            pooled->Release();
+            if (!frameOk) break;
+        }
+        if (!frameOk) return false;
+
+        uint8_t* buf = nullptr;
+        int size = 0;
+        rc = enc->Flush(&buf, &size);
+        if (rc == 0 && size > 0)
+        {
+            totalBytes += size;
+        }
+        fprintf(stderr, "[WA] %s flush rc=%d size=%d totalBytes=%lld\n",
+                v.name, rc, size, totalBytes);
+        if (totalBytes <= 0)
+        {
+            fprintf(stderr, "[WA] FAIL no encoded bytes (%s)\n", v.name);
+            return false;
+        }
+        enc.reset();
+    }
+
+    fprintf(stderr, "[WA] PASS (both variants encoded via the pool path)\n");
+    return true;
+}
+
 void DumpD3D12ValidationMessages()
 {
     ComPtr<ID3D12InfoQueue> iq;
@@ -814,6 +995,7 @@ bool TestFsr1Upscale()
 int main(int argc, char** argv)
 {
     const bool fsr4Smoke = (argc > 1 && strcmp(argv[1], "--fsr4-smoke") == 0);
+    const bool encodeWorkaround = (argc > 1 && strcmp(argv[1], "--encode-d3d12-workaround") == 0);
 
     // D3D12 debug layer BEFORE any device creation: the FSR1 dispatch drops
     // UAV writes on this driver and we need the validation messages to see
@@ -835,6 +1017,26 @@ int main(int argc, char** argv)
                 skipped ? "SKIP" : (ok ? "PASS" : "FAIL"));
         // A graceful SKIP is exit 0: missing FFX runtime is a supported state.
         return ok ? 0 : 2;
+    }
+
+    if (encodeWorkaround)
+    {
+        bool skipped = false;
+        const bool ok = TestEncodeD3D12Workaround(skipped);
+        DumpD3D12ValidationMessages();
+        if (skipped)
+        {
+            // Graceful SKIP (exit 0): no AMF in this build is a supported state.
+            fprintf(stderr, "RESULT: ENCODE_D3D12_WORKAROUND=SKIP\n");
+            return 0;
+        }
+        if (!ok)
+        {
+            fprintf(stderr, "RESULT: ENCODE_D3D12_WORKAROUND=FAIL\n");
+            return 2;
+        }
+        fprintf(stderr, "RESULT: ENCODE_D3D12_WORKAROUND=PASS\n");
+        // Fall through to the existing suite: pool/copy regression.
     }
 
     bool minc = TestMinimalCompute();

@@ -54,7 +54,9 @@ public sealed class AppSettingsModel
     // --- Processamento (Fase 2; visível mas desabilitado na UI) ---
     public int WindowSize { get; set; } = 5;
     public string InterpMethod { get; set; } = "rife";
-    public string UpscaleMethod { get; set; } = "fsr4";
+    // D-PO-3: FSR 1 (EASU) is the default for export AND playback (plan Risco 3 / A6);
+// FSR 4 is opt-in.
+public string UpscaleMethod { get; set; } = "fsr1";
     public int LocalTargetWidth { get; set; } = 1920;
     public int LocalTargetHeight { get; set; } = 1080;
     public int LocalTargetFps { get; set; } = 60;

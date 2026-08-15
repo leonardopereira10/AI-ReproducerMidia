@@ -117,10 +117,11 @@ public sealed class RepositoryTests : IDisposable
             "dlna_target_fps", "dlna_target_width", "dlna_target_height", "dlna_encode_bitrate_kbps",
             "interp_method", "upscale_method", "default_skip_intro_sec", "theme_override");
 
-        all["local_target_fps"].Should().Be("135");
+        all["local_target_fps"].Should().Be("60");
         all["dlna_target_height"].Should().Be("2160");
         all["interp_method"].Should().Be("rife");
-        all["upscale_method"].Should().Be("fsr4");
+        // D-PO-3 (subtask 03): FSR 1 é o default de export — o seed mudou de "fsr4".
+        all["upscale_method"].Should().Be("fsr1");
     }
 
     [Fact]

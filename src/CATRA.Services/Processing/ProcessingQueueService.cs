@@ -557,7 +557,9 @@ public sealed class ProcessingQueueService : IProcessingQueueService, IDisposabl
         double fps = GetDouble($"{prefix}_target_fps", dlna ? 55d : 60d);
         int bitrate = GetInt($"{prefix}_encode_bitrate_kbps", dlna ? 45_000 : 20_000);
         string interp = _settings.Get("interp_method") ?? "rife";
-        string upscale = _settings.Get("upscale_method") ?? "fsr4";
+        // D-PO-3: FSR 1 (EASU) is the export default (zero-MV limitation, plan Risco 3 / A6);
+// FSR 4 stays opt-in via the settings table.
+string upscale = _settings.Get("upscale_method") ?? "fsr1";
         string? outputFolder = _settings.Get("processed_folder");
         if (string.IsNullOrWhiteSpace(outputFolder))
         {

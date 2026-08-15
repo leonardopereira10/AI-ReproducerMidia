@@ -3,6 +3,8 @@ using CATRA.Core.Enums;
 using CATRA.Core.Interfaces;
 using CATRA.Core.Models;
 using CATRA.Core.Processing;
+using CATRA.Data.Database;
+using CATRA.Data.Repositories;
 using CATRA.Services.Processing;
 using FluentAssertions;
 using Xunit;
@@ -142,6 +144,12 @@ internal sealed class FakeNativeBridge : INativeBridge
     public Exception? ThrowOnEncodeFrame { get; set; }
     public Exception? ThrowOnInterpCreate { get; set; }
 
+    /// <summary>
+    /// Thrown by <see cref="CreateUpscaler"/> ONLY when method == 2 (CATRA_UPSCALE_FSR4)
+    /// — story 03 FSR 4 -> FSR 1 fallback tests.
+    /// </summary>
+    public Exception? ThrowOnUpscaleCreateFsr4 { get; set; }
+
     // Call counts.
     public int InterpCreateCount { get; private set; }
     public int InterpDestroyCount { get; private set; }
@@ -160,6 +168,9 @@ internal sealed class FakeNativeBridge : INativeBridge
     public int FreeNativeArrayCount { get; private set; }
     public List<IntPtr> ReleasedTextures { get; } = new();
     public List<IntPtr> FreedArrays { get; } = new();
+
+    /// <summary>Upscale method codes passed to each CreateUpscaler call, in order (story 03 fallback).</summary>
+    public List<int> UpscaleCreateMethods { get; } = new();
 
     // Last arguments (for RN-07 / forwarding assertions).
     public double LastInterpSrcFps { get; private set; }
@@ -232,8 +243,13 @@ internal sealed class FakeNativeBridge : INativeBridge
     public IntPtr CreateUpscaler(int srcWidth, int srcHeight, int dstWidth, int dstHeight, int method)
     {
         UpscaleCreateCount++;
+        UpscaleCreateMethods.Add(method);
         LastUpscaleSrcHeight = srcHeight;
         LastUpscaleDstHeight = dstHeight;
+        if (method == 2 && ThrowOnUpscaleCreateFsr4 is not null) // 2 = CATRA_UPSCALE_FSR4
+        {
+            throw ThrowOnUpscaleCreateFsr4;
+        }
         Calls.Add("upscale_create");
         return new IntPtr(_nextContext++);
     }
@@ -507,6 +523,86 @@ public class ProcessingPipelineTests : IDisposable
         bridge.LastEncodeBitrate.Should().Be(20_000);
         // ST-30 floor mode: encoder fps = srcFps * floor(target/src) = 24 * 5 = 120.
         bridge.LastEncodeFps.Should().Be(120);
+    }
+
+    // --- story 03: FSR 4 -> FSR 1 graceful fallback + D-PO-3 default -------
+
+    [Fact]
+    public async Task Upscale_Fsr4CreateFails_RetriesWithFsr1_AndCompletes()
+    {
+        // Story 03 (2ª linha de defesa): when the FSR 4 upscaler cannot be created
+        // (NativeBridgeException — e.g. FFX runtime absent and the native downgrade
+        // still surfaced as an error), the pipeline must retry ONCE with FSR 1 and
+        // the export still completes. Without the retry the whole run fails.
+        string folder = NewTempFolder();
+        var spec = new FakeDecoderSpec
+        {
+            Metadata = new FrameSourceMetadata(24, 1280, 720, TimeSpan.FromSeconds(2), 3),
+            FrameCount = 3,
+        };
+        var (pipeline, bridge, _, _) = Build(spec);
+        bridge.ThrowOnUpscaleCreateFsr4 = new NativeBridgeException("FSR 4 unavailable (FFX runtime missing)", -2);
+
+        // "fsr4" requested; target fps == source fps keeps interpolation OUT so the
+        // upscale-call accounting stays deterministic (one ProcessUpscale per frame).
+        var config = new PipelineConfig(ProcessProfile.Local, 1920, 1080, 24, 20_000, "rife", "fsr4", folder);
+
+        ProcessResult result = await pipeline.ProcessAsync(
+            Ep(1, Path.Combine(folder, "s.mp4")), config, new CapturingProgress(), CancellationToken.None);
+
+        result.Success.Should().BeTrue("the FSR 4 create failure must trigger the FSR 1 retry, not fail the export");
+        bridge.UpscaleCreateMethods.Should().Equal(new[] { 2, 1 }, "first attempt uses FSR 4 (2), the retry uses FSR 1 (1)");
+        bridge.UpscaleCreateCount.Should().Be(2);
+        bridge.UpscaleProcessCount.Should().Be(3, "every frame is upscaled by the fallback FSR 1 context");
+        bridge.UpscaleDestroyCount.Should().Be(1, "only the successful FSR 1 context is destroyed in cleanup");
+    }
+
+    [Fact]
+    public async Task QueueService_UpscaleSettingMissing_DefaultsToFsr1()
+    {
+        // D-PO-3 (story 03): FSR 1 is the export default. Two layers agree:
+        // DatabaseInitializer seeds "upscale_method" = "fsr1" on fresh installs, and
+        // ProcessingQueueService.BuildConfig falls back to "fsr1" when the setting is
+        // absent. This test asserts the seed AND forces the missing-setting path so
+        // the queue service's own default is what supplies the value to the pipeline.
+        string folder = NewTempFolder();
+        using var database = new DatabaseConnection(Path.Combine(folder, "queue-default.db"));
+        new DatabaseInitializer(database).Initialize();
+
+        var settings = new AppSettingsRepository(database);
+        settings.Get("upscale_method").Should().Be("fsr1", "DatabaseInitializer must seed the D-PO-3 default");
+
+        // Remove the seeded row to force the queue service's `?? "fsr1"` fallback.
+        database.Connection.Execute("DELETE FROM AppSettings WHERE Key = 'upscale_method';");
+
+        var episodes = new EpisodeRepository(database);
+        var jobs = new ProcessJobRepository(database);
+        var processedFiles = new ProcessedFileRepository(database);
+        settings.Set("processed_folder", Path.Combine(folder, "processed"));
+
+        var fakePipeline = new FakeProcessingPipeline();
+        using var service = new ProcessingQueueService(jobs, episodes, processedFiles, fakePipeline, settings);
+
+        Episode ep = episodes.Insert(new Episode
+        {
+            MediaItemId = 1,
+            EpisodeNumber = 1,
+            FileName = "s1-ep1.mkv",
+            FilePath = Path.Combine(folder, "s1-ep1.mkv"),
+        });
+
+        await service.StartAsync();
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        EventHandler<ProcessJob> terminal = (_, _) => tcs.TrySetResult();
+        service.JobCompleted += terminal;
+        service.JobFailed += terminal;
+
+        await service.EnqueueAsync(new List<int> { ep.Id }, ProcessProfile.Local);
+        await tcs.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        fakePipeline.Calls.Should().HaveCount(1);
+        fakePipeline.Calls.Single().Config.UpscaleMethod.Should().Be("fsr1",
+            "D-PO-3: when the setting is absent the queue service defaults the export to FSR 1");
     }
 
     // --- bugfix_06: mux must receive the exact encode fps (A/V sync) --------

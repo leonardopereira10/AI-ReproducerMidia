@@ -82,7 +82,9 @@ public sealed class DatabaseInitializer
         ("dlna_target_height", "2160"),
         ("dlna_encode_bitrate_kbps", "45000"),
         ("interp_method", "rife"),
-        ("upscale_method", "fsr4"),
+        // D-PO-3: seed FSR 1 — without this the INSERT OR IGNORE seed keeps "fsr4"
+        // on fresh installs and the FSR 1 default is never reached (plano Risco 3 / A6).
+        ("upscale_method", "fsr1"),
         ("default_skip_intro_sec", "85"),
         ("theme_override", "system"),
     };

@@ -132,6 +132,31 @@ int interop_share_d3d12_to_d3d11(ID3D12Resource* src,
                                  ID3D11Device* d3d11_device,
                                  ID3D11Texture2D** out_d3d11_tex);
 
+// AMF workaround (docs/FSR_AMF_ISSUE_CONTEXT.md): qualquer resource D3D12
+// criado por usuário (output de upscale FSR 1/FSR 4) é rejeitado por
+// AMFContext2::CreateSurfaceFromDX12Native, mas os resources D3D12 dos slots
+// do pool de interop (abertos de texturas D3D11 shared via NT handle) são
+// aceitos. Este helper copia o conteúdo de `src` para o caminho pooled D3D11
+// e entrega o resource D3D12 do slot — contrato de saída IDÊNTICO ao de
+// interop_share_d3d11_to_d3d12 (resource AddRef'd; *out_shared_handle fica
+// null — o pool mantém os handles; caller fecha/solta via RAII existente).
+//
+// Path: `src` shareable -> aberto direto no D3D11; `src` não-shareable
+// (caso genérico, ex.: output FSR 4 em heap NONE) -> cópia via staging D3D12
+// cacheada (fence wait com timeout) e o staging é aberto no D3D11. A view
+// D3D11 segue para a cópia pooled GPU-GPU; se ela falhar (ex.: keyed-mutex
+// ReleaseSync com DEVICE_REMOVED no driver RDNA 4 atual) o helper cai para o
+// MESMO CPU round-trip do pool12 que interop_share_d3d11_to_d3d12 usa — o
+// recurso entregue então não carrega keyed mutex (o consumer do encoder pula
+// o ping-pong), exatamente como o caminho D3D11 atual já entrega.
+//
+// CONTRATO DE ENTRADA: `src` deve chegar GPU-complete (produtor fez fence
+// wait), em D3D12_RESOURCE_STATE_COMMON e no device do interop (o mesmo que
+// CreateD3D12Device entrega). Requer interop_init.
+int interop_copy_d3d12_for_encode(ID3D12Resource* src,
+                                  ID3D12Resource** out_pool_tex,
+                                  HANDLE* out_shared_handle);
+
 // IDXGIKeyedMutex::AcquireSync wrapper. Returns CATRA_OK, or
 // CATRA_ERR_DEVICE on timeout (spec default 5000 ms) / failure.
 int interop_acquire(IDXGIKeyedMutex* mutex, uint64_t key, uint32_t timeout_ms);

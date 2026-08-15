@@ -915,6 +915,233 @@ bool UploadCpuTo12(ID3D12Resource* dst, const D3D11_TEXTURE2D_DESC& d,
     return true;
 }
 
+// ===========================================================================
+// AMF encode workaround helpers (SPRINT_04 subtask 03)
+// ===========================================================================
+//
+// AMFContext2::CreateSurfaceFromDX12Native rejects USER-CREATED D3D12 textures
+// (the FSR 1 / FSR 4 upscale outputs — docs/FSR_AMF_ISSUE_CONTEXT.md) but
+// accepts the pool-slot resources opened from D3D11 shared textures. The
+// workaround copies any D3D12 encode input into the pooled D3D11 path and
+// hands the encoder the pool slot instead.
+
+// Cached SHARED D3D12 staging texture for non-shareable encode inputs
+// (generic case: FSR 4 output lives on a D3D12_HEAP_FLAG_NONE heap). Recreated
+// only on geometry/format change; released by interop_shutdown.
+ComPtr<ID3D12Resource> g_encodeStaging12;
+D3D12_RESOURCE_DESC g_encodeStagingDesc = {};
+
+int EnsureEncodeStagingLocked(const D3D12_RESOURCE_DESC& srcDesc)
+{
+    if (g_encodeStaging12 &&
+        g_encodeStagingDesc.Width == srcDesc.Width &&
+        g_encodeStagingDesc.Height == srcDesc.Height &&
+        g_encodeStagingDesc.Format == srcDesc.Format)
+    {
+        return CATRA_OK;
+    }
+    g_encodeStaging12.Reset();
+    g_encodeStagingDesc = {};
+
+    D3D12_RESOURCE_DESC sd = {};
+    sd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    sd.Width = srcDesc.Width;
+    sd.Height = srcDesc.Height;
+    sd.DepthOrArraySize = 1;
+    sd.MipLevels = 1;
+    sd.Format = srcDesc.Format;
+    sd.SampleDesc.Count = 1;
+    sd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    // Copy target only, but D3D11's OpenSharedResource1 rejects shared
+    // textures that would map to ZERO bind flags (E_INVALIDARG, verified on
+    // RDNA 4): a D3D12 Flags=NONE texture opens as a BindFlags=0 D3D11
+    // texture, which is only legal for USAGE_STAGING. ALLOW_RENDER_TARGET
+    // gives the opened D3D11 view a legal binding (BGRA is RTV-capable).
+    sd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    // Initial state COMMON: the workaround contract requires inputs in COMMON,
+    // and every copy round leaves the staging back in COMMON.
+    const HRESULT hr = g_d3d12Device->CreateCommittedResource(
+        &hp, D3D12_HEAP_FLAG_SHARED, &sd,
+        D3D12_RESOURCE_STATE_COMMON, nullptr,
+        IID_PPV_ARGS(g_encodeStaging12.GetAddressOf()));
+    if (FAILED(hr))
+    {
+        catra::BackendLog(CATRA_LOG_ERROR,
+                          "interop: encode staging create hr=0x%08lX",
+                          static_cast<unsigned long>(hr));
+        return CATRA_ERR_DEVICE;
+    }
+    g_encodeStagingDesc = sd;
+    catra::BackendLog(CATRA_LOG_INFO,
+                      "interop: encode staging rebuilt %llux%u fmt=%u (shared)",
+                      static_cast<unsigned long long>(sd.Width), sd.Height,
+                      static_cast<unsigned>(sd.Format));
+    return CATRA_OK;
+}
+
+// GPU copy src -> staging on the module's DIRECT queue + bounded fence wait.
+// Both resources are taken and left in D3D12_RESOURCE_STATE_COMMON (the src
+// contract is COMMON; the pre/post barriers make the round-trip explicit).
+// Caller holds g_mutex. Returns CATRA_OK / CATRA_ERR_DEVICE (timeout is a
+// device fault — NEVER INFINITE: a wedged queue must fail, not hang).
+int CopyD3D12ToStagingLocked(ID3D12Resource* src, ID3D12Resource* dst)
+{
+    HRESULT rs = g_cmdAllocator->Reset();
+    if (SUCCEEDED(rs))
+    {
+        rs = g_cmdList->Reset(g_cmdAllocator.Get(), nullptr);
+    }
+    if (FAILED(rs))
+    {
+        catra::BackendLog(CATRA_LOG_ERROR,
+                          "interop: encode staging cmd reset hr=0x%08lX",
+                          static_cast<unsigned long>(rs));
+        return CATRA_ERR_DEVICE;
+    }
+
+    D3D12_RESOURCE_BARRIER pre[2] = {};
+    pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    pre[0].Transition.pResource = src;
+    pre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    pre[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    pre[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    pre[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    pre[1].Transition.pResource = dst;
+    pre[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    pre[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    pre[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    g_cmdList->ResourceBarrier(2, pre);
+
+    // Whole-texture copy: geometries are identical by construction (the
+    // staging is rebuilt from the source desc).
+    D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+    dstLoc.pResource = dst;
+    dstLoc.Type = static_cast<D3D12_TEXTURE_COPY_TYPE>(0);
+    dstLoc.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+    srcLoc.pResource = src;
+    srcLoc.Type = static_cast<D3D12_TEXTURE_COPY_TYPE>(0);
+    srcLoc.SubresourceIndex = 0;
+    g_cmdList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+
+    D3D12_RESOURCE_BARRIER post[2] = {};
+    post[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    post[0].Transition.pResource = src;
+    post[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    post[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    post[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    post[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    post[1].Transition.pResource = dst;
+    post[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    post[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    post[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    g_cmdList->ResourceBarrier(2, post);
+
+    rs = g_cmdList->Close();
+    if (FAILED(rs))
+    {
+        catra::BackendLog(CATRA_LOG_ERROR,
+                          "interop: encode staging cmd close hr=0x%08lX",
+                          static_cast<unsigned long>(rs));
+        return CATRA_ERR_DEVICE;
+    }
+
+    ID3D12CommandList* lists[] = { g_cmdList.Get() };
+    g_d3d12Queue->ExecuteCommandLists(1, lists);
+
+    const UINT64 fv = ++g_fenceValue;
+    g_d3d12Queue->Signal(g_fence.Get(), fv);
+    if (g_fence->GetCompletedValue() < fv)
+    {
+        g_fence->SetEventOnCompletion(fv, g_fenceEvent);
+        if (WaitForSingleObject(g_fenceEvent, 5000) != WAIT_OBJECT_0)
+        {
+            catra::BackendLog(CATRA_LOG_ERROR,
+                              "interop: encode staging fence wait timed out (5000 ms)");
+            return CATRA_ERR_DEVICE;
+        }
+    }
+    return CATRA_OK;
+}
+
+// GPU-GPU pooled copy of a D3D11 source into the next round-robin pool slot,
+// extracted verbatim from interop_share_d3d11_to_d3d12 so the AMF encode
+// workaround (interop_copy_d3d12_for_encode) can reuse it. Caller holds
+// g_mutex. Returns CATRA_OK (the slot's D3D12 resource AddRef'd into
+// *out_d3d12_tex) or CATRA_ERR_DEVICE on pool-ensure / ReleaseSync failure —
+// interop_share_d3d11_to_d3d12 translates that into its CPU round-trip
+// fallback (behaviour unchanged by the extraction).
+int PooledCopyD3D11Locked(ID3D11Texture2D* src,
+                          const D3D11_TEXTURE2D_DESC& desc,
+                          ID3D12Resource** out_d3d12_tex)
+{
+    *out_d3d12_tex = nullptr;
+
+    const int grc = EnsurePoolLocked(desc);
+    if (grc != CATRA_OK || g_pool.empty())
+    {
+        catra::BackendLog(CATRA_LOG_WARN,
+                          "interop: GPU-GPU pool ensure failed rc=%d — falling back to CPU round-trip",
+                          grc);
+        return CATRA_ERR_DEVICE;
+    }
+
+    InteropPoolSlot& slot = g_pool[g_poolIndex];
+    g_poolIndex = (g_poolIndex + 1) % g_pool.size();
+
+    g_d3d11Context->CopyResource(slot.tex11.Get(), src);
+    // Flush submits the copy; WaitForD3D11GpuIdle blocks until it is FINISHED
+    // on the GPU (AMD RDNA 4 needs completion, not just submission, before the
+    // D3D12 consumer reads the shared allocation — see WaitForD3D11GpuIdle).
+    g_d3d11Context->Flush();
+    WaitForD3D11GpuIdle();
+
+    // Producer half of the keyed-mutex ping-pong (spec ST-15): ReleaseSync(key)
+    // hands the slot to the consumer, which does AcquireSync(key) before
+    // reading (encode_amf / upscale_fsr*). The key alternates 0/1; a pool
+    // rebuild resets it to 0 and bumps the generation so consumers resync in
+    // lockstep. The toggle happens only on success — a failed release keeps
+    // the key deterministic.
+    const uint64_t key = g_frameKey;
+    const HRESULT relHr = slot.mutex11->ReleaseSync(key);
+    if (SUCCEEDED(relHr))
+    {
+        g_frameKey ^= 1;
+        LogSharePath(true);
+        *out_d3d12_tex = slot.res12.Get();
+        slot.res12->AddRef();
+        return CATRA_OK;
+    }
+    catra::BackendLog(CATRA_LOG_WARN,
+                      "interop: GPU-GPU copy ReleaseSync(key=%llu) hr=0x%08lX — falling back to CPU round-trip",
+                      static_cast<unsigned long long>(key),
+                      static_cast<unsigned long>(relHr));
+    return CATRA_ERR_DEVICE;
+}
+
+// Logs the encode-workaround route once per transition (per-frame logging
+// would spam the backend sink on a throughput-bound offline transcode).
+// Caller holds g_mutex.
+void LogEncodeWorkaroundPath(bool staged)
+{
+    static bool lastStaged = false;
+    static bool logged = false;
+    if (logged && lastStaged == staged)
+    {
+        return;
+    }
+    logged = true;
+    lastStaged = staged;
+    catra::BackendLog(CATRA_LOG_INFO,
+                      staged
+                          ? "interop: encode workaround: D3D12 input non-shareable -> staging copy -> D3D11 pool path"
+                          : "interop: encode workaround: D3D12 input shareable -> direct D3D11 open -> pool path");
+}
+
 } // namespace
 
 namespace catra {
@@ -1083,6 +1310,9 @@ void interop_shutdown()
     g_pool12.clear();
     g_pool12Desc = {};
     g_pool12Index = 0;
+    // Cached encode-workaround staging (D3D12 shared) — same rationale.
+    g_encodeStaging12.Reset();
+    g_encodeStagingDesc = {};
 
     if (g_fenceEvent != nullptr)
     {
@@ -1166,50 +1396,18 @@ int interop_share_d3d11_to_d3d12(ID3D11Texture2D* src,
         // BGRA GPU-GPU path: copy into the pooled shared D3D11 texture, sync
         // cross-API, then hand out the paired D3D12 resource (opened from the
         // NT handle at pool-build time) to the consumer (AMF wraps it via
-        // CreateSurfaceFromDX12Native and QIs the keyed mutex off it).
-        const int grc = EnsurePoolLocked(desc);
-        if (grc == CATRA_OK && !g_pool.empty())
+        // CreateSurfaceFromDX12Native and QIs the keyed mutex off it). The
+        // copy segment lives in PooledCopyD3D11Locked (shared with the AMF
+        // encode workaround); a failure there falls through to the CPU
+        // round-trip below — behaviour identical to the pre-refactor code.
+        ID3D12Resource* pooled = nullptr;
+        if (PooledCopyD3D11Locked(src, desc, &pooled) == CATRA_OK)
         {
-            InteropPoolSlot& slot = g_pool[g_poolIndex];
-            g_poolIndex = (g_poolIndex + 1) % g_pool.size();
-
-            g_d3d11Context->CopyResource(slot.tex11.Get(), src);
-            // Flush submits the copy; WaitForD3D11GpuIdle blocks until it is
-            // FINISHED on the GPU (AMD RDNA 4 needs completion, not just
-            // submission, before the D3D12 consumer reads the shared
-            // allocation — see WaitForD3D11GpuIdle above).
-            g_d3d11Context->Flush();
-            WaitForD3D11GpuIdle();
-
-            // Producer half of the keyed-mutex ping-pong (spec ST-15):
-            // ReleaseSync(key) hands the slot to the consumer, which does
-            // AcquireSync(key) before reading (encode_amf / upscale_fsr*). The
-            // key alternates 0/1; a pool rebuild resets it to 0 and bumps the
-            // generation so consumers resync in lockstep. The toggle happens
-            // only on success — a failed release keeps the key deterministic.
-            const uint64_t key = g_frameKey;
-            const HRESULT relHr = slot.mutex11->ReleaseSync(key);
-            if (SUCCEEDED(relHr))
-            {
-                g_frameKey ^= 1;
-                LogSharePath(true);
-                // No per-frame NT handle is minted (the pool keeps its handles
-                // open for its whole lifetime); leave *out_shared_handle null
-                // so the caller's RAII cleanup skips CloseHandle.
-                *out_d3d12_tex = slot.res12.Get();
-                slot.res12->AddRef();
-                return CATRA_OK;
-            }
-            BackendLog(CATRA_LOG_WARN,
-                       "interop: GPU-GPU copy ReleaseSync(key=%llu) hr=0x%08lX — falling back to CPU round-trip",
-                       static_cast<unsigned long long>(key),
-                       static_cast<unsigned long>(relHr));
-        }
-        else
-        {
-            BackendLog(CATRA_LOG_WARN,
-                       "interop: GPU-GPU pool ensure failed rc=%d — falling back to CPU round-trip",
-                       grc);
+            // No per-frame NT handle is minted (the pool keeps its handles
+            // open for its whole lifetime); leave *out_shared_handle null
+            // so the caller's RAII cleanup skips CloseHandle.
+            *out_d3d12_tex = pooled;
+            return CATRA_OK;
         }
     }
 
@@ -1285,10 +1483,13 @@ int interop_share_d3d12_to_d3d11(ID3D12Resource* src,
     }
 
     HANDLE handle = nullptr;
+    // D3D12 CreateSharedHandle REQUIRES dwAccess == GENERIC_ALL (the D3D11
+    // DXGI_SHARED_RESOURCE_READ|WRITE flags fail with E_INVALIDARG — verified
+    // via the D3D12 debug layer, SPRINT_04 subtask 03).
     hr = device12->CreateSharedHandle(
         src,
         nullptr,
-        DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+        GENERIC_ALL,
         nullptr,
         &handle);
     if (FAILED(hr))
@@ -1322,6 +1523,199 @@ int interop_share_d3d12_to_d3d11(ID3D12Resource* src,
                    static_cast<unsigned long>(hr));
         return HrToCatra(hr);
     }
+    return CATRA_OK;
+}
+
+int interop_copy_d3d12_for_encode(ID3D12Resource* src,
+                                  ID3D12Resource** out_pool_tex,
+                                  HANDLE* out_shared_handle)
+{
+    if (out_pool_tex != nullptr)
+    {
+        *out_pool_tex = nullptr;
+    }
+    if (out_shared_handle != nullptr)
+    {
+        *out_shared_handle = nullptr;
+    }
+    if (src == nullptr || out_pool_tex == nullptr)
+    {
+        return CATRA_ERR_INVALID_ARG;
+    }
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    if (!g_d3d11Device || !g_d3d11Context || !g_d3d12Device || !g_d3d12Queue ||
+        !g_cmdAllocator || !g_cmdList || !g_fence || g_fenceEvent == nullptr)
+    {
+        return CATRA_ERR_INIT;
+    }
+
+    // Same-device contract: the staging copy + pool machinery run on the
+    // interop device. Backends obtain their device via CreateD3D12Device,
+    // which hands out the interop device once interop_init has run, so this
+    // holds for every upscale output; a foreign device cannot be copied
+    // cross-device (D3D12 CopyResource is same-device only).
+    ComPtr<ID3D12Device> srcDevice;
+    if (FAILED(src->GetDevice(IID_PPV_ARGS(srcDevice.GetAddressOf()))) ||
+        srcDevice.Get() != g_d3d12Device.Get())
+    {
+        BackendLog(CATRA_LOG_ERROR,
+                   "interop: encode workaround rejected — src on a foreign D3D12 device");
+        return CATRA_ERR_DEVICE;
+    }
+
+    // Defensive geometry guard: upscale outputs are always simple 2D textures;
+    // anything else is a caller bug (fail clean instead of a device removal).
+    const D3D12_RESOURCE_DESC d12 = src->GetDesc();
+    if (d12.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        d12.MipLevels != 1 || d12.DepthOrArraySize != 1 ||
+        d12.SampleDesc.Count != 1)
+    {
+        BackendLog(CATRA_LOG_ERROR,
+                   "interop: encode workaround invalid geometry (dim=%u mip=%u arr=%u samples=%u)",
+                   static_cast<unsigned>(d12.Dimension), d12.MipLevels,
+                   d12.DepthOrArraySize, d12.SampleDesc.Count);
+        return CATRA_ERR_INVALID_ARG;
+    }
+
+    // --- Shareability probe: CreateSharedHandle succeeds only on a shared
+    // heap. Failure is the GENERIC case (FSR 4 output: HEAP_FLAG_NONE) and
+    // routes through the cached shared staging instead. A shareable texture
+    // whose D3D11 open still fails (e.g. D3D11-incompatible resource flags)
+    // ALSO falls back to the staging copy.
+    ID3D12Resource* shareableSrc = nullptr;
+    bool staged = false;
+    HANDLE probeHandle = nullptr;
+    ComPtr<ID3D11Texture2D> view11;
+    HRESULT hr = g_d3d12Device->CreateSharedHandle(
+        src,
+        nullptr,
+        GENERIC_ALL,
+        nullptr,
+        &probeHandle);
+    if (SUCCEEDED(hr))
+    {
+        // Direct open attempt; the probe handle is consumed/closed either way.
+        const int orc = interop_share_d3d12_to_d3d11(
+            src, g_d3d11Device.Get(), view11.GetAddressOf());
+        CloseHandle(probeHandle);
+        probeHandle = nullptr;
+        if (orc == CATRA_OK && view11)
+        {
+            shareableSrc = src;
+        }
+        else
+        {
+            BackendLog(CATRA_LOG_WARN,
+                       "interop: encode workaround direct D3D11 open failed rc=%d — using staging copy",
+                       orc);
+        }
+    }
+    if (shareableSrc == nullptr)
+    {
+        const int src2 = EnsureEncodeStagingLocked(d12);
+        if (src2 != CATRA_OK)
+        {
+            return src2;
+        }
+        const int crc = CopyD3D12ToStagingLocked(src, g_encodeStaging12.Get());
+        if (crc != CATRA_OK)
+        {
+            return crc;
+        }
+        shareableSrc = g_encodeStaging12.Get();
+        staged = true;
+
+        hr = g_d3d12Device->CreateSharedHandle(
+            shareableSrc,
+            nullptr,
+            GENERIC_ALL,
+            nullptr,
+            &probeHandle);
+        if (FAILED(hr))
+        {
+            BackendLog(CATRA_LOG_ERROR,
+                       "interop: encode workaround staging CreateSharedHandle hr=0x%08lX",
+                       static_cast<unsigned long>(hr));
+            return CATRA_ERR_DEVICE;
+        }
+
+        const int orc = interop_share_d3d12_to_d3d11(
+            shareableSrc, g_d3d11Device.Get(), view11.GetAddressOf());
+        CloseHandle(probeHandle);
+        probeHandle = nullptr;
+        if (orc != CATRA_OK || !view11)
+        {
+            BackendLog(CATRA_LOG_ERROR,
+                       "interop: encode workaround D3D12->D3D11 open failed rc=%d", orc);
+            return CATRA_ERR_DEVICE;
+        }
+    }
+    // Sync note: safe without a keyed-mutex acquire — the D3D12 producer
+    // fence-waited before handing the texture out (backends fence-wait in
+    // Process; the staging copy fence-waited above), so the shared allocation
+    // is GPU-complete and this open view is its sole D3D11 consumer.
+
+    D3D11_TEXTURE2D_DESC desc11;
+    view11->GetDesc(&desc11);
+
+    // --- Pooled GPU-GPU copy into the shared D3D11 pool (the AMF-accepted
+    // slot resource comes out the other side).
+    if (PooledCopyD3D11Locked(view11.Get(), desc11, out_pool_tex) == CATRA_OK)
+    {
+        *out_shared_handle = nullptr; // pool keeps its handles
+        LogEncodeWorkaroundPath(staged);
+        return CATRA_OK;
+    }
+
+    // --- CPU round-trip fallback (KNOWN ISSUE tolerance): on the current
+    // RDNA 4 driver every keyed-mutex GPU-GPU operation returns
+    // DXGI_ERROR_DEVICE_REMOVED (0x887A0001) — verified by bisect on the RX
+    // 9070 XT; interop_share_d3d11_to_d3d12 tolerates it via this exact
+    // pool12 round-trip, so the encode workaround does the same instead of
+    // failing the export. The pool12 slot carries NO keyed mutex, and
+    // AmfEncoder::Encode skips the ping-pong for mutex-less inputs (same as
+    // today's working D3D11 path output). 32-bit BGRA/RGBA only: the upscale
+    // contract (ReadBack11ToCpu assumes 4 bytes/pixel).
+    if (desc11.Format != DXGI_FORMAT_B8G8R8A8_UNORM &&
+        desc11.Format != DXGI_FORMAT_R8G8B8A8_UNORM)
+    {
+        BackendLog(CATRA_LOG_ERROR,
+                   "interop: encode workaround CPU fallback unsupported fmt=%u",
+                   static_cast<unsigned>(desc11.Format));
+        return CATRA_ERR_DEVICE;
+    }
+
+    std::vector<uint8_t> cpu;
+    UINT srcPitch = 0;
+    if (!ReadBack11ToCpu(view11.Get(), desc11, cpu, srcPitch))
+    {
+        BackendLog(CATRA_LOG_ERROR,
+                   "interop: encode workaround readback failed");
+        return CATRA_ERR_DEVICE;
+    }
+
+    const int prc = EnsurePool12Locked(desc11);
+    if (prc != CATRA_OK)
+    {
+        return prc;
+    }
+
+    Pool12Slot& slot = g_pool12[g_pool12Index];
+    g_pool12Index = (g_pool12Index + 1) % g_pool12.size();
+    if (!UploadCpuTo12(slot.tex.Get(), desc11, cpu, srcPitch, slot.state))
+    {
+        BackendLog(CATRA_LOG_ERROR,
+                   "interop: encode workaround pool12 upload failed");
+        return CATRA_ERR_DEVICE;
+    }
+
+    LogSharePath(false); // same one-time path log the D3D11 side emits
+    LogEncodeWorkaroundPath(staged);
+    *out_pool_tex = slot.tex.Get();
+    slot.tex->AddRef();
+    *out_shared_handle = nullptr; // no handle minted on the pool12 path
     return CATRA_OK;
 }
 

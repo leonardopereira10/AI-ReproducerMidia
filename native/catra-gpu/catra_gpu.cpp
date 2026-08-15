@@ -908,11 +908,19 @@ int catra_encode_frame(int ctx, void* texture,
         // The pipeline hands us EITHER a D3D11 texture (decoder frame or RIFE
         // intermediate, passthrough upscale) or an ALREADY-D3D12 texture (FSR 1
         // / FSR 4 upscale output). The AMF encoder consumes D3D12, so D3D11
-        // input goes through the pooled interop while D3D12 input is used
-        // zero-copy. The API must be PROBED, never assumed: casting a D3D12
-        // resource to ID3D11Texture2D is vtable UB (ID3D11Texture2D::GetDesc
-        // slot 11 lands on ID3D12Resource::Unmap -> garbage desc -> spurious
-        // CATRA_ERR_DEVICE or a device fault).
+        // input goes through the pooled interop. The API must be PROBED, never
+        // assumed: casting a D3D12 resource to ID3D11Texture2D is vtable UB
+        // (ID3D11Texture2D::GetDesc slot 11 lands on ID3D12Resource::Unmap ->
+        // garbage desc -> spurious CATRA_ERR_DEVICE or a device fault).
+        //
+        // AMF WORKAROUND (docs/FSR_AMF_ISSUE_CONTEXT.md, SPRINT_04 subtask 03):
+        // D3D12 input is NOT handed to AMF zero-copy anymore —
+        // CreateSurfaceFromDX12Native rejects every user-created D3D12 texture
+        // (FSR 1/FSR 4 upscale output) but accepts the interop pool-slot
+        // resources. Every D3D12 input is therefore copied through the D3D11
+        // pool path (interop_copy_d3d12_for_encode) and AMF receives the pool
+        // slot. GENERIC: no branch by origin backend — only the existing
+        // D3D12-vs-D3D11 probe below.
         ID3D12Resource* d3d12res = nullptr;
         HANDLE sharedHandle = nullptr;
         int irc = CATRA_OK;
@@ -921,13 +929,20 @@ int catra_encode_frame(int ctx, void* texture,
         HRESULT qhr = static_cast<IUnknown*>(texture)->QueryInterface(IID_PPV_ARGS(&probed12));
         if (SUCCEEDED(qhr))
         {
-            // Already D3D12 (upscale output): zero-copy to AMF, no interop
-            // pool involvement -> no NT handle minted. AmfEncoder::Encode QIs
-            // the keyed mutex itself and skips when the resource is not
-            // shared (the FSR-output case). The QI reference is owned by the
-            // ShareCleanup guard below (released exactly once).
-            d3d12res = probed12;
-            log_msg(CATRA_LOG_INFO, "catra_encode_frame: texture is D3D12 (zero-copy), texture=%p", probed12);
+            // Already D3D12 (upscale output): route through the encode
+            // workaround. The helper returns an AddRef'd pool-slot resource
+            // with the SAME output contract as interop_share_d3d11_to_d3d12
+            // (*out_shared_handle stays null — the pool owns its handles), so
+            // the ShareCleanup guard below covers it unchanged. The QI
+            // reference is ours and is dropped right after the call.
+            irc = catra::interop_copy_d3d12_for_encode(probed12, &d3d12res, &sharedHandle);
+            if (probed12 != nullptr)
+            {
+                probed12->Release(); // ref from the QI is ours
+            }
+            log_msg(CATRA_LOG_INFO,
+                    "catra_encode_frame: texture is D3D12 -> D3D11 copy workaround (AMF), texture=%p",
+                    texture);
         }
         else
         {
@@ -941,7 +956,7 @@ int catra_encode_frame(int ctx, void* texture,
         if (irc != CATRA_OK || d3d12res == nullptr)
         {
             log_msg(CATRA_LOG_ERROR,
-                    "catra_encode_frame: D3D11->D3D12 interop failed rc=%d", irc);
+                    "catra_encode_frame: interop to D3D12 failed rc=%d", irc);
             // Defensive: the interop contract guarantees null outputs on
             // failure, but drop any partial handoff so nothing leaks even if
             // that contract is ever violated.

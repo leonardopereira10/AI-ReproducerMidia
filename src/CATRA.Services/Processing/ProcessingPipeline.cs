@@ -226,9 +226,7 @@ public sealed class ProcessingPipeline : IProcessingPipeline
 
             if (needUpscale)
             {
-                upscaleContext = _bridge.CreateUpscaler(
-                    meta.Width, meta.Height, config.TargetWidth, config.TargetHeight,
-                    MapUpscaleMethod(config.UpscaleMethod));
+                upscaleContext = CreateUpscalerWithFallback(meta.Width, meta.Height, config);
                 haveUpscale = true;
             }
 
@@ -611,9 +609,39 @@ public sealed class ProcessingPipeline : IProcessingPipeline
 
     private static int MapUpscaleMethod(string method) => method.ToLowerInvariant() switch
     {
-        "fsr1" => UpscaleMethodFsr1,
-        _ => UpscaleMethodFsr4, // "fsr4" (default)
+        "fsr4" => UpscaleMethodFsr4,
+        _ => UpscaleMethodFsr1, // "fsr1" (default — D-PO-3)
     };
+
+    /// <summary>
+    /// Creates the upscaler with an FSR 4 → FSR 1 fallback (story 03, 2ª linha de defesa).
+    /// When the requested method is FSR 4 and the native create fails
+    /// (<see cref="NativeBridgeException"/> — e.g. FFX DLLs missing/unloadable after the
+    /// native-side downgrade already ran, or a GPU init error), retry ONCE with FSR 1 so
+    /// the export still completes. The 1ª linha is the native downgrade inside
+    /// <c>catra_upscale_create</c> itself; this C# retry only fires when that still
+    /// surfaces as an error. FSR 1 requests never fall back (nothing below them) and a
+    /// failed FSR 1 retry propagates as usual (failed <see cref="ProcessResult"/>).
+    /// </summary>
+    private IntPtr CreateUpscalerWithFallback(int srcWidth, int srcHeight, PipelineConfig config)
+    {
+        int method = MapUpscaleMethod(config.UpscaleMethod);
+        if (method != UpscaleMethodFsr4)
+        {
+            return _bridge.CreateUpscaler(srcWidth, srcHeight, config.TargetWidth, config.TargetHeight, method);
+        }
+
+        try
+        {
+            return _bridge.CreateUpscaler(srcWidth, srcHeight, config.TargetWidth, config.TargetHeight, UpscaleMethodFsr4);
+        }
+        catch (NativeBridgeException ex)
+        {
+            Trace.WriteLine(
+                $"[ProcessingPipeline] FSR 4 upscaler create failed ({ex.Message}); falling back to FSR 1.");
+            return _bridge.CreateUpscaler(srcWidth, srcHeight, config.TargetWidth, config.TargetHeight, UpscaleMethodFsr1);
+        }
+    }
 
     private static string BuildOutputPath(Episode episode, PipelineConfig config)
     {
