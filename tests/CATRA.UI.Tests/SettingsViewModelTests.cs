@@ -87,8 +87,8 @@ public sealed class SettingsViewModelTests
         vm.CleanupOnClose.Should().BeTrue();
         vm.WindowSize.Should().Be(5);
         vm.InterpMethod.Should().Be("rife");
-        vm.UpscaleMethod.Should().Be("fsr4");
-        vm.LocalFps.Should().Be(135);
+        vm.UpscaleMethod.Should().Be("fsr1");
+        vm.LocalFps.Should().Be(60);
         vm.DlnaFps.Should().Be(55);
     }
 

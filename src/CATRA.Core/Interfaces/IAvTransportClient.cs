@@ -47,4 +47,18 @@ public interface IAvTransportClient
     /// <c>STOPPED</c>, <c>TRANSITIONING</c>, ...).
     /// </summary>
     Task<string> GetTransportStateAsync(DlnaDeviceInfo device, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Skips to the next track in the renderer's playlist. Note: most renderers
+    /// ignore this when playing a single URI; included for spec compliance and
+    /// future ContentDirectory support.
+    /// </summary>
+    Task NextAsync(DlnaDeviceInfo device, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Skips to the previous track in the renderer's playlist. Note: most renderers
+    /// ignore this when playing a single URI; included for spec compliance and
+    /// future ContentDirectory support.
+    /// </summary>
+    Task PreviousAsync(DlnaDeviceInfo device, CancellationToken cancellationToken = default);
 }

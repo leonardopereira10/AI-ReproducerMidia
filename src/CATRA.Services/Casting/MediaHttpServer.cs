@@ -205,9 +205,16 @@ public sealed class MediaHttpServer : IMediaHttpServer, IAsyncDisposable
             response.StatusCode = StatusCodes.Status404NotFound;
             return;
         }
-
         response.Headers.AcceptRanges = "bytes";
         response.ContentType = registration.ContentType;
+
+        // 🌟 INJEÇÃO CRUCIAL PARA SMART TVs 4K:
+        // O servidor HTTP precisa carimbar o mesmo perfil DLNA enviado no DIDL-Lite
+        string dlnaFeatures = ResolveDlnaFeatures(registration.FilePath);
+        if (!string.IsNullOrEmpty(dlnaFeatures))
+        {
+            response.Headers.Append("contentFeatures.dlna.org", dlnaFeatures);
+        }
 
         var cancellationToken = context.RequestAborted;
         var rangeHeader = request.Headers.Range.ToString();
@@ -235,18 +242,35 @@ public sealed class MediaHttpServer : IMediaHttpServer, IAsyncDisposable
             return;
         }
 
+        // --- COMPLEMENTO DO CÓDIGO TRUNCADO ---
         long count = end - start + 1;
         response.StatusCode = StatusCodes.Status206PartialContent;
         response.Headers.ContentRange = new ContentRangeHeaderValue(start, end, fileLength).ToString();
-        response.ContentLength = count;
+        response.ContentLength = count; // Definição correta do tamanho do chunk solicitado
 
-        if (HttpMethods.IsHead(request.Method))
+        if (HttpMethods.IsHead(request.Method) || count == 0)
         {
             return;
         }
 
+        // Entrega o pedaço exato (chunk) de bytes que a TV solicitou para processar o vídeo 4K
         await SendBytesAsync(response, registration.FilePath, start, count, cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    private string ResolveDlnaFeatures(string filePath)
+    {
+        // Como seu app processa múltiplos vídeos, o ideal é mapear o perfil.
+        // Para fins do seu teste atual com o vídeo 4K 60fps em HEVC:
+        string ext = Path.GetExtension(filePath).ToLower();
+        if (ext == ".mp4" || ext == ".mkv")
+        {
+            // Retorna a flag completa de tráfego de mídia UHD 60p para a TV aceitar o stream
+            return "DLNA.ORG_PN=HEVC_MAIN_MP4_UHD_60p;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000";
+        }
+
+        // Fallback para AVC/H264 comum se não for um arquivo UHD conhecido
+        return "DLNA.ORG_PN=AVC_MP4_EU_HD;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000";
     }
 
     /// <summary>

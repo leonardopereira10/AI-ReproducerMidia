@@ -144,12 +144,15 @@ public partial class App : Application
                 // Native GPU bridge (ST-12): P/Invoke wrapper over catra-gpu.dll
                 // (FSR 4 / RIFE / AMF, delivered in ST-13..ST-16). Degrades
                 // gracefully when the native DLL has not been built yet.
-                services.AddSingleton<INativeBridge, NativeBridge>();
+                // Transient: each parallel video processing job gets its own bridge
+                // instance so GPU contexts are independent (no cross-device conflicts).
+                services.AddTransient<INativeBridge, NativeBridge>();
 
                 // Pre-processing pipeline (ST-17): decode → interp → upscale → encode
                 // → mux orchestrator over the native bridge + injectable decoder/muxer.
                 // The decoder is transient (a fresh FFmpeg decoder per episode); the
-                // pipeline is a singleton that creates one via the factory per episode.
+                // bridge is transient too (a fresh GPU context per parallel video);
+                // the pipeline is a singleton that creates both via factories per episode.
                 services.AddTransient<IFrameDecoder, FrameDecoder>();
                 // Audio mux shells out to the ffmpeg/ffprobe CLIs: prefer the
                 // binaries bundled in lib/ffmpeg/ (deployed next to the app by
@@ -159,7 +162,7 @@ public partial class App : Application
                     ResolveBundledFfmpegTool("ffmpeg.exe"),
                     ResolveBundledFfmpegTool("ffprobe.exe")));
                 services.AddSingleton<IProcessingPipeline>(sp => new ProcessingPipeline(
-                    sp.GetRequiredService<INativeBridge>(),
+                    () => sp.GetRequiredService<INativeBridge>(),
                     () => sp.GetRequiredService<IFrameDecoder>(),
                     sp.GetRequiredService<IAudioMuxer>()));
 

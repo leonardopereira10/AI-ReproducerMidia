@@ -267,6 +267,43 @@ internal sealed class FakeNativeBridge : INativeBridge
         Calls.Add("upscale_destroy");
     }
 
+    // Async upscale stubs
+    public int SubmitUpscaleAsyncCount { get; private set; }
+    public int PollUpscaleResultCount { get; private set; }
+    public int GetUpscalePendingCountCount { get; private set; }
+    private int _nextTicket = 1;
+
+    public int SubmitUpscaleAsync(IntPtr context, IntPtr srcTexture)
+    {
+        SubmitUpscaleAsyncCount++;
+        Calls.Add("upscale_submit_async");
+        // Simulate native AsyncUpscaleWorker behaviour: ownership of srcTexture
+        // transfers to the native worker, which calls Release() on the source
+        // after processing (matching the real C++ worker thread).
+        if (srcTexture != IntPtr.Zero)
+        {
+            ReleaseTextureCount++;
+            ReleasedTextures.Add(srcTexture);
+            Calls.Add("release_texture");
+        }
+        return _nextTicket++;
+    }
+
+    public IntPtr PollUpscaleResult(IntPtr context, int ticket)
+    {
+        PollUpscaleResultCount++;
+        Calls.Add("upscale_poll_result");
+        // Return a fake result immediately (simulating async completion)
+        // The native worker releases the source texture, not the pipeline.
+        return new IntPtr(0x90000 + ticket);
+    }
+
+    public int GetUpscalePendingCount(IntPtr context)
+    {
+        GetUpscalePendingCountCount++;
+        return 0;
+    }
+
     public IntPtr CreateEncoder(int width, int height, int bitrateKbps, double fps)
     {
         EncodeCreateCount++;
@@ -444,7 +481,7 @@ public class ProcessingPipelineTests : IDisposable
         var muxer = new FakeAudioMuxer();
         var shared = spec ?? new FakeDecoderSpec();
         var pipeline = new ProcessingPipeline(
-            bridge,
+            () => bridge,
             () => new FakeFrameDecoder(shared),
             muxer,
             frameTimeout,
@@ -553,7 +590,7 @@ public class ProcessingPipelineTests : IDisposable
         result.Success.Should().BeTrue("the FSR 4 create failure must trigger the FSR 1 retry, not fail the export");
         bridge.UpscaleCreateMethods.Should().Equal(new[] { 2, 1 }, "first attempt uses FSR 4 (2), the retry uses FSR 1 (1)");
         bridge.UpscaleCreateCount.Should().Be(2);
-        bridge.UpscaleProcessCount.Should().Be(3, "every frame is upscaled by the fallback FSR 1 context");
+        bridge.SubmitUpscaleAsyncCount.Should().Be(3, "every frame is upscaled by the fallback FSR 1 context");
         bridge.UpscaleDestroyCount.Should().Be(1, "only the successful FSR 1 context is destroyed in cleanup");
     }
 
@@ -719,7 +756,7 @@ public class ProcessingPipelineTests : IDisposable
 
         // Every source frame encoded once (5) + 2 intermediates per pair (4×2 = 8) = 13.
         bridge.EncodeFrameCount.Should().Be(13);
-        bridge.UpscaleProcessCount.Should().Be(13, "every encoded frame is upscaled first");
+        bridge.SubmitUpscaleAsyncCount.Should().Be(13, "every encoded frame is upscaled first");
         bridge.EncodeFlushCount.Should().Be(1);
 
         muxer.MuxCallCount.Should().Be(1);
@@ -792,9 +829,11 @@ public class ProcessingPipelineTests : IDisposable
         bridge.UpscaleCreateCount.Should().Be(1);
         bridge.InterpCreateCount.Should().Be(0, "src fps >= target fps disables interp");
 
-        // Zero leak: one release per upscaled texture, each released exactly once.
-        bridge.UpscaleProcessCount.Should().Be(4, "each of the 4 source frames is upscaled");
-        bridge.ReleaseTextureCount.Should().Be(bridge.UpscaleProcessCount, "every caller-owned upscale output is released");
+        // Zero leak: one release per upscaled texture (output), each released exactly once.
+        // Decoder-owned source frames are released via decoder.ReleaseFrame (not bridge.ReleaseTexture).
+        bridge.SubmitUpscaleAsyncCount.Should().Be(4, "each of the 4 source frames is submitted for async upscale");
+        // Async path: native worker releases source textures (4) + encoder releases upscale outputs (4) = 8.
+        bridge.ReleaseTextureCount.Should().Be(bridge.SubmitUpscaleAsyncCount * 2, "native worker releases source + encoder releases upscale output");
         bridge.ReleasedTextures.Should().OnlyHaveUniqueItems("no texture is released twice");
         bridge.FreeNativeArrayCount.Should().Be(0, "no interp arrays are allocated in this flow");
     }
@@ -852,11 +891,13 @@ public class ProcessingPipelineTests : IDisposable
 
         // 5 source frames + 4 pairs x 2 intermediates = 13 encoded (each upscaled).
         bridge.EncodeFrameCount.Should().Be(13);
-        bridge.UpscaleProcessCount.Should().Be(13);
+        bridge.SubmitUpscaleAsyncCount.Should().Be(13);
         int intermediates = bridge.InterpProcessCount * bridge.InterpFramesPerPair; // 4 x 2 = 8
 
-        // Every upscale output (13) AND every intermediate (8) is released exactly once.
-        bridge.ReleaseTextureCount.Should().Be(bridge.UpscaleProcessCount + intermediates);
+        // Async path: native worker releases ALL source textures (5 decoder-owned + 8 intermediates = 13)
+        // via SubmitUpscaleAsync, then encoder releases the 13 upscale outputs via ReleaseTexture.
+        // Total bridge releases = 13 (native worker) + 13 (encoder) = 26.
+        bridge.ReleaseTextureCount.Should().Be(bridge.SubmitUpscaleAsyncCount * 2, "native worker releases all sources + encoder releases all upscale outputs");
         bridge.ReleasedTextures.Should().OnlyHaveUniqueItems();
         bridge.FreeNativeArrayCount.Should().Be(bridge.InterpProcessCount);
     }
@@ -1164,7 +1205,7 @@ public class ProcessingPipelineTests : IDisposable
         var bridge = new FakeNativeBridge();
         var muxer = new FakeAudioMuxer();
         FakeFrameDecoder? created = null;
-        var pipeline = new ProcessingPipeline(bridge, () => created = new FakeFrameDecoder(spec), muxer);
+        var pipeline = new ProcessingPipeline(() => bridge, () => created = new FakeFrameDecoder(spec), muxer);
         bridge.ThrowOnEncodeFrame = new NativeBridgeException("boom");
 
         await pipeline.ProcessAsync(Ep(1, Path.Combine(folder, "s.mp4")), LocalConfig(folder), new CapturingProgress(), CancellationToken.None);

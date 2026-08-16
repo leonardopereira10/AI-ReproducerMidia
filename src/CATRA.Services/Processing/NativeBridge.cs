@@ -59,6 +59,9 @@ internal interface INativeLibrary
     int UpscaleCreate(int srcWidth, int srcHeight, int dstWidth, int dstHeight, int method, out int context);
     int UpscaleProcess(int context, IntPtr srcTexture, out IntPtr dstTexture);
     void UpscaleDestroy(int context);
+    int UpscaleSubmitAsync(int context, IntPtr srcTexture);
+    int UpscalePollResult(int context, int ticket, out IntPtr dstTexture);
+    int UpscalePendingCount(int context);
 
     int EncodeCreate(int width, int height, int bitrateKbps, double fps, out int context);
     int EncodeFrame(int context, IntPtr texture, out IntPtr packetBuffer, out int packetSize);
@@ -148,6 +151,15 @@ internal sealed class NativeLibraryLoader : INativeLibrary
 
     public void UpscaleDestroy(int context) => catra_upscale_destroy(context);
 
+    public int UpscaleSubmitAsync(int context, IntPtr srcTexture)
+        => catra_upscale_submit_async(context, srcTexture);
+
+    public int UpscalePollResult(int context, int ticket, out IntPtr dstTexture)
+        => catra_upscale_poll_result(context, ticket, out dstTexture);
+
+    public int UpscalePendingCount(int context)
+        => catra_upscale_pending_count(context);
+
     public int EncodeCreate(int width, int height, int bitrateKbps, double fps, out int context)
         => catra_encode_create(width, height, bitrateKbps, fps, out context);
 
@@ -215,6 +227,15 @@ internal sealed class NativeLibraryLoader : INativeLibrary
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     private static extern void catra_upscale_destroy(int context);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int catra_upscale_submit_async(int context, IntPtr srcTexture);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int catra_upscale_poll_result(int context, int ticket, out IntPtr dstTexture);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int catra_upscale_pending_count(int context);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     private static extern int catra_encode_create(int width, int height, int bitrateKbps, double fps, out int context);
@@ -447,6 +468,46 @@ public sealed class NativeBridge : INativeBridge
         }
 
         _library.UpscaleDestroy(ToInt32(context));
+    }
+
+    /// <inheritdoc />
+    public int SubmitUpscaleAsync(IntPtr context, IntPtr srcTexture)
+    {
+        EnsureAvailable();
+        int ticket = _library.UpscaleSubmitAsync(ToInt32(context), srcTexture);
+        if (ticket < 0)
+        {
+            ThrowIfError(ticket, "catra_upscale_submit_async");
+        }
+        return ticket;
+    }
+
+    /// <inheritdoc />
+    public IntPtr PollUpscaleResult(IntPtr context, int ticket)
+    {
+        EnsureAvailable();
+        int resultCode = _library.UpscalePollResult(ToInt32(context), ticket, out IntPtr dstTexture);
+        if (resultCode == 0) // CATRA_OK
+        {
+            return dstTexture;
+        }
+        if (resultCode == -6) // CATRA_ERR_UNKNOWN = still in flight OR ticket not found
+        {
+            return IntPtr.Zero;
+        }
+        // Any other error is fatal
+        ThrowIfError(resultCode, "catra_upscale_poll_result");
+        return IntPtr.Zero; // unreachable
+    }
+
+    /// <inheritdoc />
+    public int GetUpscalePendingCount(IntPtr context)
+    {
+        if (!_library.IsAvailable)
+        {
+            return 0;
+        }
+        return _library.UpscalePendingCount(ToInt32(context));
     }
 
     /// <inheritdoc />

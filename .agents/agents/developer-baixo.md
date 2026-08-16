@@ -1,6 +1,7 @@
 ---
 name: developer-baixo
 description: Developer — complexidade baixa. CRUD simples, validações, DTOs, converters.
+model: qwen-ai/deepseek-v4-flash-0731
 thinking: minimal
 tools: read, grep, find, ls, bash, edit, write
 systemPromptMode: replace

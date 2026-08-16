@@ -1,0 +1,43 @@
+{
+  "id": "bugfix_05",
+  "tipo": "fix_bug",
+  "titulo": "Status do episódio recém-assistido não atualiza ao voltar do player para a tela de detalhe",
+  "complexidade": "baixa",
+  "agente": "developer-baixo",
+  "bug": {
+    "descricao": "Ao terminar de assistir um episódio e voltar para a tela principal (MediaDetail, Tela 2), o episódio recém-assistido permanece na grade 'Não assistidos' e o ProgressLine não reflete o novo estado.",
+    "causa_raiz": "FrameNavigationService.GoBack() usa _frame.GoBack(), que restaura a página kept-alive (MediaDetailView, KeepAlive=True) do back stack do WPF sem invocar INavigationAware.OnNavigatedTo (chamado apenas em Navigate()). MediaDetailView só carregava dados em OnNavigatedTo, então MediaDetailViewModel.LoadAsync nunca re-executava no retorno do player. Persistência não era o problema: WatchStateService.SaveProgressAsync é síncrono e roda antes do GoBack (PlayerViewModel.Close/ReleasePlayback → SaveCurrentProgress).",
+    "reproducao": "Home → série → play episódio até o fim (RN-02 marca watched) → voltar → episódio continua em 'Não assistidos' até renavegar manualmente.",
+    "evidencia_producao": "Reporte do usuário; análise de código: FrameNavigationService.GoBack não notifica INavigationAware; HomeView já usava padrão de reload via evento Loaded."
+  },
+  "escopo": {
+    "arquivos": [
+      "src/CATRA.UI/Views/MediaDetailView.xaml.cs",
+      "tests/CATRA.UI.Tests/MediaDetailViewModelTests.cs"
+    ],
+    "implementacao": [
+      "MediaDetailView: registrar Loaded += OnLoaded; guardar _mediaItemId recebido em OnNavigatedTo.",
+      "OnLoaded: no primeiro show delega o load inicial a OnNavigatedTo; em re-entradas na árvore visual (GoBack) chama LoadSafeAsync() → _viewModel.LoadAsync(_mediaItemId) — mesmo padrão do HomeView.",
+      "Teste de regressão Load_ReturningFromPlayer_ReflectsUpdatedWatchState: load inicial com episódio não assistido → watch state persistido (Watched=true, 100%) → reload move episódio para WatchedEpisodes e atualiza ProgressLine/HasWatched/HasUnwatched."
+    ],
+    "fora_de_escopo": [
+      "Alterar FrameNavigationService/GoBack para notificar INavigationAware (mudança genérica de navegação)",
+      "Refresh reativo via eventos do WatchStateService",
+      "ProcessingQueueView/outras telas (mesmo padrão pode ser aplicado depois se necessário)"
+    ]
+  },
+  "criterios_aceite": [
+    "Voltar do player após assistir episódio até o fim: episódio aparece em 'Assistidos' e ProgressLine atualizado",
+    "Load inicial (Navigate) não duplica carregamento",
+    "dotnet build CATRA.sln 0w/0e",
+    "MediaDetailViewModelTests 8/8 passando; sem falhas novas em dotnet test (falhas Settings_* pré-existentes, confirmadas no baseline)"
+  ],
+  "risk_assessment": {
+    "nivel": "baixo",
+    "riscos": [
+      "Evento Loaded disparar em ordem inesperada no primeiro show; mitigação: flag _initialShow + load inicial sempre via OnNavigatedTo.",
+      "Reload a cada retorno re-executa QueueThumbnailLoads; mitigação: thumbnails já resolvidas são puladas (check ThumbnailPath) e lookup é best-effort em thread pool."
+    ]
+  },
+  "validacao": "dotnet build CATRA.sln --no-restore (0w/0e) + dotnet test --no-build (MediaDetailViewModelTests 8/8; falhas restantes pré-existentes no baseline: SettingsProcessingTests x2, SettingsViewModelTests x1, Data RepositoryTests.Settings_SeedsAllSpecDefaults x1, Services x1 — unrelated, spec-defaults local_target_fps 135 vs 60). Validação manual sugerida: assistir episódio até o fim e voltar."
+}

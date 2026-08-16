@@ -1,7 +1,8 @@
 ---
 name: developer-alto
 description: Developer — complexidade alta. E2E, auth, multi-layer flows, performance, EF Core.
-thinking: high
+model: qwen-ai/qwen3.7-max
+thinking: medium
 tools: read, grep, find, ls, bash, edit, write
 systemPromptMode: replace
 inheritProjectContext: true

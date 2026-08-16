@@ -1,0 +1,51 @@
+{
+  "bug_id": "bugfix_06_av_sync",
+  "title": "Dessincronização áudio/vídeo após processamento",
+  "severity": "high",
+  "description": "Após processar um vídeo, a saída tem áudio que termina antes do vídeo. Exemplo: vídeo 'Teste rápido' gera saída de 5:34, mas áudio termina 10s antes do fim.",
+  "symptoms": [
+    "Vídeo processado tem duração maior que o áudio",
+    "Áudio termina antes do vídeo (ex: 10s antes em vídeo de 5:34)",
+    "Dessincronização A/V progressiva ou pontual"
+  ],
+  "expected_behavior": "Áudio e vídeo devem ter a mesma duração e estar sincronizados após processamento",
+  "actual_behavior": "Áudio termina antes do vídeo, causando dessincronização",
+  "reproduction": "Processar vídeo 'Teste rápido' (curto) com upscale/interpolação ativados",
+  "hypotheses": [
+    "Cálculo incorreto da duração do stream de áudio no muxing",
+    "Frames de áudio sendo truncados ou não codificados",
+    "Conversão de frame rate (RIFE/FSR) não ajusta timing do áudio",
+    "Bug no muxing MP4 (PTS/DTS não sincronizados)",
+    "Audio encoder não está recebendo todos os frames",
+    "Frame rate do áudio não está sendo convertido corretamente"
+  ],
+  "affected_components": [
+    "src/CATRA.Services/Processing/ProcessingPipeline.cs",
+    "src/CATRA.Services/Processing/ProcessingQueueService.cs",
+    "native/catra-gpu/encode_amf.cpp (encoder)",
+    "Muxing MP4 (C# ou nativo)",
+    "Audio encoding pipeline"
+  ],
+  "risk_assessment": {
+    "impact": "high — torna vídeos processados inutilizáveis",
+    "likelihood": "high — reproduzível com qualquer vídeo processado",
+    "complexity": "media — requer investigação do pipeline de áudio + muxing"
+  },
+  "investigation_steps": [
+    "1. Reproduzir com vídeo curto (10-30s) e medir duração exata de áudio/vídeo na saída",
+    "2. Verificar se o problema ocorre sem upscale/interpolação (baseline)",
+    "3. Inspecionar ProcessingPipeline: como o áudio é codificado e muxado",
+    "4. Verificar encode_amf.cpp: se o encoder está recebendo todos os frames de áudio",
+    "5. Inspecicionar muxing MP4: PTS/DTS de áudio vs vídeo",
+    "6. Verificar se frame rate conversion afeta o áudio"
+  ],
+  "fix_approach": "TBD após investigação",
+  "test_strategy": "Teste automatizado: processar vídeo de duração conhecida, validar que áudio e vídeo têm a mesma duração (tolerância ±100ms)",
+  "created_at": "2026-08-14T01:45:00Z",
+  "created_by": "orchestrator",
+  "status": "closed",
+  "closed_at": "2026-08-14T02:20:00Z",
+  "closed_by": "orchestrator",
+  "resolution": "AudioMuxer agora faz 2-pass: normaliza VUI com hevc_metadata BSF (tick_rate={fps}) + mux com -f hevc -framerate explicito. Corrige VUI invalida do AMF (135/1 -> fps real). Commit a8f0faf.",
+  "validation": "Review aprovado. 193/193 testes Processing passam. Dump AMF real: 0.059s -> 0.320s (8/25 exato)."
+}

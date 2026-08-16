@@ -136,6 +136,8 @@ internal sealed class FakeProcessingQueue : IProcessingQueueService
 
     public ProcessJob? CurrentJob { get; set; }
 
+    public List<ProcessJob> ActiveJobs { get; } = new();
+
     public List<ProcessJob> QueuedJobs { get; } = new();
 
     public Task EnqueueAsync(List<int> episodeIds, ProcessProfile profile, bool forceReprocess = false)

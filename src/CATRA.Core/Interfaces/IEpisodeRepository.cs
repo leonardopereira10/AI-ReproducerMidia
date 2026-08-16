@@ -15,4 +15,18 @@ public interface IEpisodeRepository : IRepository<Episode>
     /// <see cref="Episode.EpisodeNumber"/> ascending.
     /// </summary>
     IReadOnlyList<Episode> GetUnwatchedByMediaItem(int mediaItemId);
+
+    /// <summary>
+    /// Returns the next episode after <paramref name="currentEpisodeId"/> within
+    /// the same media item, ordered by <see cref="Episode.EpisodeNumber"/>.
+    /// Returns <c>null</c> when the current episode is the last one.
+    /// </summary>
+    Episode? GetNextEpisode(int currentEpisodeId);
+
+    /// <summary>
+    /// Returns the previous episode before <paramref name="currentEpisodeId"/> within
+    /// the same media item, ordered by <see cref="Episode.EpisodeNumber"/>.
+    /// Returns <c>null</c> when the current episode is the first one.
+    /// </summary>
+    Episode? GetPreviousEpisode(int currentEpisodeId);
 }

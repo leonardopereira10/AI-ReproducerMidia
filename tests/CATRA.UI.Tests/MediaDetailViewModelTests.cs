@@ -148,6 +148,37 @@ public sealed class MediaDetailViewModelTests
         _navigator.QueueIds.Should().ContainSingle().Which.Should().Be(7);
     }
 
+    [Fact]
+    public async Task Load_ReturningFromPlayer_ReflectsUpdatedWatchState()
+    {
+        // Bug fix regression: after watching an episode to the end and going
+        // back to the detail screen, the reload must move the episode from the
+        // unwatched grid to the watched grid (the view re-triggers LoadAsync
+        // when the kept-alive page is shown again).
+        var episode = new Episode { Id = 1, MediaItemId = 7, EpisodeNumber = 1, FileName = "ep1.mkv", DurationSec = 1000d };
+        _library.MediaItem = new MediaItem { Id = 7, Title = "Série" };
+        _library.Episodes.Add(new EpisodeDetail(episode, watchState: null));
+        var vm = CreateVm();
+        await vm.LoadAsync(7);
+
+        vm.UnwatchedEpisodes.Should().ContainSingle();
+        vm.WatchedEpisodes.Should().BeEmpty();
+
+        // Watch state persisted by the player (RN-02 crossed the threshold).
+        _library.Episodes.Clear();
+        _library.Episodes.Add(new EpisodeDetail(
+            episode,
+            new CATRA.Core.Models.WatchState { EpisodeId = 1, Watched = true, ProgressPct = 100d }));
+
+        await vm.LoadAsync(7);
+
+        vm.WatchedEpisodes.Should().ContainSingle();
+        vm.UnwatchedEpisodes.Should().BeEmpty();
+        vm.ProgressLine.Should().Be("1 eps | 1 assistidos");
+        vm.HasWatched.Should().BeTrue();
+        vm.HasUnwatched.Should().BeFalse();
+    }
+
     // ── fakes ──────────────────────────────────────────────────────────────
 
     /// <summary>Recording <see cref="IThumbnailService"/> fake (no filesystem).</summary>

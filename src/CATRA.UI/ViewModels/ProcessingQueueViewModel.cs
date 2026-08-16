@@ -67,33 +67,16 @@ public sealed partial class ProcessingQueueViewModel : ObservableObject, IDispos
     [ObservableProperty]
     private string _activeProfileLabel = string.Empty;
 
-    /// <summary>Whether a job is currently processing.</summary>
+    /// <summary>Whether any job is currently processing.</summary>
     [ObservableProperty]
     private bool _hasCurrentJob;
 
-    /// <summary>Current job episode label ("EP03").</summary>
+    /// <summary>Label showing how many jobs are active, e.g. "2 em execução".</summary>
     [ObservableProperty]
-    private string _currentJobEpisodeLabel = string.Empty;
+    private string _activeJobCountLabel = string.Empty;
 
-    /// <summary>Current job episode title.</summary>
-    [ObservableProperty]
-    private string _currentJobTitle = string.Empty;
-
-    /// <summary>Current job overall progress (0–100).</summary>
-    [ObservableProperty]
-    private double _currentProgressPct;
-
-    /// <summary>Current pipeline step label, e.g. "Upscale (FSR4)".</summary>
-    [ObservableProperty]
-    private string _currentStepLabel = string.Empty;
-
-    /// <summary>Combined progress text, e.g. "58% — Upscale (FSR4)".</summary>
-    [ObservableProperty]
-    private string _currentProgressText = string.Empty;
-
-    /// <summary>Estimated time remaining, e.g. "~3 min".</summary>
-    [ObservableProperty]
-    private string _etaDisplay = "—";
+    /// <summary>Currently processing jobs (parallel processing support).</summary>
+    public ObservableCollection<ActiveJobItem> ActiveJobItems { get; } = [];
 
     /// <summary>Disk used by the series' processed files (bytes).</summary>
     [ObservableProperty]
@@ -144,7 +127,7 @@ public sealed partial class ProcessingQueueViewModel : ObservableObject, IDispos
 
         RebuildWindowEpisodes();
         RecomputeDisk();
-        RefreshCurrentJob();
+        RefreshActiveJobs();
     }
 
     /// <summary>← Voltar.</summary>
@@ -161,38 +144,72 @@ public sealed partial class ProcessingQueueViewModel : ObservableObject, IDispos
     {
         RebuildWindowEpisodes();
         RecomputeDisk();
-        RefreshCurrentJob();
+        RefreshActiveJobs();
     });
 
     private void OnProgressChanged(object? sender, PipelineProgress sample) => Post(() =>
     {
-        CurrentProgressPct = Clamp(sample.OverallPct);
-        CurrentStepLabel = StepToLabelConverter.ToLabel(sample.CurrentStep, MethodForStep(sample.CurrentStep));
-        CurrentProgressText = $"{CurrentProgressPct:F0}% — {CurrentStepLabel}";
-        EtaDisplay = sample.Eta is { } eta ? FormatEta(eta) : "—";
+        // Update all active job items with progress from their respective jobs.
+        // The progress event doesn't carry job identity, so we refresh from the queue.
+        RefreshActiveJobs();
     });
 
-    private void RefreshCurrentJob()
+    private void RefreshActiveJobs()
     {
-        var job = _queue.CurrentJob;
-        if (job is null)
+        var jobs = _queue.ActiveJobs;
+        HasCurrentJob = jobs.Count > 0;
+        ActiveJobCountLabel = jobs.Count > 0
+            ? $"{jobs.Count} em execução"
+            : string.Empty;
+
+        // Build a map of existing items by job ID for efficient update.
+        var existingItems = new Dictionary<int, ActiveJobItem>();
+        foreach (var item in ActiveJobItems)
         {
-            HasCurrentJob = false;
-            CurrentProgressPct = 0d;
-            CurrentProgressText = string.Empty;
-            EtaDisplay = "—";
-            return;
+            existingItems[item.JobId] = item;
         }
 
-        var episode = _window.WindowEpisodes.FirstOrDefault(e => e.Id == job.EpisodeId);
-        HasCurrentJob = true;
-        CurrentJobEpisodeLabel = EpisodeLabel(episode);
-        CurrentJobTitle = episode?.DisplayTitle ?? episode?.FileName ?? string.Empty;
-        CurrentProgressPct = Clamp(job.ProgressPct);
-        CurrentStepLabel = job.CurrentStep is { } step
-            ? StepToLabelConverter.ToLabel(MapStep(step), MethodForStep(MapStep(step)))
-            : string.Empty;
-        CurrentProgressText = $"{CurrentProgressPct:F0}% — {CurrentStepLabel}";
+        // Remove items that are no longer active.
+        var activeJobIds = new HashSet<int>(jobs.Select(j => j.Id));
+        foreach (var item in ActiveJobItems.ToList())
+        {
+            if (!activeJobIds.Contains(item.JobId))
+            {
+                ActiveJobItems.Remove(item);
+                existingItems.Remove(item.JobId);
+            }
+        }
+
+        // Add or update items for each active job.
+        foreach (var job in jobs)
+        {
+            if (existingItems.TryGetValue(job.Id, out var existingItem))
+            {
+                // Update existing item.
+                existingItem.ProgressPct = Clamp(job.ProgressPct);
+                existingItem.StepLabel = job.CurrentStep is { } step
+                    ? StepToLabelConverter.ToLabel(MapStep(step), MethodForStep(MapStep(step)))
+                    : string.Empty;
+                existingItem.ProgressText = $"{existingItem.ProgressPct:F0}% — {existingItem.StepLabel}";
+            }
+            else
+            {
+                // Create new item.
+                var episode = _window.WindowEpisodes.FirstOrDefault(e => e.Id == job.EpisodeId);
+                var newItem = new ActiveJobItem
+                {
+                    JobId = job.Id,
+                    EpisodeLabel = EpisodeLabel(episode),
+                    Title = episode?.DisplayTitle ?? episode?.FileName ?? string.Empty,
+                    ProgressPct = Clamp(job.ProgressPct),
+                    StepLabel = job.CurrentStep is { } step
+                        ? StepToLabelConverter.ToLabel(MapStep(step), MethodForStep(MapStep(step)))
+                        : string.Empty,
+                };
+                newItem.ProgressText = $"{newItem.ProgressPct:F0}% — {newItem.StepLabel}";
+                ActiveJobItems.Add(newItem);
+            }
+        }
     }
 
     private void RebuildWindowEpisodes()
@@ -341,6 +358,33 @@ public sealed partial class ProcessingQueueViewModel : ObservableObject, IDispos
         _queue.JobCompleted -= OnJobEvent;
         _queue.JobFailed -= OnJobEvent;
         _queue.ProgressChanged -= OnProgressChanged;
+    }
+
+    /// <summary>A single active job card in the processing list.</summary>
+    public sealed partial class ActiveJobItem : ObservableObject
+    {
+        /// <summary>Database ID of the job (for tracking).</summary>
+        public int JobId { get; init; }
+
+        /// <summary>Episode label ("EP03").</summary>
+        [ObservableProperty]
+        private string _episodeLabel = string.Empty;
+
+        /// <summary>Episode display title.</summary>
+        [ObservableProperty]
+        private string _title = string.Empty;
+
+        /// <summary>Overall progress (0–100).</summary>
+        [ObservableProperty]
+        private double _progressPct;
+
+        /// <summary>Current pipeline step label, e.g. "Upscale (FSR4)".</summary>
+        [ObservableProperty]
+        private string _stepLabel = string.Empty;
+
+        /// <summary>Combined progress text, e.g. "58% — Upscale (FSR4)".</summary>
+        [ObservableProperty]
+        private string _progressText = string.Empty;
     }
 
     /// <summary>A single episode row in the window list (Tela 3).</summary>

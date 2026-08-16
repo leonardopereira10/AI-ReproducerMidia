@@ -136,19 +136,76 @@ public sealed class AvTransportClient : IAvTransportClient
            "</s:Envelope>";
 
     /// <summary>
-    /// Builds the DIDL-Lite metadata for <see cref="SetAvTransportUriAsync"/>.
-    /// <c>DLNA.ORG_OP=01</c> advertises byte seek support (Range requests).
+    /// Constrói os metadados DIDL-Lite dinamicamente com base nos metadados reais do vídeo.
     /// </summary>
-    public static string BuildDidlLiteMetadata(string title, string url)
-        => "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" " +
-           "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" " +
-           "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">" +
-           "<item id=\"0\" parentID=\"-1\" restricted=\"1\">" +
-           $"<dc:title>{Escape(title)}</dc:title>" +
-           "<upnp:class>object.item.videoItem</upnp:class>" +
-           $"<res protocolInfo=\"http-get:*:video/mp4:DLNA.ORG_OP=01;DLNA.ORG_CI=0\">{Escape(url)}</res>" +
-           "</item>" +
-           "</DIDL-Lite>";
+    public static string BuildDidlLiteMetadata(VideoMetadata video)
+    {
+        // 1. Define o MIME Type correto com base na extensão
+        string mimeType = video.Extension == "mkv" ? "video/x-matroska" : "video/mp4";
+
+        // 2. Descobre o perfil DLNA (DLNA.ORG_PN) correspondente
+        string dlnaProfile = GetDlnaProfile(video.VideoCodec ?? "HEVC", video.Width, (int)video.Fps);
+
+        // 3. Monta a string de ProtocolInfo. 
+        // Se o codec for reconhecido pelo DLNA, injetamos o perfil; caso contrário, usamos o cabeçalho genérico.
+        string protocolInfo = !string.IsNullOrEmpty(dlnaProfile)
+            ? $"http-get:*:{mimeType}:{dlnaProfile};DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+            : $"http-get:*:{mimeType}:DLNA.ORG_OP=01;DLNA.ORG_CI=0";
+
+        return "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" " +
+               "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" " +
+               "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">" +
+               "<item id=\"0\" parentID=\"-1\" restricted=\"1\">" +
+               $"<dc:title>{Escape(video.Title)}</dc:title>" +
+               "<upnp:class>object.item.videoItem</upnp:class> " +
+               $"<res protocolInfo=\"{protocolInfo}\">{Escape(video.Url)}</res>" +
+               "</item>" +
+               "</DIDL-Lite>";
+    }
+
+    /// <summary>
+    /// Mapeia as propriedades técnicas do arquivo para os perfis UHD/HD oficiais do DLNA.
+    /// </summary>
+    private static string GetDlnaProfile(string codec, int width, int fps)
+    {
+        if (string.IsNullOrEmpty(codec)) return string.Empty;
+
+        string normalizedCodec = codec.ToLower();
+
+        // Cenários para HEVC / H.265 (Padrão para 4K moderno)
+        if (normalizedCodec == "hevc" || normalizedCodec == "h265")
+        {
+            if (width >= 3840) // Resolução 4K Ultra HD
+            {
+                return fps > 30
+                    ? "DLNA.ORG_PN=HEVC_MAIN_MP4_UHD_60p"
+                    : "DLNA.ORG_PN=HEVC_MAIN_MP4_UHD_30p";
+            }
+
+            // HEVC em resoluções menores (como 1080p)
+            return "DLNA.ORG_PN=HEVC_MAIN_MP4_HD";
+        }
+
+        // Cenários para H.264 / AVC (Padrão tradicional)
+        if (normalizedCodec == "h264" || normalizedCodec == "avc")
+        {
+            if (width >= 3840) return "DLNA.ORG_PN=AVC_MP4_UHD";     // H.264 em 4K
+            if (width >= 1920) return "DLNA.ORG_PN=AVC_MP4_EU_HD";  // H.264 em 1080p (Full HD)
+            if (width >= 1280) return "DLNA.ORG_PN=AVC_MP4_HP_HD";  // H.264 em 720p (HD)
+
+            return "DLNA.ORG_PN=AVC_MP4_MP_SD"; // Resoluções menores (SD)
+        }
+
+        // Retorna vazio se for outro formato (como VP9 ou AV1) para usar o fallback seguro de streaming
+        return string.Empty;
+    }
+
+    // Método auxiliar de escape para evitar que caracteres especiais quebrem a string XML
+    public static string Escape(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return string.Empty;
+        return System.Security.SecurityElement.Escape(text);
+    }
 
     /// <summary>The <c>SOAPAction</c> header value for <paramref name="action"/>.</summary>
     public static string BuildSoapAction(string action) => $"\"{ServiceType}#{action}\"";
@@ -162,13 +219,32 @@ public sealed class AvTransportClient : IAvTransportClient
         return new PositionInfo(DlnaTime.Parse(relTime), DlnaTime.Parse(trackDuration));
     }
 
+    /// <inheritdoc />
+    public Task NextAsync(DlnaDeviceInfo device, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(device);
+        var body =
+            $"<u:Next xmlns:u=\"{ServiceType}\">" +
+            "<InstanceID>0</InstanceID>" +
+            "</u:Next>";
+        return InvokeAsync(device.AvTransportControlUrl, "Next", body, cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public Task PreviousAsync(DlnaDeviceInfo device, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(device);
+        var body =
+            $"<u:Previous xmlns:u=\"{ServiceType}\">" +
+            "<InstanceID>0</InstanceID>" +
+            "</u:Previous>";
+        return InvokeAsync(device.AvTransportControlUrl, "Previous", body, cancellationToken);
+    }
+
+    /// <inheritdoc />
     /// <summary>Parses a <c>GetTransportInfo</c> response (<c>CurrentTransportState</c>).</summary>
     public static string ParseTransportState(string responseXml)
         => ParseBodyValues(responseXml).TryGetValue("CurrentTransportState", out var state) ? state : string.Empty;
-
-    /// <summary>XML-escapes text for inclusion in an envelope (entities, not CDATA).</summary>
-    public static string Escape(string value)
-        => SecurityElement.Escape(value) ?? string.Empty;
 
     private static Dictionary<string, string> ParseBodyValues(string responseXml)
     {

@@ -69,6 +69,7 @@ public sealed partial class SettingsViewModel : ObservableObject
         _windowSize = model.WindowSize;
         _interpMethod = model.InterpMethod;
         _upscaleMethod = model.UpscaleMethod;
+        _maxParallelJobs = model.MaxParallelJobs;
         _localWidth = model.LocalTargetWidth;
         _localHeight = model.LocalTargetHeight;
         _localFps = model.LocalTargetFps;
@@ -77,6 +78,14 @@ public sealed partial class SettingsViewModel : ObservableObject
         _dlnaHeight = model.DlnaTargetHeight;
         _dlnaFps = model.DlnaTargetFps;
         _dlnaBitrate = model.DlnaEncodeBitrateKbps;
+
+        // Text bindings for resolution/FPS (free typing, commit on LostFocus)
+        _localWidthText = model.LocalTargetWidth.ToString(CultureInfo.InvariantCulture);
+        _localHeightText = model.LocalTargetHeight.ToString(CultureInfo.InvariantCulture);
+        _localFpsText = model.LocalTargetFps.ToString(CultureInfo.InvariantCulture);
+        _dlnaWidthText = model.DlnaTargetWidth.ToString(CultureInfo.InvariantCulture);
+        _dlnaHeightText = model.DlnaTargetHeight.ToString(CultureInfo.InvariantCulture);
+        _dlnaFpsText = model.DlnaTargetFps.ToString(CultureInfo.InvariantCulture);
 
         _loading = false;
 
@@ -200,6 +209,10 @@ public sealed partial class SettingsViewModel : ObservableObject
     [ObservableProperty]
     private string _upscaleMethod = "fsr4";
 
+    /// <summary>Maximum number of videos to process simultaneously (1-4 recommended).</summary>
+    [ObservableProperty]
+    private int _maxParallelJobs = 1;
+
     /// <summary>Local profile target width.</summary>
     [ObservableProperty]
     private int _localWidth = 1920;
@@ -231,6 +244,58 @@ public sealed partial class SettingsViewModel : ObservableObject
     /// <summary>DLNA profile encode bitrate (kbps).</summary>
     [ObservableProperty]
     private int _dlnaBitrate = 45000;
+
+    // --- Text bindings for resolution/FPS fields (free typing, commit on LostFocus) ---
+
+    [ObservableProperty]
+    private string _localWidthText = string.Empty;
+
+    [ObservableProperty]
+    private string _localHeightText = string.Empty;
+
+    [ObservableProperty]
+    private string _localFpsText = string.Empty;
+
+    [ObservableProperty]
+    private string _dlnaWidthText = string.Empty;
+
+    [ObservableProperty]
+    private string _dlnaHeightText = string.Empty;
+
+    [ObservableProperty]
+    private string _dlnaFpsText = string.Empty;
+
+    [ObservableProperty]
+    private string _localWidthError = string.Empty;
+
+    [ObservableProperty]
+    private string _localHeightError = string.Empty;
+
+    [ObservableProperty]
+    private string _localFpsError = string.Empty;
+
+    [ObservableProperty]
+    private string _dlnaWidthError = string.Empty;
+
+    [ObservableProperty]
+    private string _dlnaHeightError = string.Empty;
+
+    [ObservableProperty]
+    private string _dlnaFpsError = string.Empty;
+
+    /// <summary>First validation error for the Local profile (empty when all valid).</summary>
+    public string LocalValidationError =>
+        !string.IsNullOrEmpty(LocalWidthError) ? LocalWidthError :
+        !string.IsNullOrEmpty(LocalHeightError) ? LocalHeightError :
+        !string.IsNullOrEmpty(LocalFpsError) ? LocalFpsError :
+        string.Empty;
+
+    /// <summary>First validation error for the DLNA profile (empty when all valid).</summary>
+    public string DlnaValidationError =>
+        !string.IsNullOrEmpty(DlnaWidthError) ? DlnaWidthError :
+        !string.IsNullOrEmpty(DlnaHeightError) ? DlnaHeightError :
+        !string.IsNullOrEmpty(DlnaFpsError) ? DlnaFpsError :
+        string.Empty;
 
     /// <summary>
     /// Whether FSR 4 is available on this machine (headless default: true;
@@ -431,20 +496,30 @@ public sealed partial class SettingsViewModel : ObservableObject
         SaveStringIfNotLoading(AppSettingsModel.UpscaleMethodKey, value);
     }
 
+    partial void OnMaxParallelJobsChanged(int value)
+    {
+        // Clamp to valid range (1-8 parallel jobs)
+        if (value < 1) value = 1;
+        if (value > 8) value = 8;
+        if (value != MaxParallelJobs)
+        {
+            MaxParallelJobs = value;
+            return; // re-entrant call will handle save
+        }
+        SaveIntIfNotLoading(AppSettingsModel.MaxParallelJobsKey, value);
+    }
+
     partial void OnFsr4AvailableChanged(bool value)
         => RefreshUpscaleWarning();
 
     partial void OnLocalWidthChanged(int value)
-        => ClampAndSave(ref value, MinWidth, MaxWidth, v => LocalWidth = v,
-            AppSettingsModel.LocalTargetWidthKey);
+        => SaveIntIfNotLoading(AppSettingsModel.LocalTargetWidthKey, value);
 
     partial void OnLocalHeightChanged(int value)
-        => ClampAndSave(ref value, MinHeight, MaxHeight, v => LocalHeight = v,
-            AppSettingsModel.LocalTargetHeightKey);
+        => SaveIntIfNotLoading(AppSettingsModel.LocalTargetHeightKey, value);
 
     partial void OnLocalFpsChanged(int value)
-        => ClampAndSave(ref value, MinFps, MaxFps, v => LocalFps = v,
-            AppSettingsModel.LocalTargetFpsKey);
+        => SaveIntIfNotLoading(AppSettingsModel.LocalTargetFpsKey, value);
 
     partial void OnLocalBitrateChanged(int value)
     {
@@ -454,16 +529,13 @@ public sealed partial class SettingsViewModel : ObservableObject
     }
 
     partial void OnDlnaWidthChanged(int value)
-        => ClampAndSave(ref value, MinWidth, MaxWidth, v => DlnaWidth = v,
-            AppSettingsModel.DlnaTargetWidthKey);
+        => SaveIntIfNotLoading(AppSettingsModel.DlnaTargetWidthKey, value);
 
     partial void OnDlnaHeightChanged(int value)
-        => ClampAndSave(ref value, MinHeight, MaxHeight, v => DlnaHeight = v,
-            AppSettingsModel.DlnaTargetHeightKey);
+        => SaveIntIfNotLoading(AppSettingsModel.DlnaTargetHeightKey, value);
 
     partial void OnDlnaFpsChanged(int value)
-        => ClampAndSave(ref value, MinFps, MaxFps, v => DlnaFps = v,
-            AppSettingsModel.DlnaTargetFpsKey);
+        => SaveIntIfNotLoading(AppSettingsModel.DlnaTargetFpsKey, value);
 
     partial void OnDlnaBitrateChanged(int value)
     {
@@ -472,9 +544,125 @@ public sealed partial class SettingsViewModel : ObservableObject
             AppSettingsModel.DlnaEncodeBitrateKey);
     }
 
+    // --- Text-change handlers (validate on every keystroke, apply if valid) ---
+
+    partial void OnLocalWidthTextChanged(string value)
+        => ValidateAndApplyInt(value, MinWidth, MaxWidth, v => LocalWidth = v, e => LocalWidthError = e);
+
+    partial void OnLocalHeightTextChanged(string value)
+        => ValidateAndApplyInt(value, MinHeight, MaxHeight, v => LocalHeight = v, e => LocalHeightError = e);
+
+    partial void OnLocalFpsTextChanged(string value)
+        => ValidateAndApplyInt(value, MinFps, MaxFps, v => LocalFps = v, e => LocalFpsError = e);
+
+    partial void OnDlnaWidthTextChanged(string value)
+        => ValidateAndApplyInt(value, MinWidth, MaxWidth, v => DlnaWidth = v, e => DlnaWidthError = e);
+
+    partial void OnDlnaHeightTextChanged(string value)
+        => ValidateAndApplyInt(value, MinHeight, MaxHeight, v => DlnaHeight = v, e => DlnaHeightError = e);
+
+    partial void OnDlnaFpsTextChanged(string value)
+        => ValidateAndApplyInt(value, MinFps, MaxFps, v => DlnaFps = v, e => DlnaFpsError = e);
+
+    // --- Error-change handlers (refresh aggregated validation messages) ---
+
+    partial void OnLocalWidthErrorChanged(string value) => OnPropertyChanged(nameof(LocalValidationError));
+    partial void OnLocalHeightErrorChanged(string value) => OnPropertyChanged(nameof(LocalValidationError));
+    partial void OnLocalFpsErrorChanged(string value) => OnPropertyChanged(nameof(LocalValidationError));
+    partial void OnDlnaWidthErrorChanged(string value) => OnPropertyChanged(nameof(DlnaValidationError));
+    partial void OnDlnaHeightErrorChanged(string value) => OnPropertyChanged(nameof(DlnaValidationError));
+    partial void OnDlnaFpsErrorChanged(string value) => OnPropertyChanged(nameof(DlnaValidationError));
+
+    // --- Commit commands (LostFocus: clamp + restore text) ---
+
+    [RelayCommand]
+    public void CommitLocalWidth()
+        => CommitIntField(LocalWidthText, MinWidth, MaxWidth, LocalWidth,
+            v => LocalWidth = v, t => LocalWidthText = t, e => LocalWidthError = e);
+
+    [RelayCommand]
+    public void CommitLocalHeight()
+        => CommitIntField(LocalHeightText, MinHeight, MaxHeight, LocalHeight,
+            v => LocalHeight = v, t => LocalHeightText = t, e => LocalHeightError = e);
+
+    [RelayCommand]
+    public void CommitLocalFps()
+        => CommitIntField(LocalFpsText, MinFps, MaxFps, LocalFps,
+            v => LocalFps = v, t => LocalFpsText = t, e => LocalFpsError = e);
+
+    [RelayCommand]
+    public void CommitDlnaWidth()
+        => CommitIntField(DlnaWidthText, MinWidth, MaxWidth, DlnaWidth,
+            v => DlnaWidth = v, t => DlnaWidthText = t, e => DlnaWidthError = e);
+
+    [RelayCommand]
+    public void CommitDlnaHeight()
+        => CommitIntField(DlnaHeightText, MinHeight, MaxHeight, DlnaHeight,
+            v => DlnaHeight = v, t => DlnaHeightText = t, e => DlnaHeightError = e);
+
+    [RelayCommand]
+    public void CommitDlnaFps()
+        => CommitIntField(DlnaFpsText, MinFps, MaxFps, DlnaFps,
+            v => DlnaFps = v, t => DlnaFpsText = t, e => DlnaFpsError = e);
+
     // ---------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------
+
+    /// <summary>Persists an int setting immediately (no clamping).</summary>
+    private void SaveIntIfNotLoading(string key, int value)
+    {
+        if (!_loading)
+        {
+            _settings.Set(key, value.ToString(CultureInfo.InvariantCulture));
+        }
+    }
+
+    /// <summary>
+    /// Parses <paramref name="text"/> as an int. If valid and in [min, max],
+    /// clears the error and applies via <paramref name="setInt"/> (which
+    /// triggers persistence). Otherwise sets the error message.
+    /// </summary>
+    private void ValidateAndApplyInt(string? text, int min, int max,
+        Action<int> setInt, Action<string> setError)
+    {
+        if (_loading) return;
+
+        if (int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
+            && parsed >= min && parsed <= max)
+        {
+            setError(string.Empty);
+            setInt(parsed);
+        }
+        else
+        {
+            setError($"Entre {min} e {max}.");
+        }
+    }
+
+    /// <summary>
+    /// Called on LostFocus: if the text is unparseable, restores the last
+    /// committed int value; if out-of-range, clamps and persists the clamped
+    /// value. Always clears the error and syncs the text.
+    /// </summary>
+    private void CommitIntField(string? text, int min, int max, int currentValue,
+        Action<int> setInt, Action<string> setText, Action<string> setError)
+    {
+        if (!int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
+        {
+            setText(currentValue.ToString(CultureInfo.InvariantCulture));
+            setError(string.Empty);
+            return;
+        }
+
+        var clamped = Math.Clamp(parsed, min, max);
+        if (clamped != currentValue)
+        {
+            setInt(clamped);
+        }
+        setText(clamped.ToString(CultureInfo.InvariantCulture));
+        setError(string.Empty);
+    }
 
     /// <summary>
     /// Clamps <paramref name="value"/> into [min, max]. Out-of-range values are

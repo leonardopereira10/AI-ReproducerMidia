@@ -40,6 +40,19 @@
 // amfrt64.dll is loaded from the AMD driver at runtime). Without the headers
 // the encode entry points degrade gracefully to CATRA_ERR_NOT_IMPL.
 //
+// FG playback (SPRINT_04 subtask 04): the catra_fg_* entry points (declared
+// in catra_fg.h, included at the bottom of this header) run FSR 3 Frame
+// Generation on the PLAYBACK path through the FFX Frame Generation Swapchain
+// (DX12) created directly on the caller's HWND + an FG context with the
+// runtime's INTERNAL optical flow (no Prepare dispatch — video carries no
+// depth/motion vectors). Everything is RUNTIME-LOADED through ffx_runtime
+// (loader + 8 list-A1 DLLs + DX12 adapter; no FFX .lib is linked); frames
+// cross the ST-15 D3D11<->DX12 interop and are letterboxed into the FG
+// backbuffer. Unavailable runtime -> catra_is_fg_available()==0 and
+// catra_fg_create returns CATRA_ERR_NOT_IMPL (never a crash). catra_shutdown
+// destroys FG contexts together with the other registries, before
+// interop_shutdown.
+//
 // EXCEPTION SAFETY: every fallible entry point is guarded at the C ABI
 // boundary; no C++ exception escapes this DLL. Stray exceptions (e.g.
 // std::bad_alloc) surface as CATRA_ERR_UNKNOWN.
@@ -205,13 +218,18 @@ CATRA_API int  catra_upscale_create(int src_w, int src_h,
                                     int dst_w, int dst_h,
                                     int method, int* out_ctx);
 
-// Upscales one texture. `src_texture` is an ID3D11Texture2D* (src_w x src_h).
+// Upscales one texture (SYNCHRONOUS — kept for compatibility).
+// `src_texture` is an ID3D11Texture2D* (src_w x src_h).
 // On success writes the destination texture to *dst_texture and returns
 // CATRA_OK. For passthrough the destination is an ID3D11Texture2D*; for
 // FSR 1 / FSR 4 it is an ID3D12Resource* (shared back to D3D11 by the caller).
 // OWNERSHIP: the caller owns the returned texture and must release it with
 // catra_release_texture once done (the encoder reads it zero-copy and never
 // releases it). *dst_texture stays null on every failure path.
+//
+// NOTE: This function BLOCKS until the GPU completes the upscale. For
+// high-throughput pipelines, prefer catra_upscale_submit_async +
+// catra_upscale_poll_result to overlap GPU work across frames.
 CATRA_API int  catra_upscale_process(int ctx,
                                      void* src_texture,
                                      void** dst_texture);
@@ -229,6 +247,49 @@ CATRA_API int  catra_upscale_reset(int ctx);
 
 // Destroys an upscale job. No-op for an unknown handle.
 CATRA_API void catra_upscale_destroy(int ctx);
+
+// ===========================================================================
+// Async Upscale — high-throughput pipeline support
+// ===========================================================================
+//
+// The async upscale API allows the pipeline to submit multiple upscale
+// operations without blocking on each one. The GPU processes frames in
+// parallel while the CPU continues submitting work.
+//
+// FLOW:
+//   1. catra_upscale_submit_async(ctx, src) → returns a ticket ID
+//   2. (repeat for more frames — GPU works in parallel)
+//   3. catra_upscale_poll_result(ctx, ticket, &dst) → check if done
+//      Returns CATRA_OK if result is ready, CATRA_ERR_UNKNOWN if still pending
+//   4. When done, caller owns *dst_texture (release with catra_release_texture)
+//
+// The async path uses a ring buffer of pending operations. The maximum number
+// of in-flight operations is limited by the internal queue depth (typically
+// 64 frames). Submitting beyond capacity blocks until a slot is available.
+
+// Submits an upscale operation asynchronously. Returns a ticket ID (>0) on
+// success that can be used to poll for the result. The source texture is
+// consumed immediately (the caller must NOT release it until the result is
+// collected or the context is destroyed). Returns a negative CATRA_ERR_* on
+// failure (ticket is not issued).
+//
+// OWNERSHIP: the source texture ownership transfers to the async queue. The
+// caller must NOT release src_texture after a successful submit — it will be
+// released internally when the operation completes or the context is destroyed.
+CATRA_API int  catra_upscale_submit_async(int ctx, void* src_texture);
+
+// Polls for the result of an async upscale operation. Returns CATRA_OK if the
+// result is ready (writes destination texture to *dst_texture and ticket is
+// consumed). Returns CATRA_ERR_UNKNOWN if the operation is still in flight
+// (caller should retry later). Returns CATRA_ERR_CONTEXT for unknown ticket.
+//
+// OWNERSHIP: on success, the caller owns *dst_texture (release with
+// catra_release_texture). On any failure, *dst_texture is null.
+CATRA_API int  catra_upscale_poll_result(int ctx, int ticket, void** dst_texture);
+
+// Returns the number of async upscale operations currently in flight (pending
+// or being processed). Useful for monitoring pipeline depth.
+CATRA_API int  catra_upscale_pending_count(int ctx);
 
 // ===========================================================================
 // NV12 → BGRA GPU compute shader — ST-23
@@ -326,5 +387,10 @@ CATRA_API void catra_encode_destroy(int ctx);
 #ifdef __cplusplus
 } // extern "C"
 #endif
+
+// SPRINT_04 subtask 04: FSR 3 Frame Generation playback ABI (catra_fg_*) +
+// the internal catra::FgRenderer declaration. Included LAST so CATRA_API and
+// the CATRA_ERR_* codes above are already defined.
+#include "catra_fg.h"
 
 #endif // CATRA_GPU_H

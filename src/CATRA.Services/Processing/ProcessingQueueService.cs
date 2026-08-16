@@ -7,17 +7,23 @@ using CATRA.Core.Processing;
 namespace CATRA.Services.Processing;
 
 /// <summary>
-/// Default <see cref="IProcessingQueueService"/> (ST-18). A single dedicated worker
-/// task drains an unbounded <see cref="Channel{T}"/> of <see cref="ProcessJob"/>s and
-/// runs each through <see cref="IProcessingPipeline"/>, persisting the job lifecycle
+/// Default <see cref="IProcessingQueueService"/> (ST-18). Worker tasks drain a
+/// <see cref="Channel{T}"/> of <see cref="ProcessJob"/>s and run each through
+/// <see cref="IProcessingPipeline"/>, persisting the job lifecycle
 /// (queued → processing → completed/failed/cancelled) and saving the resulting
 /// <see cref="ProcessedFile"/> on success.
 /// </summary>
 /// <remarks>
 /// <para>
-/// All mutable state (queued list, current job, cancellation sources) is guarded by a
+/// Supports parallel processing of multiple videos via <c>MaxParallelJobs</c> setting.
+/// Each worker task processes one job at a time; with N workers, up to N videos can
+/// be processed simultaneously. This exploits GPU underutilization (observed 14% with
+/// single video) to improve overall throughput without increasing per-video time.
+/// </para>
+/// <para>
+/// All mutable state (queued list, current jobs, cancellation sources) is guarded by a
 /// single lock; channel writes happen under that lock so <see cref="ClearQueueAsync"/>
-/// can never race a partially-written enqueue. The worker re-reads each job from the
+/// can never race a partially-written enqueue. Workers re-read each job from the
 /// database just before processing so a job cancelled while queued is skipped.
 /// </para>
 /// <para>
@@ -43,15 +49,15 @@ public sealed class ProcessingQueueService : IProcessingQueueService, IDisposabl
     private readonly Func<string, bool> _fileExists;
 
     private readonly Channel<ProcessJob> _channel =
-        Channel.CreateUnbounded<ProcessJob>(new UnboundedChannelOptions { SingleReader = true });
+        Channel.CreateUnbounded<ProcessJob>(new UnboundedChannelOptions());
 
     private readonly object _gate = new();
     private readonly List<ProcessJob> _queuedJobs = new();
+    private readonly List<ProcessJob> _activeJobs = new();
+    private readonly Dictionary<int, CancellationTokenSource> _jobCtsMap = new();
 
     private CancellationTokenSource? _workerCts;
-    private CancellationTokenSource? _currentJobCts;
-    private Task? _workerTask;
-    private ProcessJob? _currentJob;
+    private List<Task>? _workerTasks;
     private bool _disposed;
 
     /// <summary>Creates the queue service over its dependencies.</summary>
@@ -90,7 +96,15 @@ public sealed class ProcessingQueueService : IProcessingQueueService, IDisposabl
     /// <inheritdoc />
     public ProcessJob? CurrentJob
     {
-        get { lock (_gate) { return _currentJob; } }
+        get { lock (_gate) { return _activeJobs.FirstOrDefault(); } }
+    }
+
+    /// <summary>
+    /// Gets all currently processing jobs (for parallel processing scenarios).
+    /// </summary>
+    public List<ProcessJob> ActiveJobs
+    {
+        get { lock (_gate) { return _activeJobs.ToList(); } }
     }
 
     /// <inheritdoc />
@@ -203,7 +217,11 @@ public sealed class ProcessingQueueService : IProcessingQueueService, IDisposabl
     {
         lock (_gate)
         {
-            _currentJobCts?.Cancel();
+            // Cancel all active jobs
+            foreach (var cts in _jobCtsMap.Values)
+            {
+                cts.Cancel();
+            }
         }
 
         return Task.CompletedTask;
@@ -242,7 +260,7 @@ public sealed class ProcessingQueueService : IProcessingQueueService, IDisposabl
     {
         lock (_gate)
         {
-            if (_workerTask is not null)
+            if (_workerTasks is not null)
             {
                 return Task.CompletedTask; // already running (idempotent)
             }
@@ -250,9 +268,18 @@ public sealed class ProcessingQueueService : IProcessingQueueService, IDisposabl
             RecoverCrashedJobs();
             RecoverOrphanedQueuedJobs();
 
+            // Read parallel job count from settings
+            int maxParallel = Math.Max(1, GetInt("max_parallel_jobs", 1));
+
             _workerCts = new CancellationTokenSource();
             CancellationToken token = _workerCts.Token;
-            _workerTask = Task.Run(() => LoopAsync(token));
+            
+            // Create multiple worker tasks for parallel processing
+            _workerTasks = new List<Task>(maxParallel);
+            for (int i = 0; i < maxParallel; i++)
+            {
+                _workerTasks.Add(Task.Run(() => LoopAsync(token)));
+            }
         }
 
         return Task.CompletedTask;
@@ -262,17 +289,22 @@ public sealed class ProcessingQueueService : IProcessingQueueService, IDisposabl
     public async Task StopAsync()
     {
         CancellationTokenSource? cts;
-        Task? task;
+        List<Task>? tasks;
         lock (_gate)
         {
             cts = _workerCts;
-            task = _workerTask;
+            tasks = _workerTasks;
             _workerCts = null;
-            _workerTask = null;
-            _currentJobCts?.Cancel();
+            _workerTasks = null;
+            
+            // Cancel all active jobs
+            foreach (var jobCts in _jobCtsMap.Values)
+            {
+                jobCts.Cancel();
+            }
         }
 
-        if (cts is null || task is null)
+        if (cts is null || tasks is null)
         {
             return;
         }
@@ -280,15 +312,15 @@ public sealed class ProcessingQueueService : IProcessingQueueService, IDisposabl
         await cts.CancelAsync().ConfigureAwait(false);
         try
         {
-            await task.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false);
         }
         catch (TimeoutException)
         {
-            // The worker did not exit in time; leave it — the process is going down.
+            // Workers did not exit in time; leave them — the process is going down.
         }
         catch (OperationCanceledException)
         {
-            // Expected: the loop observes cancellation.
+            // Expected: the loops observe cancellation.
         }
 
         cts.Dispose();
@@ -332,7 +364,7 @@ public sealed class ProcessingQueueService : IProcessingQueueService, IDisposabl
 
         foreach (ProcessJob job in orphaned)
         {
-            if (_queuedJobs.Any(j => j.Id == job.Id) || (_currentJob is not null && _currentJob.Id == job.Id))
+            if (_queuedJobs.Any(j => j.Id == job.Id) || _activeJobs.Any(j => j.Id == job.Id))
             {
                 continue; // already active in memory — never duplicate
             }
@@ -354,9 +386,14 @@ public sealed class ProcessingQueueService : IProcessingQueueService, IDisposabl
         lock (_gate)
         {
             _workerCts?.Cancel();
-            _currentJobCts?.Cancel();
-            _currentJobCts?.Dispose();
             _workerCts?.Dispose();
+            
+            foreach (var jobCts in _jobCtsMap.Values)
+            {
+                jobCts.Cancel();
+                jobCts.Dispose();
+            }
+            _jobCtsMap.Clear();
         }
     }
 
@@ -397,8 +434,8 @@ public sealed class ProcessingQueueService : IProcessingQueueService, IDisposabl
         CancellationTokenSource jobCts = new();
         lock (_gate)
         {
-            _currentJob = job;
-            _currentJobCts = jobCts;
+            _activeJobs.Add(job);
+            _jobCtsMap[job.Id] = jobCts;
         }
 
         try
@@ -470,18 +507,13 @@ public sealed class ProcessingQueueService : IProcessingQueueService, IDisposabl
         {
             lock (_gate)
             {
-                if (ReferenceEquals(_currentJob, job))
+                _activeJobs.Remove(job);
+                if (_jobCtsMap.TryGetValue(job.Id, out var cts))
                 {
-                    _currentJob = null;
-                }
-
-                if (ReferenceEquals(_currentJobCts, jobCts))
-                {
-                    _currentJobCts = null;
+                    _jobCtsMap.Remove(job.Id);
+                    cts.Dispose();
                 }
             }
-
-            jobCts.Dispose();
         }
     }
 

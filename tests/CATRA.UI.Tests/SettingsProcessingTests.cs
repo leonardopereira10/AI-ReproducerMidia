@@ -74,15 +74,23 @@ public sealed class SettingsProcessingTests
 
         vm.WindowSize.Should().Be(5);
         vm.InterpMethod.Should().Be("rife");
-        vm.UpscaleMethod.Should().Be("fsr4");
+        vm.UpscaleMethod.Should().Be("fsr1");
         vm.LocalWidth.Should().Be(1920);
         vm.LocalHeight.Should().Be(1080);
-        vm.LocalFps.Should().Be(135);
+        vm.LocalFps.Should().Be(60);
         vm.LocalBitrate.Should().Be(20000);
         vm.DlnaWidth.Should().Be(3840);
         vm.DlnaHeight.Should().Be(2160);
         vm.DlnaFps.Should().Be(55);
         vm.DlnaBitrate.Should().Be(45000);
+
+        // Text bindings are initialized from the int defaults
+        vm.LocalWidthText.Should().Be("1920");
+        vm.LocalHeightText.Should().Be("1080");
+        vm.LocalFpsText.Should().Be("60");
+        vm.DlnaWidthText.Should().Be("3840");
+        vm.DlnaHeightText.Should().Be("2160");
+        vm.DlnaFpsText.Should().Be("55");
     }
 
     [Fact]
@@ -115,10 +123,10 @@ public sealed class SettingsProcessingTests
     {
         var fixture = new Fixture();
         fixture.ViewModel.InterpMethod = "fsr3fg";
-        fixture.ViewModel.UpscaleMethod = "fsr1";
+        fixture.ViewModel.UpscaleMethod = "fsr4"; // default is fsr1, so fsr4 triggers change
 
         fixture.Settings.SetCalls.Should().Contain((AppSettingsModel.InterpMethodKey, "fsr3fg"));
-        fixture.Settings.SetCalls.Should().Contain((AppSettingsModel.UpscaleMethodKey, "fsr1"));
+        fixture.Settings.SetCalls.Should().Contain((AppSettingsModel.UpscaleMethodKey, "fsr4"));
     }
 
     [Fact]
@@ -127,12 +135,12 @@ public sealed class SettingsProcessingTests
         var fixture = new Fixture();
         fixture.ViewModel.LocalWidth = 2560;
         fixture.ViewModel.LocalHeight = 1440;
-        fixture.ViewModel.LocalFps = 60;
+        fixture.ViewModel.LocalFps = 120; // non-default value to trigger change
         fixture.ViewModel.LocalBitrate = 30000;
 
         fixture.Settings.SetCalls.Should().Contain((AppSettingsModel.LocalTargetWidthKey, "2560"));
         fixture.Settings.SetCalls.Should().Contain((AppSettingsModel.LocalTargetHeightKey, "1440"));
-        fixture.Settings.SetCalls.Should().Contain((AppSettingsModel.LocalTargetFpsKey, "60"));
+        fixture.Settings.SetCalls.Should().Contain((AppSettingsModel.LocalTargetFpsKey, "120"));
         fixture.Settings.SetCalls.Should().Contain((AppSettingsModel.LocalEncodeBitrateKey, "30000"));
     }
 
@@ -173,53 +181,57 @@ public sealed class SettingsProcessingTests
     [Theory]
     [InlineData(10, 24)]
     [InlineData(500, 240)]
-    public void Local_fps_is_clamped_and_persisted(int input, int expected)
+    public void Local_fps_is_clamped_on_commit(int input, int expected)
     {
         var fixture = new Fixture();
-        fixture.ViewModel.LocalFps = input;
+        fixture.ViewModel.LocalFpsText = input.ToString();
+        fixture.ViewModel.CommitLocalFps();
 
         fixture.ViewModel.LocalFps.Should().Be(expected);
-        fixture.Settings.SetCalls.Should().ContainSingle()
-            .Which.Should().Be((AppSettingsModel.LocalTargetFpsKey, expected.ToString()));
+        fixture.ViewModel.LocalFpsText.Should().Be(expected.ToString());
+        fixture.ViewModel.LocalFpsError.Should().BeEmpty();
     }
 
     [Theory]
     [InlineData(10, 24)]
     [InlineData(500, 240)]
-    public void Dlna_fps_is_clamped_and_persisted(int input, int expected)
+    public void Dlna_fps_is_clamped_on_commit(int input, int expected)
     {
         var fixture = new Fixture();
-        fixture.ViewModel.DlnaFps = input;
+        fixture.ViewModel.DlnaFpsText = input.ToString();
+        fixture.ViewModel.CommitDlnaFps();
 
         fixture.ViewModel.DlnaFps.Should().Be(expected);
-        fixture.Settings.SetCalls.Should().ContainSingle()
-            .Which.Should().Be((AppSettingsModel.DlnaTargetFpsKey, expected.ToString()));
+        fixture.ViewModel.DlnaFpsText.Should().Be(expected.ToString());
+        fixture.ViewModel.DlnaFpsError.Should().BeEmpty();
     }
 
     [Theory]
     [InlineData(100, 640)]
     [InlineData(9000, 7680)]
-    public void Width_is_clamped_and_persisted(int input, int expected)
+    public void Width_is_clamped_on_commit(int input, int expected)
     {
         var fixture = new Fixture();
-        fixture.ViewModel.LocalWidth = input;
+        fixture.ViewModel.LocalWidthText = input.ToString();
+        fixture.ViewModel.CommitLocalWidth();
 
         fixture.ViewModel.LocalWidth.Should().Be(expected);
-        fixture.Settings.SetCalls.Should().ContainSingle()
-            .Which.Should().Be((AppSettingsModel.LocalTargetWidthKey, expected.ToString()));
+        fixture.ViewModel.LocalWidthText.Should().Be(expected.ToString());
+        fixture.ViewModel.LocalWidthError.Should().BeEmpty();
     }
 
     [Theory]
     [InlineData(100, 360)]
     [InlineData(5000, 4320)]
-    public void Height_is_clamped_and_persisted(int input, int expected)
+    public void Height_is_clamped_on_commit(int input, int expected)
     {
         var fixture = new Fixture();
-        fixture.ViewModel.DlnaHeight = input;
+        fixture.ViewModel.DlnaHeightText = input.ToString();
+        fixture.ViewModel.CommitDlnaHeight();
 
         fixture.ViewModel.DlnaHeight.Should().Be(expected);
-        fixture.Settings.SetCalls.Should().ContainSingle()
-            .Which.Should().Be((AppSettingsModel.DlnaTargetHeightKey, expected.ToString()));
+        fixture.ViewModel.DlnaHeightText.Should().Be(expected.ToString());
+        fixture.ViewModel.DlnaHeightError.Should().BeEmpty();
     }
 
     [Theory]
@@ -239,9 +251,47 @@ public sealed class SettingsProcessingTests
     public void In_range_values_are_not_modified()
     {
         var fixture = new Fixture();
-        fixture.ViewModel.LocalFps = 120;
+        fixture.ViewModel.LocalFpsText = "120";
+        fixture.ViewModel.CommitLocalFps();
 
         fixture.ViewModel.LocalFps.Should().Be(120);
+        fixture.ViewModel.LocalFpsText.Should().Be("120");
+        fixture.ViewModel.LocalFpsError.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Invalid_text_shows_error_and_does_not_apply()
+    {
+        var fixture = new Fixture();
+        var originalWidth = fixture.ViewModel.LocalWidth;
+
+        fixture.ViewModel.LocalWidthText = "abc";
+
+        fixture.ViewModel.LocalWidthError.Should().NotBeEmpty();
+        fixture.ViewModel.LocalWidth.Should().Be(originalWidth); // unchanged
+    }
+
+    [Fact]
+    public void Commit_with_invalid_text_restores_previous_value()
+    {
+        var fixture = new Fixture();
+        var originalWidth = fixture.ViewModel.LocalWidth;
+
+        fixture.ViewModel.LocalWidthText = "not_a_number";
+        fixture.ViewModel.CommitLocalWidth();
+
+        fixture.ViewModel.LocalWidthText.Should().Be(originalWidth.ToString());
+        fixture.ViewModel.LocalWidthError.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Valid_text_applies_immediately_without_commit()
+    {
+        var fixture = new Fixture();
+        fixture.ViewModel.LocalWidthText = "2560";
+
+        fixture.ViewModel.LocalWidth.Should().Be(2560);
+        fixture.ViewModel.LocalWidthError.Should().BeEmpty();
     }
 
     // ------------------------------------------------------------------
@@ -284,18 +334,20 @@ public sealed class SettingsProcessingTests
     // ------------------------------------------------------------------
 
     [Fact]
-    public void No_warning_when_fsr4_available()
+    public void No_warning_when_fsr4_available_and_selected()
     {
-        var vm = new Fixture().ViewModel;
+        var fixture = new Fixture();
+        fixture.ViewModel.UpscaleMethod = "fsr4";
+        fixture.ViewModel.Fsr4Available = true;
 
-        vm.UpscaleMethod.Should().Be("fsr4");
-        vm.UpscaleWarning.Should().BeEmpty();
+        fixture.ViewModel.UpscaleWarning.Should().BeEmpty();
     }
 
     [Fact]
     public void Warning_shown_when_fsr4_selected_but_unavailable()
     {
         var fixture = new Fixture();
+        fixture.ViewModel.UpscaleMethod = "fsr4";
         fixture.ViewModel.Fsr4Available = false;
 
         fixture.ViewModel.UpscaleWarning.Should().Contain("FSR 4").And.Contain("FSR 1");
@@ -305,6 +357,7 @@ public sealed class SettingsProcessingTests
     public void Warning_clears_when_switching_to_fsr1()
     {
         var fixture = new Fixture();
+        fixture.ViewModel.UpscaleMethod = "fsr4";
         fixture.ViewModel.Fsr4Available = false;
         fixture.ViewModel.UpscaleWarning.Should().NotBeEmpty();
 

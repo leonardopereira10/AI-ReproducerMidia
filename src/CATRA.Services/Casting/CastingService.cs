@@ -24,6 +24,8 @@ public sealed class CastingService : ICastingService, IDisposable
 
     private DlnaDeviceInfo? _currentDevice;
     private string? _currentToken;
+    private TimeSpan _currentDuration;
+    private bool _mediaEndedFired;
     private CancellationTokenSource? _pollCts;
     private CastingState _state = CastingState.Idle;
     private bool _disposed;
@@ -63,10 +65,13 @@ public sealed class CastingService : ICastingService, IDisposable
     public event EventHandler<TimeSpan>? PositionChanged;
 
     /// <inheritdoc />
+    public event EventHandler? MediaEnded;
+
+    /// <inheritdoc />
     public Task<List<DlnaDeviceInfo>> DiscoverDevicesAsync() => _discovery.DiscoverDevicesAsync();
 
     /// <inheritdoc />
-    public async Task StartCastingAsync(DlnaDeviceInfo device, string filePath, string title)
+    public async Task StartCastingAsync(DlnaDeviceInfo device, string filePath, string title, TimeSpan duration = default)
     {
         ArgumentNullException.ThrowIfNull(device);
         ArgumentException.ThrowIfNullOrEmpty(filePath);
@@ -91,15 +96,28 @@ public sealed class CastingService : ICastingService, IDisposable
                     await _httpServer.StartAsync().ConfigureAwait(false);
                 }
 
-                token = _httpServer.RegisterFile(filePath, ResolveContentType(filePath));
-                var url = _httpServer.GetMediaUrl(token);
-                var metadata = AvTransportClient.BuildDidlLiteMetadata(title, url);
+                // 1. Extrai os metadados reais do arquivo de vídeo antes de registrar
+                var videoInfo = GetVideoMetadata(filePath);
 
-                await _avTransport.SetAvTransportUriAsync(device, url, metadata).ConfigureAwait(false);
+                videoInfo.Title = title;
+
+                // 2. Determina o MIME Type correto (ex: video/mp4 ou video/x-matroska) baseado no arquivo
+                string contentType = videoInfo.Extension == "mkv" ? "video/x-matroska" : $"video/{videoInfo.Extension}";
+
+                // 3. Registra o arquivo no servidor HTTP com o ContentType preciso
+                token = _httpServer.RegisterFile(filePath, contentType);
+                videoInfo.Url = _httpServer.GetMediaUrl(token);
+
+                // 4. Chama a nova versão do método passando o objeto completo de metadados
+                var metadata = AvTransportClient.BuildDidlLiteMetadata(videoInfo);
+
+                await _avTransport.SetAvTransportUriAsync(device, videoInfo.Url, metadata).ConfigureAwait(false);
                 await _avTransport.PlayAsync(device).ConfigureAwait(false);
 
                 _currentDevice = device;
                 _currentToken = token;
+                _currentDuration = duration > TimeSpan.Zero ? duration : videoInfo.Duration;
+                _mediaEndedFired = false;
                 ErrorMessage = null;
                 SetState(CastingState.Streaming);
                 StartPolling();
@@ -119,6 +137,39 @@ public sealed class CastingService : ICastingService, IDisposable
         finally
         {
             _gate.Release();
+        }
+    }
+
+    // Método para ler o arquivo fisicamente usando ffprobe
+    private VideoMetadata GetVideoMetadata(string filePath)
+    {
+        try
+        {
+            var ffProbe = new NReco.VideoInfo.FFProbe();
+            var info = ffProbe.GetMediaInfo(filePath);
+
+            return new VideoMetadata
+            {
+                Width = info.Streams[0].Width,
+                Fps = (int)Math.Round(info.Streams[0].FrameRate),
+                VideoCodec = info.Streams[0].CodecName, // Retorna strings como "hevc", "h264"
+                Extension = Path.GetExtension(filePath).Replace(".", "").ToLower(),
+                Duration = info.Duration,
+                Height = info.Streams[0].Height
+            };
+        }
+        catch
+        {
+            // Fallback caso o ffprobe falhe em ler o arquivo (Gera configuração padrão segura)
+            return new VideoMetadata
+            {
+                Width = 1920,
+                Height = 1080,
+                Fps = 30,
+                VideoCodec = "h264",
+                Extension = Path.GetExtension(filePath).Replace(".", "").ToLower(),
+                Duration = TimeSpan.Zero,
+            };
         }
     }
 
@@ -306,6 +357,17 @@ public sealed class CastingService : ICastingService, IDisposable
                 {
                     var info = await _avTransport.GetPositionInfoAsync(device, cancellationToken).ConfigureAwait(false);
                     PositionChanged?.Invoke(this, info.RelTime);
+
+                    // Detect end of episode: position >= duration - 2s threshold
+                    if (!_mediaEndedFired && _currentDuration > TimeSpan.Zero)
+                    {
+                        var threshold = TimeSpan.FromSeconds(2);
+                        if (info.RelTime >= _currentDuration - threshold)
+                        {
+                            _mediaEndedFired = true;
+                            MediaEnded?.Invoke(this, EventArgs.Empty);
+                        }
+                    }
                 }
                 catch (OperationCanceledException)
                 {

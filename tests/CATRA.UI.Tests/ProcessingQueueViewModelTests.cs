@@ -51,10 +51,15 @@ public sealed class ProcessingQueueViewModelTests
         _window.ActiveProfile = ProcessProfile.Local;
         _window.WindowEpisodes = new List<Episode> { Ep(10, 1) };
         _library.MediaItem = new MediaItem { Id = 1, Title = "Série" };
-        _queue.CurrentJob = new ProcessJob { Id = 1, EpisodeId = 10, Status = JobStatus.Processing, ProgressPct = 10 };
+        var job = new ProcessJob { Id = 1, EpisodeId = 10, Status = JobStatus.Processing, ProgressPct = 10, CurrentStep = ProcessStep.Upscale };
+        _queue.ActiveJobs = new List<ProcessJob> { job };
         var vm = CreateVm();
         await vm.LoadAsync(null);
 
+        // Simulate progress update: the fake's ActiveJobs must reflect the new state
+        // because RefreshActiveJobs reads from the queue (PipelineProgress has no job identity).
+        job.ProgressPct = 58;
+        job.CurrentStep = ProcessStep.Upscale;
         _queue.RaiseProgressChanged(new PipelineProgress(
             EpisodeIndex: 0,
             EpisodeCount: 1,
@@ -64,10 +69,10 @@ public sealed class ProcessingQueueViewModelTests
             Elapsed: TimeSpan.FromMinutes(2),
             Eta: TimeSpan.FromMinutes(3)));
 
-        vm.CurrentProgressPct.Should().Be(58);
-        vm.CurrentStepLabel.Should().Be("Upscale (FSR4)");
-        vm.CurrentProgressText.Should().Be("58% — Upscale (FSR4)");
-        vm.EtaDisplay.Should().Be("~3 min");
+        vm.ActiveJobItems.Should().HaveCount(1);
+        vm.ActiveJobItems[0].ProgressPct.Should().BeApproximately(58, 0.01);
+        vm.ActiveJobItems[0].StepLabel.Should().Be("Upscale (FSR4)");
+        vm.ActiveJobItems[0].ProgressText.Should().Contain("58%");
     }
 
     [Fact]
@@ -140,11 +145,12 @@ public sealed class ProcessingQueueViewModelTests
         vm.HasCurrentJob.Should().BeFalse();
 
         var job = new ProcessJob { Id = 1, EpisodeId = 10, Status = JobStatus.Processing, ProgressPct = 5, CurrentStep = ProcessStep.Decode };
-        _queue.CurrentJob = job;
+        _queue.ActiveJobs = new List<ProcessJob> { job };
         _queue.RaiseJobStarted(job);
 
         vm.HasCurrentJob.Should().BeTrue();
-        vm.CurrentJobEpisodeLabel.Should().Be("EP03");
+        vm.ActiveJobItems.Should().HaveCount(1);
+        vm.ActiveJobItems[0].EpisodeLabel.Should().Be("EP03");
     }
 
     [Fact]

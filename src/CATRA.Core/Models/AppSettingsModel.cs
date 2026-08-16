@@ -29,6 +29,7 @@ public sealed class AppSettingsModel
     public const string UpscaleMethodKey = "upscale_method";
     public const string DefaultSkipIntroSecKey = "default_skip_intro_sec";
     public const string ThemeOverrideKey = "theme_override";
+    public const string MaxParallelJobsKey = "max_parallel_jobs";
 
     // --- UI-only keys (not seeded; created on first change, read with defaults) ---
     public const string AutoScanKey = "auto_scan";
@@ -46,6 +47,14 @@ public sealed class AppSettingsModel
     // --- Player ---
     public int DefaultSkipIntroSec { get; set; } = 85;
     public AppTheme ThemeOverride { get; set; } = AppTheme.System;
+
+    // --- Processamento Paralelo ---
+    /// <summary>
+    /// Maximum number of videos to process simultaneously. Default is 1 (sequential).
+    /// With GPU underutilization (14% observed), values 2-4 can improve throughput
+    /// without increasing per-video processing time.
+    /// </summary>
+    public int MaxParallelJobs { get; set; } = 1;
 
     // --- DLNA ---
     public string DlnaHttpPort { get; set; } = "auto";
@@ -100,6 +109,7 @@ public string UpscaleMethod { get; set; } = "fsr1";
         model.InterpMethod = GetString(all, InterpMethodKey, model.InterpMethod);
         model.UpscaleMethod = GetString(all, UpscaleMethodKey, model.UpscaleMethod);
         model.ThemeOverride = ParseTheme(GetString(all, ThemeOverrideKey, "system"));
+        model.MaxParallelJobs = Math.Max(1, GetInt(all, MaxParallelJobsKey, model.MaxParallelJobs));
 
         return model;
     }

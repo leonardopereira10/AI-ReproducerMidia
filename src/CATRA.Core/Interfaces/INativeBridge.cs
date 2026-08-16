@@ -109,6 +109,39 @@ public interface INativeBridge : IDisposable
     /// <summary>Destroys an upscaler. No-op when unavailable.</summary>
     void DestroyUpscaler(IntPtr context);
 
+    // --- Async Upscale (high-throughput pipeline) --------------------------
+
+    /// <summary>
+    /// Submits an upscale operation asynchronously. Returns a ticket ID (>0) on
+    /// success that can be used to poll for the result. The source texture ownership
+    /// transfers to the async queue — the caller must NOT release it after a
+    /// successful submit.
+    /// </summary>
+    /// <remarks>
+    /// The async path uses a worker thread and a ring buffer of pending operations.
+    /// Submitting beyond capacity (64 frames) blocks until a slot is available.
+    /// Returns a negative value (CATRA_ERR_*) on failure — no ticket is issued.
+    /// </remarks>
+    int SubmitUpscaleAsync(IntPtr context, IntPtr srcTexture);
+
+    /// <summary>
+    /// Polls for the result of an async upscale operation. Returns the destination
+    /// texture when ready, or <see cref="IntPtr.Zero"/> if still in flight.
+    /// The caller owns the returned texture (release with <see cref="ReleaseTexture"/>).
+    /// </summary>
+    /// <remarks>
+    /// Returns <see cref="IntPtr.Zero"/> when the operation is still pending — the
+    /// caller should retry later. Throws a native-bridge exception for unknown ticket
+    /// or context.
+    /// </remarks>
+    IntPtr PollUpscaleResult(IntPtr context, int ticket);
+
+    /// <summary>
+    /// Returns the number of async upscale operations currently in flight (pending
+    /// or being processed). Useful for monitoring pipeline depth.
+    /// </summary>
+    int GetUpscalePendingCount(IntPtr context);
+
     // --- Encode (AMF H.265 / HEVC, ST-16) ----------------------------------
 
     /// <summary>Creates an H.265 (HEVC) encoder; returns an opaque context handle.</summary>

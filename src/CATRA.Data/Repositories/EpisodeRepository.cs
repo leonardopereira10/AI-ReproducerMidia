@@ -76,6 +76,62 @@ public sealed class EpisodeRepository : IEpisodeRepository
     }
 
     /// <inheritdoc />
+    public Episode? GetNextEpisode(int currentEpisodeId)
+    {
+        lock (_database.SyncRoot)
+        {
+            // 1. Busca o episódio atual para obter seu MediaItemId e EpisodeNumber
+            var current = _database.Connection.Find<EpisodeEntity>(currentEpisodeId);
+            if (current is null)
+            {
+                return null;
+            }
+
+            // 2. Busca o próximo episódio (EpisodeNumber > atual ou Id > atual se EpisodeNumber for nulo)
+            const string sql =
+                "SELECT * FROM Episode WHERE MediaItemId = ? AND (" +
+                "  (EpisodeNumber IS NOT NULL AND ? IS NOT NULL AND EpisodeNumber > ?) OR" +
+                "  (EpisodeNumber IS NULL AND ? IS NULL AND Id > ?)" +
+                ") ORDER BY CASE WHEN EpisodeNumber IS NULL THEN 1 ELSE 0 END, " +
+                "EpisodeNumber ASC, Id ASC LIMIT 1;";
+
+            var next = _database.Connection
+                .Query<EpisodeEntity>(sql, current.MediaItemId, current.EpisodeNumber, current.EpisodeNumber, current.EpisodeNumber, current.Id)
+                .FirstOrDefault();
+
+            return next is null ? null : ToModel(next);
+        }
+    }
+
+    /// <inheritdoc />
+    public Episode? GetPreviousEpisode(int currentEpisodeId)
+    {
+        lock (_database.SyncRoot)
+        {
+            // 1. Busca o episódio atual para obter seu MediaItemId e EpisodeNumber
+            var current = _database.Connection.Find<EpisodeEntity>(currentEpisodeId);
+            if (current is null)
+            {
+                return null;
+            }
+
+            // 2. Busca o episódio anterior (EpisodeNumber < atual ou Id < atual se EpisodeNumber for nulo)
+            const string sql =
+                "SELECT * FROM Episode WHERE MediaItemId = ? AND (" +
+                "  (EpisodeNumber IS NOT NULL AND ? IS NOT NULL AND EpisodeNumber < ?) OR" +
+                "  (EpisodeNumber IS NULL AND ? IS NULL AND Id < ?)" +
+                ") ORDER BY CASE WHEN EpisodeNumber IS NULL THEN 1 ELSE 0 END, " +
+                "EpisodeNumber DESC, Id DESC LIMIT 1;";
+
+            var prev = _database.Connection
+                .Query<EpisodeEntity>(sql, current.MediaItemId, current.EpisodeNumber, current.EpisodeNumber, current.EpisodeNumber, current.Id)
+                .FirstOrDefault();
+
+            return prev is null ? null : ToModel(prev);
+        }
+    }
+
+    /// <inheritdoc />
     public Episode Insert(Episode entity)
     {
         ArgumentNullException.ThrowIfNull(entity);

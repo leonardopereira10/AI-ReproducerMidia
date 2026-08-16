@@ -186,20 +186,38 @@
                     </DockPanel>
                     <TextBlock Style="{StaticResource ErrorLabel}" Text="{Binding UpscaleWarning}" />
 
+                    <DockPanel Style="{StaticResource Row}">
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="Vídeos simultâneos:" />
+                        <StackPanel Orientation="Horizontal">
+                            <TextBox Width="50" Padding="6,4"
+                                     Text="{Binding MaxParallelJobs, UpdateSourceTrigger=PropertyChanged}"
+                                     ToolTip="Número de vídeos processados em paralelo. Com GPU subutilizada, aumentar para 2-4 pode melhorar throughput." />
+                            <TextBlock Margin="8,0,0,0" VerticalAlignment="Center" Opacity="0.6"
+                                       Text="(1-4 recomendado)" />
+                        </StackPanel>
+                    </DockPanel>
+
                     <TextBlock Margin="0,8,0,4"
                                FontWeight="SemiBold"
                                Foreground="{DynamicResource SectionHeaderForegroundBrush}"
                                Text="Perfil Local" />
                     <DockPanel Style="{StaticResource Row}">
                         <TextBlock Style="{StaticResource FieldLabel}" Text="Resolução:" />
-                        <TextBox Width="70" Padding="6,4" Text="{Binding LocalWidth, UpdateSourceTrigger=PropertyChanged}" />
+                        <TextBox Name="LocalWidthBox" Width="70" Padding="6,4"
+                                 Text="{Binding LocalWidthText, UpdateSourceTrigger=PropertyChanged}"
+                                 LostFocus="OnResolutionFieldLostFocus" />
                         <TextBlock Margin="6,0" VerticalAlignment="Center" Text="x" />
-                        <TextBox Width="70" Padding="6,4" Text="{Binding LocalHeight, UpdateSourceTrigger=PropertyChanged}" />
+                        <TextBox Name="LocalHeightBox" Width="70" Padding="6,4"
+                                 Text="{Binding LocalHeightText, UpdateSourceTrigger=PropertyChanged}"
+                                 LostFocus="OnResolutionFieldLostFocus" />
                         <TextBlock Margin="12,0,0,0" Style="{StaticResource FieldLabel}" Text="Monitor Hz:" />
-                        <TextBox Width="70" Padding="6,4" Text="{Binding LocalFps, UpdateSourceTrigger=PropertyChanged}" />
+                        <TextBox Name="LocalFpsBox" Width="70" Padding="6,4"
+                                 Text="{Binding LocalFpsText, UpdateSourceTrigger=PropertyChanged}"
+                                 LostFocus="OnResolutionFieldLostFocus" />
                         <TextBlock Margin="12,0,0,0" Style="{StaticResource FieldLabel}" Text="Bitrate:" />
                         <TextBox Width="90" Padding="6,4" Text="{Binding LocalBitrate, UpdateSourceTrigger=PropertyChanged}" />
                     </DockPanel>
+                    <TextBlock Style="{StaticResource ErrorLabel}" Text="{Binding LocalValidationError}" />
                     <TextBlock Margin="120,2,0,0"
                                FontSize="11"
                                Foreground="{DynamicResource SectionHeaderForegroundBrush}"
@@ -211,14 +229,21 @@
                                Text="Perfil DLNA" />
                     <DockPanel Style="{StaticResource Row}">
                         <TextBlock Style="{StaticResource FieldLabel}" Text="Resolução:" />
-                        <TextBox Width="70" Padding="6,4" Text="{Binding DlnaWidth, UpdateSourceTrigger=PropertyChanged}" />
+                        <TextBox Name="DlnaWidthBox" Width="70" Padding="6,4"
+                                 Text="{Binding DlnaWidthText, UpdateSourceTrigger=PropertyChanged}"
+                                 LostFocus="OnResolutionFieldLostFocus" />
                         <TextBlock Margin="6,0" VerticalAlignment="Center" Text="x" />
-                        <TextBox Width="70" Padding="6,4" Text="{Binding DlnaHeight, UpdateSourceTrigger=PropertyChanged}" />
+                        <TextBox Name="DlnaHeightBox" Width="70" Padding="6,4"
+                                 Text="{Binding DlnaHeightText, UpdateSourceTrigger=PropertyChanged}"
+                                 LostFocus="OnResolutionFieldLostFocus" />
                         <TextBlock Margin="12,0,0,0" Style="{StaticResource FieldLabel}" Text="Monitor Hz:" />
-                        <TextBox Width="70" Padding="6,4" Text="{Binding DlnaFps, UpdateSourceTrigger=PropertyChanged}" />
+                        <TextBox Name="DlnaFpsBox" Width="70" Padding="6,4"
+                                 Text="{Binding DlnaFpsText, UpdateSourceTrigger=PropertyChanged}"
+                                 LostFocus="OnResolutionFieldLostFocus" />
                         <TextBlock Margin="12,0,0,0" Style="{StaticResource FieldLabel}" Text="Bitrate:" />
                         <TextBox Width="90" Padding="6,4" Text="{Binding DlnaBitrate, UpdateSourceTrigger=PropertyChanged}" />
                     </DockPanel>
+                    <TextBlock Style="{StaticResource ErrorLabel}" Text="{Binding DlnaValidationError}" />
                     <TextBlock Margin="120,2,0,0"
                                FontSize="11"
                                Foreground="{DynamicResource SectionHeaderForegroundBrush}"

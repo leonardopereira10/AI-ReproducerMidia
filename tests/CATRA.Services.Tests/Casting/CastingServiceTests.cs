@@ -332,6 +332,12 @@ public sealed class CastingServiceTests : IDisposable
 
         public Task<string> GetTransportStateAsync(DlnaDeviceInfo device, CancellationToken cancellationToken = default)
             => Task.FromResult("PLAYING");
+
+        public Task NextAsync(DlnaDeviceInfo device, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+
+        public Task PreviousAsync(DlnaDeviceInfo device, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
     }
 
     private sealed class FakeRenderingControl : IRenderingControlClient

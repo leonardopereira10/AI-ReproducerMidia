@@ -70,6 +70,8 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
     private bool _detached;
     private CancellationTokenSource? _progressSaverCts;
     private CancellationTokenSource? _discoveryRetryCts;
+    private int? _nextEpisodeId;
+    private int? _previousEpisodeId;
 
     /// <summary>Creates the view model and subscribes to the engine events.</summary>
     public PlayerViewModel(
@@ -102,6 +104,7 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
 
         _casting.StateChanged += OnCastingStateChanged;
         _casting.PositionChanged += OnCastingPositionChanged;
+        _casting.MediaEnded += OnCastingMediaEnded;
     }
 
     /// <summary>Current playback position.</summary>
@@ -215,6 +218,14 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
     /// <summary>ST-08: renderers found by the last discovery pass.</summary>
     public ObservableCollection<DlnaDeviceInfo> CastDevices { get; } = new();
 
+    /// <summary>Whether there is a next episode available.</summary>
+    [ObservableProperty]
+    private bool _hasNextEpisode;
+
+    /// <summary>Whether there is a previous episode available.</summary>
+    [ObservableProperty]
+    private bool _hasPreviousEpisode;
+
     /// <summary>The episode being played, once opened.</summary>
     public Episode? Episode => _episode;
 
@@ -302,6 +313,7 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
         }
 
         StartProgressSaver();
+        ResolveAdjacentEpisodes(episodeId);
         SkipIntroCommand.NotifyCanExecuteChanged();
         TransmitCommand.NotifyCanExecuteChanged();
     }
@@ -602,7 +614,7 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
 
         try
         {
-            await _casting.StartCastingAsync(device, resolved.FilePath, Title);
+            await _casting.StartCastingAsync(device, resolved.FilePath, Title, Duration);
             IsCastPaused = false;
         }
         catch (Exception ex)
@@ -639,6 +651,89 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
     {
         IsCastPaused = true;
         await _casting.PauseAsync();
+    }
+
+    /// <summary>Skips to the next episode in the series (if available).</summary>
+    [RelayCommand(CanExecute = nameof(CanGoNext))]
+    private async Task NextEpisodeAsync()
+    {
+        if (_nextEpisodeId is not int nextId)
+        {
+            return;
+        }
+
+        await NavigateToEpisodeAsync(nextId);
+    }
+
+    private bool CanGoNext() => _nextEpisodeId.HasValue;
+
+    /// <summary>Skips to the previous episode in the series (if available).</summary>
+    [RelayCommand(CanExecute = nameof(CanGoPrevious))]
+    private async Task PreviousEpisodeAsync()
+    {
+        if (_previousEpisodeId is not int prevId)
+        {
+            return;
+        }
+
+        await NavigateToEpisodeAsync(prevId);
+    }
+
+    private bool CanGoPrevious() => _previousEpisodeId.HasValue;
+
+    /// <summary>
+    /// Navigates to the given episode, stopping the current playback and casting session.
+    /// If a casting session was active, automatically resumes transmission to the same device.
+    /// </summary>
+    private async Task NavigateToEpisodeAsync(int episodeId)
+    {
+        // Capture the current casting device before stopping
+        var castDevice = _casting.CurrentDevice;
+        bool wasCasting = IsCasting;
+
+        // Stop current playback and casting before navigating
+        StopCastingFireAndForget();
+        SaveCurrentProgress();
+        _engine.Stop();
+
+        // Navigate to the new episode (reuses the same player page)
+        await OpenAsync(episodeId);
+
+        // Resume casting to the same device if it was active
+        if (wasCasting && castDevice is not null)
+        {
+            await ResumeCastingToDeviceAsync(castDevice);
+        }
+    }
+
+    /// <summary>
+    /// Resumes casting to the specified device after episode navigation.
+    /// Resolves the DLNA file and starts transmission without user interaction.
+    /// </summary>
+    private async Task ResumeCastingToDeviceAsync(DlnaDeviceInfo device)
+    {
+        if (_episode is null || _filePath is null)
+        {
+            return;
+        }
+
+        try
+        {
+            // Resolve the DLNA file for the new episode
+            var resolved = await _mediaFileResolver.ResolveAsync(_episode.Id, ProcessProfile.Dlna);
+            
+            // If processed file is not available, fall back to original without asking
+            // (user already confirmed fallback on the first cast, so we reuse that decision)
+            _castProfileLabel = resolved.DisplayLabel;
+            _engine.Pause(); // RF-06: local playback pauses, not stops.
+
+            await _casting.StartCastingAsync(device, resolved.FilePath, Title, Duration);
+            IsCastPaused = false;
+        }
+        catch (Exception ex)
+        {
+            SetError($"Falha ao retomar transmissão: {ex.Message}");
+        }
     }
 
     /// <summary>Stops playback and navigates back (idempotent).</summary>
@@ -692,6 +787,7 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
         _engine.Error -= OnEngineError;
         _casting.StateChanged -= OnCastingStateChanged;
         _casting.PositionChanged -= OnCastingPositionChanged;
+        _casting.MediaEnded -= OnCastingMediaEnded;
     }
 
     /// <summary>
@@ -861,7 +957,7 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
         => RunOnUi(() => State = e);
 
     private void OnEngineMediaEnded(object? sender, EventArgs e)
-        => RunOnUi(() =>
+        => RunOnUi(async () =>
         {
             State = PlaybackState.Stopped;
             if (Duration > TimeSpan.Zero)
@@ -872,6 +968,23 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
 
             StopProgressSaver();
             SaveCurrentProgress(); // natural end: position == duration -> marks watched (RN-02).
+
+            // Auto-play next episode immediately if available
+            if (_nextEpisodeId.HasValue)
+            {
+                await NavigateToEpisodeAsync(_nextEpisodeId.Value);
+            }
+        });
+
+    /// <summary>ST-08: raised when the DLNA renderer reaches the end of the current episode.</summary>
+    private void OnCastingMediaEnded(object? sender, EventArgs e)
+        => RunOnUi(async () =>
+        {
+            // Auto-play next episode immediately if available (casting mode)
+            if (_nextEpisodeId.HasValue)
+            {
+                await NavigateToEpisodeAsync(_nextEpisodeId.Value);
+            }
         });
 
     private void OnEngineError(object? sender, PlaybackErrorEventArgs e)
@@ -1016,5 +1129,23 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
                 $"original {expectedSec:F1}s vs opened {openedDuration.TotalSeconds:F1}s " +
                 $"(delta {delta:F1}s > {DurationMatchToleranceSec:F1}s); timestamp mapping may drift.");
         }
+    }
+
+    /// <summary>
+    /// Resolves the next and previous episode IDs for the current episode
+    /// and updates the HasNextEpisode/HasPreviousEpisode properties.
+    /// </summary>
+    private void ResolveAdjacentEpisodes(int episodeId)
+    {
+        var next = _episodes.GetNextEpisode(episodeId);
+        var prev = _episodes.GetPreviousEpisode(episodeId);
+
+        _nextEpisodeId = next?.Id;
+        _previousEpisodeId = prev?.Id;
+        HasNextEpisode = next is not null;
+        HasPreviousEpisode = prev is not null;
+
+        NextEpisodeCommand.NotifyCanExecuteChanged();
+        PreviousEpisodeCommand.NotifyCanExecuteChanged();
     }
 }

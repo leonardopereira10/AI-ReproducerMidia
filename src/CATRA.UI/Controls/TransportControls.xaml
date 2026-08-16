@@ -6,6 +6,7 @@
     <UserControl.Resources>
         <converters:TimeSpanToStringConverter x:Key="TimeConverter" />
         <converters:PlaybackStateToIconConverter x:Key="StateIconConverter" />
+        <converters:BoolToVisibilityConverter x:Key="BoolToVisibility" />
     </UserControl.Resources>
 
     <!-- DataContext: PlayerViewModel (inherited from the PlayerView) -->
@@ -55,6 +56,24 @@
                             FontSize="14"
                             Style="{StaticResource BaseButtonStyle}"
                             ToolTip="Parar" />
+
+                    <Button Width="40"
+                            Margin="8,0,0,0"
+                            Command="{Binding PreviousEpisodeCommand}"
+                            Content="⏮"
+                            FontSize="14"
+                            Style="{StaticResource BaseButtonStyle}"
+                            ToolTip="Epis\u00f3dio anterior"
+                            Visibility="{Binding HasPreviousEpisode, Converter={StaticResource BoolToVisibility}}" />
+
+                    <Button Width="40"
+                            Margin="8,0,0,0"
+                            Command="{Binding NextEpisodeCommand}"
+                            Content="⏭"
+                            FontSize="14"
+                            Style="{StaticResource BaseButtonStyle}"
+                            ToolTip="Pr\u00f3ximo epis\u00f3dio"
+                            Visibility="{Binding HasNextEpisode, Converter={StaticResource BoolToVisibility}}" />
 
                     <controls:VolumeControl Margin="16,0,0,0"
                                             IsMuted="{Binding IsMuted, Mode=TwoWay}"

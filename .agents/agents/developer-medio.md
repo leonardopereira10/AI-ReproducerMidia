@@ -1,7 +1,8 @@
 ---
 name: developer-medio
 description: Developer — complexidade média. Serviços genéricos, converters, validators, paginação.
-thinking: medium
+model: qwen-ai/qwen3.7-plus
+thinking: low
 tools: read, grep, find, ls, bash, edit, write
 systemPromptMode: replace
 inheritProjectContext: true

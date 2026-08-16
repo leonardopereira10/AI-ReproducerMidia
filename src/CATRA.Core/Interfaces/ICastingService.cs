@@ -25,6 +25,9 @@ public interface ICastingService
     /// <summary>Raised ~1s cadence with the renderer's reported playback position.</summary>
     event EventHandler<TimeSpan>? PositionChanged;
 
+    /// <summary>Raised when the renderer reaches the end of the current media (position >= duration - threshold).</summary>
+    event EventHandler? MediaEnded;
+
     /// <summary>Runs one SSDP discovery pass (AVTransport-capable renderers only).</summary>
     Task<List<DlnaDeviceInfo>> DiscoverDevicesAsync();
 
@@ -32,8 +35,10 @@ public interface ICastingService
     /// Registers <paramref name="filePath"/> on the HTTP server, sends
     /// SetAVTransportURI (DIDL-Lite metadata with <paramref name="title"/>) and
     /// Play. Transitions Idle → Connecting → Streaming (or Error).
+    /// When <paramref name="duration"/> is provided, the service detects end-of-episode
+    /// via position polling and raises <see cref="MediaEnded"/>.
     /// </summary>
-    Task StartCastingAsync(DlnaDeviceInfo device, string filePath, string title);
+    Task StartCastingAsync(DlnaDeviceInfo device, string filePath, string title, TimeSpan duration = default);
 
     /// <summary>Resumes playback on the renderer.</summary>
     Task PlayAsync();

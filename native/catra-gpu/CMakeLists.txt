@@ -276,6 +276,7 @@ endif()
 # --- Target -----------------------------------------------------------------
 add_library(catra-gpu SHARED
     catra_gpu.cpp
+    catra_fg.cpp
     d3d_interop.cpp
     encode_amf.cpp
     ffx_runtime.cpp
@@ -354,7 +355,8 @@ target_link_libraries(catra-gpu PRIVATE
     dxgi
     d3d11
     dxguid
-    d3dcompiler)
+    d3dcompiler
+    user32)
 
 # --- Diagnostic tool (NOT installed/shipped) -------------------------------
 # Standalone readback test: verifies the D3D11 -> D3D12 pooled share actually
@@ -431,6 +433,59 @@ else()
         "catra-ffx-load-test builds but cannot run (runtime DLLs missing).")
 endif()
 
+# --- FG playback smoke test (SPRINT_04 subtask 04, NOT installed/shipped) --
+# E2E native test of the catra_fg_* ABI: creates a real HWND + D3D11 device,
+# catra_init, catra_fg_create on the HWND, 90 presents at 30 fps with the
+# present observer counting rendered+generated frames (>= 1.5x), resize +
+# invalid-arg paths, 3x create/destroy churn with a stable GDI count. Compiles
+# the bridge sources into the exe (same pattern as catra-interop-test, keeps
+# the test independent of the DLL install order); the POST_BUILD copy
+# co-locates the 8 FFX runtime DLLs. Graceful SKIP (exit 0) when the runtime
+# / GPU is unavailable; --expect-unavailable asserts the clean-failure path.
+add_executable(catra-fg-smoke-test
+    tools/fg_smoke_test.cpp
+    catra_gpu.cpp
+    catra_fg.cpp
+    ffx_runtime.cpp
+    d3d_interop.cpp
+    encode_amf.cpp
+    interp_rife.cpp
+    nv12_to_bgra_shader.cpp
+    upscale_fsr1.cpp
+    upscale_fsr4.cpp)
+target_include_directories(catra-fg-smoke-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    "${CATRA_FFX_SDK_HEADERS}/api/include"
+    "${CATRA_FFX_SDK_HEADERS}/upscalers/include"
+    "${CATRA_FFX_SDK_HEADERS}/framegeneration/include")
+# CATRA_GPU_BUILDING keeps the CATRA_API symbols dllexport-consistent when the
+# bridge sources are compiled straight into the exe.
+target_compile_definitions(catra-fg-smoke-test PRIVATE CATRA_GPU_BUILDING=1)
+if(MSVC)
+    target_compile_options(catra-fg-smoke-test PRIVATE /W3 /utf-8 /EHsc)
+    target_compile_definitions(catra-fg-smoke-test PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+target_link_libraries(catra-fg-smoke-test PRIVATE
+    d3d12 dxgi d3d11 dxguid d3dcompiler user32 gdi32)
+if(TARGET Microsoft::DirectX-Headers)
+    target_link_libraries(catra-fg-smoke-test PRIVATE Microsoft::DirectX-Headers)
+endif()
+if(CATRA_ONNXRUNTIME_TARGET)
+    target_compile_definitions(catra-fg-smoke-test PRIVATE CATRA_HAS_ONNXRUNTIME=1)
+    target_link_libraries(catra-fg-smoke-test PRIVATE ${CATRA_ONNXRUNTIME_TARGET})
+endif()
+if(CATRA_HAS_DML)
+    target_compile_definitions(catra-fg-smoke-test PRIVATE USE_DML=1)
+endif()
+if(EXISTS "${CATRA_FFX_DLL_DIR}")
+    foreach(_dll IN LISTS CATRA_FFX_DLLS)
+        add_custom_command(TARGET catra-fg-smoke-test POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${CATRA_FFX_DLL_DIR}/${_dll}" "$<TARGET_FILE_DIR:catra-fg-smoke-test>/${_dll}"
+            COMMAND_EXPAND_LISTS)
+    endforeach()
+endif()
+
 # Optional vcpkg-provided packages (linked when the toolchain resolved them).
 if(TARGET Microsoft::DirectX-Headers)
     target_link_libraries(catra-gpu PRIVATE Microsoft::DirectX-Headers)
@@ -490,6 +545,9 @@ if(CATRA_WITH_AMF AND DEFINED CATRA_AMF_ROOT)
         # The diagnostic tool exercises the AMF encode path too.
         target_include_directories(catra-interop-test PRIVATE "${CATRA_AMF_ROOT}")
         target_compile_definitions(catra-interop-test PRIVATE CATRA_HAS_AMF=1)
+        # The FG smoke test compiles encode_amf.cpp as well.
+        target_include_directories(catra-fg-smoke-test PRIVATE "${CATRA_AMF_ROOT}")
+        target_compile_definitions(catra-fg-smoke-test PRIVATE CATRA_HAS_AMF=1)
         message(STATUS "catra-gpu: AMF SDK found at ${CATRA_AMF_ROOT} -> AMF H.265 encode enabled")
     else()
         message(WARNING

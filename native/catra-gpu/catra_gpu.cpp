@@ -17,17 +17,29 @@
 #include "catra_gpu.h"
 #include "d3d_interop.h"
 #include "encode_amf.h"
+#include "ffx_runtime.h"
 #include "interp_rife.h"
 #include "upscale_fsr1.h"
 #include "upscale_fsr4.h"
 #include "nv12_to_bgra_shader.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h> // IsWindow (catra_fg_create HWND validation)
 
 #include <d3d11.h>
 #include <d3d12.h>
@@ -163,6 +175,21 @@ namespace {
 // mutex-guarded map, heavy work outside the lock. A context owns exactly one
 // backend (passthrough needs none; FSR 1 / FSR 4 each own their pipeline).
 
+// Forward declarations
+struct UpscaleContext;
+int UpscalePassthrough(UpscaleContext* ctx, ID3D11Texture2D* src, ID3D11Texture2D** outDst);
+
+// Async upscale operation state.
+struct AsyncUpscaleOp
+{
+    int ticket = 0;
+    ID3D11Texture2D* srcTexture = nullptr; // caller-owned until processed
+    ID3D12Resource* dstTexture = nullptr;  // set when complete
+    bool completed = false;
+    bool failed = false;
+    int errorCode = CATRA_OK;
+};
+
 struct UpscaleContext
 {
     int method = CATRA_UPSCALE_OFF; // effective method after any FSR4->FSR1 downgrade
@@ -174,14 +201,112 @@ struct UpscaleContext
 
     ID3D11Device* device = nullptr;               // borrowed (bridge-owned)
     ID3D11DeviceContext* deviceContext = nullptr; // borrowed (passthrough copy)
+    ID3D12Device* device12 = nullptr;             // borrowed (bridge-owned, for async share)
 
     std::unique_ptr<catra::Fsr1Upscaler> fsr1;
     std::unique_ptr<catra::Fsr4Upscaler> fsr4;
+
+    // CRITICAL: Protects fsr1/fsr4 Process() calls — these backends are NOT thread-safe
+    // (they reuse command allocators / descriptor heaps internally).
+    std::mutex processMutex;
+
+    // Async upscale queue
+    std::mutex asyncMutex;
+    std::condition_variable asyncCv;
+    std::deque<AsyncUpscaleOp> asyncQueue;
+    std::deque<AsyncUpscaleOp> asyncResults;
+    int nextTicket = 1;
+    std::thread asyncWorker;
+    std::atomic<bool> shutdownRequested{false};
+    static constexpr int kMaxQueueDepth = 64;
 };
 
 std::mutex g_upscaleMutex;
 std::unordered_map<int, std::unique_ptr<UpscaleContext>> g_upscaleContexts;
 int g_nextUpscaleHandle = 0;
+
+// Async worker thread function for upscale context.
+// Processes queued upscale operations without blocking the caller.
+// OWNERSHIP: The worker owns the source texture after submit (no AddRef).
+// It releases the source after processing and stores the result.
+// The pipeline C# side must NOT release the source texture after poll.
+void AsyncUpscaleWorker(UpscaleContext* ctx)
+{
+    while (true)
+    {
+        AsyncUpscaleOp op;
+        {
+            std::unique_lock<std::mutex> lock(ctx->asyncMutex);
+            ctx->asyncCv.wait(lock, [ctx] {
+                return ctx->shutdownRequested.load() || !ctx->asyncQueue.empty();
+            });
+
+            if (ctx->shutdownRequested.load() && ctx->asyncQueue.empty())
+            {
+                return;
+            }
+
+            op = std::move(ctx->asyncQueue.front());
+            ctx->asyncQueue.pop_front();
+        }
+
+        // Process the upscale operation outside the lock
+        ID3D12Resource* dst12 = nullptr;
+        int rc = CATRA_OK;
+
+        if (ctx->method == CATRA_UPSCALE_OFF)
+        {
+            // Passthrough: need to convert D3D11 src to D3D12 via ShareTexture
+            ID3D11Texture2D* dst11 = nullptr;
+            rc = UpscalePassthrough(ctx, op.srcTexture, &dst11);
+            if (rc == CATRA_OK && dst11 != nullptr)
+            {
+                // Share to D3D12
+                HRESULT hr = catra::ShareTexture(ctx->device, ctx->device12, dst11, &dst12);
+                dst11->Release();
+                if (FAILED(hr))
+                {
+                    rc = CATRA_ERR_DEVICE;
+                }
+            }
+        }
+        else if (ctx->method == CATRA_UPSCALE_FSR4 && ctx->fsr4)
+        {
+            // CRITICAL: fsr4->Process() is NOT thread-safe — must hold processMutex
+            std::lock_guard<std::mutex> procLock(ctx->processMutex);
+            rc = ctx->fsr4->Process(op.srcTexture, &dst12);
+        }
+        else if (ctx->fsr1)
+        {
+            // CRITICAL: fsr1->Process() is NOT thread-safe — must hold processMutex
+            std::lock_guard<std::mutex> procLock(ctx->processMutex);
+            rc = ctx->fsr1->Process(op.srcTexture, &dst12);
+        }
+        else
+        {
+            rc = CATRA_ERR_NOT_IMPL;
+        }
+
+        // Release source texture (worker owns it after submit, no AddRef)
+        if (op.srcTexture != nullptr)
+        {
+            op.srcTexture->Release();
+            op.srcTexture = nullptr;
+        }
+
+        // Store result
+        op.dstTexture = dst12;
+        op.completed = true;
+        op.failed = (rc != CATRA_OK);
+        op.errorCode = rc;
+
+        {
+            std::lock_guard<std::mutex> lock(ctx->asyncMutex);
+            ctx->asyncResults.push_back(std::move(op));
+        }
+        ctx->asyncCv.notify_one();
+    }
+}
 
 int RegisterUpscale(std::unique_ptr<UpscaleContext> ctx)
 {
@@ -200,8 +325,44 @@ UpscaleContext* LookupUpscale(int handle)
 
 void DestroyUpscale(int handle)
 {
-    std::lock_guard<std::mutex> lock(g_upscaleMutex);
-    g_upscaleContexts.erase(handle); // unique_ptr frees the backend pipeline
+    std::unique_ptr<UpscaleContext> ctx;
+    {
+        std::lock_guard<std::mutex> lock(g_upscaleMutex);
+        auto it = g_upscaleContexts.find(handle);
+        if (it == g_upscaleContexts.end())
+        {
+            return;
+        }
+        ctx = std::move(it->second);
+        g_upscaleContexts.erase(it);
+    }
+
+    // Stop async worker if running
+    if (ctx->asyncWorker.joinable())
+    {
+        {
+            std::lock_guard<std::mutex> lock(ctx->asyncMutex);
+            ctx->shutdownRequested.store(true);
+        }
+        ctx->asyncCv.notify_all();
+        ctx->asyncWorker.join();
+    }
+
+    // Release any pending async operations
+    for (auto& op : ctx->asyncQueue)
+    {
+        if (op.srcTexture != nullptr)
+        {
+            op.srcTexture->Release();
+        }
+    }
+    for (auto& op : ctx->asyncResults)
+    {
+        if (op.dstTexture != nullptr)
+        {
+            op.dstTexture->Release();
+        }
+    }
 }
 
 // Called from catra_shutdown BEFORE the bridge releases its D3D11 device, which
@@ -309,7 +470,64 @@ void DestroyAllEncode()
     g_encodeContexts.clear();
 }
 
+// --- FG playback context registry (SPRINT_04 subtask 04) -------------------
+//
+// Mirrors the upscale/encode registries: dense non-negative int handles,
+// mutex-guarded map, heavy work outside the lock. A handle owns exactly one
+// catra::FgRenderer (FG swapchain context + FG context + letterbox pipeline).
+// Lookups hand out a raw pointer; heavy work (present/resize) runs OUTSIDE
+// the lock so the FFX callbacks (runtime threads) never contend with it.
+
+std::mutex g_fgMutex;
+std::unordered_map<int, std::unique_ptr<catra::FgRenderer>> g_fgContexts;
+int g_nextFgHandle = 0;
+
+int RegisterFg(std::unique_ptr<catra::FgRenderer> renderer)
+{
+    std::lock_guard<std::mutex> lock(g_fgMutex);
+    const int handle = g_nextFgHandle++;
+    g_fgContexts.emplace(handle, std::move(renderer));
+    return handle;
+}
+
+catra::FgRenderer* LookupFg(int handle)
+{
+    std::lock_guard<std::mutex> lock(g_fgMutex);
+    auto it = g_fgContexts.find(handle);
+    return it == g_fgContexts.end() ? nullptr : it->second.get();
+}
+
+void DestroyFg(int handle)
+{
+    std::lock_guard<std::mutex> lock(g_fgMutex);
+    g_fgContexts.erase(handle); // unique_ptr runs the full FFX teardown (RAII)
+}
+
+// Called from catra_shutdown BEFORE interop_shutdown / device release: the
+// renderers borrow the interop D3D12 device + DIRECT queue.
+void DestroyAllFg()
+{
+    std::lock_guard<std::mutex> lock(g_fgMutex);
+    g_fgContexts.clear();
+}
+
 } // namespace
+
+namespace catra {
+
+// Test hook used ONLY by tools/fg_smoke_test.cpp: installs the present
+// observer on a live FG context (counts rendered + generated presents).
+// No-op for an unknown handle. Not part of the C ABI, never exported.
+void FgSetPresentObserver(int ctx, FgPresentObserverFn cb, void* user)
+{
+    catra::FgRenderer* r = LookupFg(ctx);
+    if (r != nullptr)
+    {
+        r->SetPresentObserver(cb, user);
+    }
+}
+
+} // namespace catra
 
 // ===========================================================================
 // Lifecycle
@@ -376,6 +594,7 @@ void catra_shutdown(void)
         catra::InterpRifeDestroyAll();
         DestroyAllUpscale();
         DestroyAllEncode(); // ST-16: AMF contexts borrow the D3D12 device
+        DestroyAllFg(); // subtask 04: FG contexts borrow device12 + queue12
 
         // ST-23: release the cached NV12→BGRA compute shader + output texture.
         catra::nv12_bgra_shutdown();
@@ -567,6 +786,7 @@ int catra_upscale_create(int src_w, int src_h,
         ctx->quality = catra::SelectQualityMode(src_w, src_h, dst_w, dst_h);
         ctx->device = g_device.Get();
         ctx->deviceContext = g_deviceContext.Get();
+        ctx->device12 = g_d3d12Device.Get();
 
         int rc = CATRA_OK;
         if (effective == CATRA_UPSCALE_FSR1)
@@ -642,6 +862,8 @@ int catra_upscale_process(int ctx, void* src_texture, void** dst_texture)
         }
 
         ID3D12Resource* dst12 = nullptr;
+        // CRITICAL: fsr->Process() is NOT thread-safe — must hold processMutex
+        std::lock_guard<std::mutex> procLock(c->processMutex);
         int rc = (c->method == CATRA_UPSCALE_FSR4)
                      ? c->fsr4->Process(src, &dst12)
                      : c->fsr1->Process(src, &dst12);
@@ -684,6 +906,140 @@ void catra_upscale_destroy(int ctx)
 {
     GuardCabiVoid([&]() {
         DestroyUpscale(ctx); // no-op for an unknown handle
+    });
+}
+
+// ===========================================================================
+// Async Upscale API
+// ===========================================================================
+
+int catra_upscale_submit_async(int ctx_handle, void* src_texture)
+{
+    return GuardCabi([&]() -> int {
+        UpscaleContext* ctx = LookupUpscale(ctx_handle);
+        if (ctx == nullptr)
+        {
+            log_msg(CATRA_LOG_ERROR, "catra_upscale_submit_async: unknown context %d", ctx_handle);
+            return CATRA_ERR_CONTEXT;
+        }
+        if (src_texture == nullptr)
+        {
+            return CATRA_ERR_INVALID_ARG;
+        }
+
+        // Start worker thread on first use
+        {
+            std::lock_guard<std::mutex> lock(ctx->asyncMutex);
+            if (!ctx->asyncWorker.joinable())
+            {
+                ctx->shutdownRequested.store(false);
+                ctx->asyncWorker = std::thread(AsyncUpscaleWorker, ctx);
+            }
+        }
+
+        // NO AddRef - ownership transfers to the worker thread directly.
+        // The worker will Release() the texture after processing.
+        // The caller (pipeline C#) must NOT release the texture after submit.
+        ID3D11Texture2D* src = static_cast<ID3D11Texture2D*>(src_texture);
+
+        int ticket;
+        {
+            std::unique_lock<std::mutex> lock(ctx->asyncMutex);
+
+            // Wait if queue is full (backpressure)
+            ctx->asyncCv.wait(lock, [ctx] {
+                return static_cast<int>(ctx->asyncQueue.size()) < UpscaleContext::kMaxQueueDepth;
+            });
+
+            ticket = ctx->nextTicket++;
+            AsyncUpscaleOp op;
+            op.ticket = ticket;
+            op.srcTexture = src;
+            op.dstTexture = nullptr;
+            op.completed = false;
+            op.failed = false;
+            op.errorCode = CATRA_OK;
+            ctx->asyncQueue.push_back(std::move(op));
+        }
+        ctx->asyncCv.notify_one();
+
+        return ticket;
+    });
+}
+
+int catra_upscale_poll_result(int ctx_handle, int ticket, void** dst_texture)
+{
+    return GuardCabi([&]() -> int {
+        if (dst_texture != nullptr)
+        {
+            *dst_texture = nullptr;
+        }
+
+        UpscaleContext* ctx = LookupUpscale(ctx_handle);
+        if (ctx == nullptr)
+        {
+            // Context destroyed - treat as "not found" rather than error
+            // The pipeline may still be polling for tickets that were in flight
+            return CATRA_ERR_UNKNOWN;
+        }
+        if (dst_texture == nullptr)
+        {
+            return CATRA_ERR_INVALID_ARG;
+        }
+
+        std::lock_guard<std::mutex> lock(ctx->asyncMutex);
+
+        // Find the result
+        for (auto it = ctx->asyncResults.begin(); it != ctx->asyncResults.end(); ++it)
+        {
+            if (it->ticket == ticket)
+            {
+                if (!it->completed)
+                {
+                    return CATRA_ERR_UNKNOWN; // Still in flight
+                }
+
+                if (it->failed)
+                {
+                    int errCode = it->errorCode;
+                    ctx->asyncResults.erase(it);
+                    return errCode;
+                }
+
+                *dst_texture = it->dstTexture; // Transfer ownership
+                ctx->asyncResults.erase(it);
+                ctx->asyncCv.notify_one(); // Wake up submitter if queue was full
+                return CATRA_OK;
+            }
+        }
+
+        // Ticket not found in results - check if still in queue
+        for (const auto& op : ctx->asyncQueue)
+        {
+            if (op.ticket == ticket)
+            {
+                return CATRA_ERR_UNKNOWN; // Still in queue, not processed yet
+            }
+        }
+
+        // Ticket not found anywhere - treat as "not found" (context may have been
+        // destroyed, or ticket was already collected). Return CATRA_ERR_UNKNOWN
+        // so the pipeline can handle it gracefully.
+        return CATRA_ERR_UNKNOWN;
+    });
+}
+
+int catra_upscale_pending_count(int ctx_handle)
+{
+    return GuardCabi([&]() -> int {
+        UpscaleContext* ctx = LookupUpscale(ctx_handle);
+        if (ctx == nullptr)
+        {
+            return 0;
+        }
+
+        std::lock_guard<std::mutex> lock(ctx->asyncMutex);
+        return static_cast<int>(ctx->asyncQueue.size() + ctx->asyncResults.size());
     });
 }
 
@@ -1046,4 +1402,109 @@ void catra_encode_destroy(int ctx)
         fprintf(stderr, "catra_encode_destroy: DestroyEncode returned\n");
     });
     fprintf(stderr, "catra_encode_destroy: EXIT\n");
+}
+
+// ===========================================================================
+// FG playback — FSR 3 Frame Generation via FFX FG swapchain (SPRINT_04
+// subtask 04)
+// ===========================================================================
+//
+// The internal renderer (catra_fg.cpp) owns the FFX FG swapchain + FG context
+// and the letterbox D3D12 pipeline; it borrows the bridge's interop D3D12
+// device + DIRECT queue (g_d3d12Device / g_d3d12Queue). Availability is
+// runtime-loaded (ffx_runtime): loader + 8 list-A1 DLLs + a DX12 adapter.
+
+int catra_is_fg_available(void)
+{
+    return GuardCabi([&]() -> int {
+        // Needs a live bridge (device/queue come from catra_init's interop).
+        if (!g_initialized.load())
+        {
+            return 0;
+        }
+        if (g_d3d12Device == nullptr || g_d3d12Queue == nullptr)
+        {
+            return 0; // interop soft-failed at init
+        }
+        return catra::ffx::FfxRuntime::IsAvailable() ? 1 : 0;
+    });
+}
+
+int catra_fg_create(void* hwnd, int w, int h, double video_fps, int* out_ctx)
+{
+    return GuardCabi([&]() -> int {
+        if (out_ctx != nullptr)
+        {
+            *out_ctx = -1;
+        }
+        if (!g_initialized.load())
+        {
+            log_msg(CATRA_LOG_ERROR, "catra_fg_create: bridge not initialized");
+            return CATRA_ERR_INIT;
+        }
+        // HWND validation happens here (needs IsWindow) and again defensively
+        // in FgRenderer::Create; w/h/fps validated in both places.
+        if (hwnd == nullptr || !IsWindow(static_cast<HWND>(hwnd)) ||
+            w <= 0 || h <= 0 || video_fps <= 0.0 || out_ctx == nullptr)
+        {
+            log_msg(CATRA_LOG_ERROR,
+                    "catra_fg_create: invalid args (hwnd=%p %dx%d fps=%.3f)",
+                    hwnd, w, h, video_fps);
+            return CATRA_ERR_INVALID_ARG;
+        }
+        if (g_d3d12Device == nullptr || g_d3d12Queue == nullptr)
+        {
+            log_msg(CATRA_LOG_ERROR,
+                    "catra_fg_create: no interop D3D12 device/queue");
+            return CATRA_ERR_DEVICE;
+        }
+
+        catra::FgRenderer* renderer = nullptr;
+        const int rc = catra::FgRenderer::Create(
+            g_d3d12Device.Get(), g_d3d12Queue.Get(), hwnd, w, h, video_fps,
+            &renderer);
+        if (rc != CATRA_OK || renderer == nullptr)
+        {
+            log_msg(CATRA_LOG_ERROR,
+                    "catra_fg_create: FgRenderer::Create failed rc=%d", rc);
+            return rc != CATRA_OK ? rc : CATRA_ERR_DEVICE;
+        }
+
+        const int handle = RegisterFg(std::unique_ptr<catra::FgRenderer>(renderer));
+        *out_ctx = handle;
+        return CATRA_OK;
+    });
+}
+
+int catra_fg_present(int ctx, void* frame_texture, int frame_w, int frame_h)
+{
+    return GuardCabi([&]() -> int {
+        catra::FgRenderer* r = LookupFg(ctx);
+        if (r == nullptr)
+        {
+            log_msg(CATRA_LOG_ERROR, "catra_fg_present: unknown context %d", ctx);
+            return CATRA_ERR_CONTEXT;
+        }
+        return r->Present(frame_texture, frame_w, frame_h);
+    });
+}
+
+int catra_fg_resize(int ctx, int w, int h)
+{
+    return GuardCabi([&]() -> int {
+        catra::FgRenderer* r = LookupFg(ctx);
+        if (r == nullptr)
+        {
+            log_msg(CATRA_LOG_ERROR, "catra_fg_resize: unknown context %d", ctx);
+            return CATRA_ERR_CONTEXT;
+        }
+        return r->Resize(w, h);
+    });
+}
+
+void catra_fg_destroy(int ctx)
+{
+    GuardCabiVoid([&]() {
+        DestroyFg(ctx); // no-op for an unknown handle
+    });
 }

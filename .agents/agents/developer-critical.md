@@ -1,7 +1,8 @@
 ---
 name: developer-critical
 description: Developer — complexidade crítica. Zero-defect, OWASP, security, race conditions.
-thinking: max
+model: qwen-ai/qwen3.8-max
+thinking: medium
 tools: read, grep, find, ls, bash, edit, write
 systemPromptMode: replace
 inheritProjectContext: true

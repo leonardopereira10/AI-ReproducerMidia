@@ -63,10 +63,22 @@
                     </StackPanel>
                 </Border>
 
-                <!-- Processing now -->
+                <!-- Processing now (supports parallel jobs) -->
                 <StackPanel Margin="0,12,0,0">
-                    <TextBlock Style="{StaticResource SectionHeaderStyle}" Text="Processando agora" />
-                    <controls:ProcessJobCardControl Margin="0,6,0,0" />
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource SectionHeaderStyle}" Text="Processando agora" />
+                        <TextBlock HorizontalAlignment="Right"
+                                   DockPanel.Dock="Right"
+                                   Foreground="{DynamicResource SectionHeaderForegroundBrush}"
+                                   Text="{Binding ActiveJobCountLabel, Mode=OneWay}" />
+                    </DockPanel>
+                    <ItemsControl Margin="0,6,0,0" ItemsSource="{Binding ActiveJobItems}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <controls:ProcessJobCardControl />
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
                     <TextBlock Margin="0,6,0,0"
                                Foreground="{DynamicResource SectionHeaderForegroundBrush}"
                                Text="Nenhum job em execução.">

@@ -166,6 +166,34 @@ internal sealed class FakeNativeLibrary : INativeLibrary
         LastUpscaleDestroyContext = context;
     }
 
+    // Async upscale stubs
+    public int UpscaleSubmitAsyncResult { get; set; } = 1;
+    public int UpscaleSubmitAsyncCallCount { get; private set; }
+    public int UpscalePollResultResult { get; set; } = -6; // CATRA_ERR_UNKNOWN = still in flight
+    public IntPtr UpscalePollResultDst { get; set; }
+    public int UpscalePollResultCallCount { get; private set; }
+    public int UpscalePendingCountResult { get; set; } = 0;
+    public int UpscalePendingCountCallCount { get; private set; }
+
+    public int UpscaleSubmitAsync(int context, IntPtr srcTexture)
+    {
+        UpscaleSubmitAsyncCallCount++;
+        return UpscaleSubmitAsyncResult;
+    }
+
+    public int UpscalePollResult(int context, int ticket, out IntPtr dstTexture)
+    {
+        UpscalePollResultCallCount++;
+        dstTexture = UpscalePollResultDst;
+        return UpscalePollResultResult;
+    }
+
+    public int UpscalePendingCount(int context)
+    {
+        UpscalePendingCountCallCount++;
+        return UpscalePendingCountResult;
+    }
+
     public int EncodeCreate(int width, int height, int bitrateKbps, double fps, out int context)
     {
         EncodeCreateCallCount++;
@@ -1289,7 +1317,7 @@ public class NativeBridgePInvokeSignatureTests
             .Where(m => m.GetCustomAttribute<DllImportAttribute>() is not null)
             .ToList();
 
-        imports.Should().HaveCount(22, "the full catra_gpu.h C ABI must be declared");
+        imports.Should().HaveCount(25, "the full catra_gpu.h C ABI must be declared");
         imports.Should().OnlyContain(m => m.IsPrivate);
     }
 

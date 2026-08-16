@@ -192,13 +192,15 @@ internal sealed class FakeCastingService : ICastingService
 
     public event EventHandler<TimeSpan>? PositionChanged;
 
+    public event EventHandler? MediaEnded;
+
     public Task<List<DlnaDeviceInfo>> DiscoverDevicesAsync()
     {
         DiscoverCount++;
         return Task.FromResult(DevicesToReturn.ToList());
     }
 
-    public Task StartCastingAsync(DlnaDeviceInfo device, string filePath, string title)
+    public Task StartCastingAsync(DlnaDeviceInfo device, string filePath, string title, TimeSpan duration = default)
     {
         StartCalls.Add((device, filePath, title));
         CurrentDevice = device;
@@ -248,6 +250,9 @@ internal sealed class FakeCastingService : ICastingService
 
     public void RaisePositionChanged(TimeSpan position)
         => PositionChanged?.Invoke(this, position);
+
+    public void RaiseMediaEnded()
+        => MediaEnded?.Invoke(this, EventArgs.Empty);
 }
 
 /// <summary>Recording <see cref="IAppNavigator"/> fake.</summary>
@@ -304,6 +309,30 @@ internal sealed class FakeEpisodeRepository : IEpisodeRepository
 
     public IReadOnlyList<Episode> GetUnwatchedByMediaItem(int mediaItemId)
         => GetByMediaItem(mediaItemId);
+
+    public Episode? GetNextEpisode(int currentEpisodeId)
+    {
+        if (!_byId.TryGetValue(currentEpisodeId, out var current))
+            return null;
+
+        return _byId.Values
+            .Where(e => e.MediaItemId == current.MediaItemId)
+            .OrderBy(e => e.EpisodeNumber)
+            .ThenBy(e => e.Id)
+            .FirstOrDefault(e => e.EpisodeNumber > current.EpisodeNumber || (e.EpisodeNumber == current.EpisodeNumber && e.Id > current.Id));
+    }
+
+    public Episode? GetPreviousEpisode(int currentEpisodeId)
+    {
+        if (!_byId.TryGetValue(currentEpisodeId, out var current))
+            return null;
+
+        return _byId.Values
+            .Where(e => e.MediaItemId == current.MediaItemId)
+            .OrderByDescending(e => e.EpisodeNumber)
+            .ThenByDescending(e => e.Id)
+            .FirstOrDefault(e => e.EpisodeNumber < current.EpisodeNumber || (e.EpisodeNumber == current.EpisodeNumber && e.Id < current.Id));
+    }
 }
 
 /// <summary>In-memory <see cref="IMediaItemRepository"/>.</summary>
@@ -554,6 +583,8 @@ internal sealed class FakeProcessingQueueService : IProcessingQueueService
     public int StopCount { get; private set; }
 
     public ProcessJob? CurrentJob { get; set; }
+
+    public List<ProcessJob> ActiveJobs { get; set; } = new();
 
     public List<ProcessJob> QueuedJobs { get; set; } = new();
 

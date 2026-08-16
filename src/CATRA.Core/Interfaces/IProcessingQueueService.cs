@@ -75,6 +75,12 @@ public interface IProcessingQueueService
     /// <summary>The job currently being processed, or <c>null</c> when idle.</summary>
     ProcessJob? CurrentJob { get; }
 
+    /// <summary>
+    /// Snapshot of all jobs currently being processed (parallel processing).
+    /// Empty when idle. With <c>MaxParallelJobs</c> = 1 this has at most one entry.
+    /// </summary>
+    List<ProcessJob> ActiveJobs { get; }
+
     /// <summary>Snapshot of the jobs waiting in the queue (not yet started).</summary>
     List<ProcessJob> QueuedJobs { get; }
 

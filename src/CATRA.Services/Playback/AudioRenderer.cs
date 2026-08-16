@@ -52,10 +52,8 @@ public sealed class AudioRenderer : IAudioRenderer
             lock (_gate)
             {
                 _volume = ClampVolume(value);
-                if (_output is not null)
-                {
-                    _output.Volume = _volume;
-                }
+                // Volume is applied by multiplying samples in Write(), not via WasapiOut.Volume
+                // which would alter the system volume.
             }
         }
     }
@@ -131,7 +129,8 @@ public sealed class AudioRenderer : IAudioRenderer
 
         _output = new WasapiOut(AudioClientShareMode.Shared, WasapiLatencyMs);
         _output.Init(_buffer);
-        _output.Volume = _volume;
+        // Do NOT set _output.Volume here - it alters the system volume.
+        // Volume is applied by multiplying samples in Write().
     }
 
     /// <inheritdoc />
@@ -152,8 +151,19 @@ public sealed class AudioRenderer : IAudioRenderer
                 return;
             }
 
+            // Apply volume by multiplying samples (does not affect system volume)
+            float[] adjustedSamples = samples;
+            if (_volume != 1.0f)
+            {
+                adjustedSamples = new float[count];
+                for (int i = 0; i < count; i++)
+                {
+                    adjustedSamples[i] = samples[i] * _volume;
+                }
+            }
+
             byte[] bytes = new byte[count * BytesPerFloatSample];
-            Buffer.BlockCopy(samples, 0, bytes, 0, bytes.Length);
+            Buffer.BlockCopy(adjustedSamples, 0, bytes, 0, bytes.Length);
             _buffer!.AddSamples(bytes, 0, bytes.Length);
             _bytesWritten += bytes.Length;
         }
