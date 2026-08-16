@@ -536,8 +536,7 @@ public sealed class ProcessingPipeline : IProcessingPipeline
         // ASYNC UPSCALE: Uses the native async worker (catra_upscale_submit_async +
         // catra_upscale_poll_result) to simulate real-time ingame processing. The GPU
         // processes frames on a dedicated worker thread while the CPU continues
-        // submitting. A 1ms Sleep in the native worker prevents frame overlap,
-        // mimicking the vsync-gated frame delivery of a game engine.
+        // submitting.
         var upscalerTask = Task.Run(async () =>
         {
             var frameTimer = new Stopwatch();
@@ -559,6 +558,13 @@ public sealed class ProcessingPipeline : IProcessingPipeline
                         // it Release()s the source after processing (no AddRef).
                         int ticket = bridge.SubmitUpscaleAsync(upscaleContext, frame.Texture);
 
+                        // Mark the frame as transferred so the decoder does NOT try
+                        // to release it during cleanup (prevents double-release / AV).
+                        if (frame.IsDecoderOwned)
+                        {
+                            decoder.TransferOwnership(frame.Texture);
+                        }
+
                         // Poll until the native worker delivers the result.
                         IntPtr result = IntPtr.Zero;
                         while (result == IntPtr.Zero)
@@ -567,7 +573,7 @@ public sealed class ProcessingPipeline : IProcessingPipeline
                             result = bridge.PollUpscaleResult(upscaleContext, ticket);
                             if (result == IntPtr.Zero)
                             {
-                                await Task.Delay(1, linkedToken).ConfigureAwait(false);
+                                BusyWaitMs(0.1);
                             }
                         }
 
@@ -576,14 +582,15 @@ public sealed class ProcessingPipeline : IProcessingPipeline
                         // NOTE: source texture ownership transferred to native worker
                         // on submit — it released the source internally. Do NOT release here.
 
-                        // 1ms busy-wait between submissions to simulate real-time ingame
-                        // cadence. In a game engine frames arrive vsync-gated; this
-                        // spacing ensures the GPU processes frames in submission order
-                        // without overlap. Uses a tight Stopwatch loop instead of
-                        // Task.Delay/Thread.Sleep because those can deprioritize the
-                        // thread and actually stall for ~15ms. CPU is not a concern
-                        // here — the GPU is the bottleneck.
-                        BusyWait1Ms();
+                        // Conditional busy-wait between submissions to prevent frame
+                        // overlap when GPU queue is backed up. Uses 0.1ms (100μs) to
+                        // minimize CPU competition with decoder. Tight Stopwatch loop
+                        // instead of Task.Delay (which can stall ~15ms).
+                        int pending = bridge.GetUpscalePendingCount(upscaleContext);
+                        if (pending > 1)
+                        {
+                            BusyWaitMs(0.1);
+                        }
                         linkedToken.ThrowIfCancellationRequested();
                     }
                     else
@@ -1012,14 +1019,15 @@ public sealed class ProcessingPipeline : IProcessingPipeline
     }
 
     /// <summary>
-    /// Busy-waits for ~1ms using a tight Stopwatch loop. Unlike Thread.Sleep or
-    /// Task.Delay (which can deprioritize the thread and stall for ~15ms), this
-    /// spins the CPU to guarantee sub-millisecond precision. Acceptable here
-    /// because the GPU is the bottleneck, not the CPU.
+    /// Busy-waits for the specified duration using a tight Stopwatch loop. Unlike
+    /// Thread.Sleep or Task.Delay (which can deprioritize the thread and stall for
+    /// ~15ms), this spins the CPU to guarantee sub-millisecond precision. Acceptable
+    /// here because the GPU is the bottleneck, not the CPU.
     /// </summary>
-    private static void BusyWait1Ms()
+    /// <param name="milisseconds">Duration to wait (e.g. 0.1 = 100μs).</param>
+    private static void BusyWaitMs(double milisseconds = 0.1)
     {
-        long targetTicks = Stopwatch.Frequency / 1000; // 1ms in Stopwatch ticks
+        long targetTicks = (long)((Stopwatch.Frequency / 1000) * milisseconds);
         Stopwatch sw = Stopwatch.StartNew();
         while (sw.ElapsedTicks < targetTicks)
         {

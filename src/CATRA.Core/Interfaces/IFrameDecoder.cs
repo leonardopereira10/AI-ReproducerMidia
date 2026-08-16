@@ -54,4 +54,17 @@ public interface IFrameDecoder : IDisposable
     /// <see cref="IntPtr.Zero"/> or an unknown pointer.
     /// </summary>
     void ReleaseFrame(IntPtr texture);
+
+    /// <summary>
+    /// Marks a frame texture as transferred to another owner (e.g. native async
+    /// upscale worker). The decoder removes the texture from its tracking list
+    /// WITHOUT releasing it — the new owner is responsible for the release.
+    /// Null-safe (<see cref="IntPtr.Zero"/> is a no-op).
+    /// </summary>
+    /// <remarks>
+    /// Use this when the frame's ownership transfers to a native component that
+    /// will release the texture internally (e.g. <c>catra_upscale_submit_async</c>
+    /// releases the source texture after processing).
+    /// </remarks>
+    void TransferOwnership(IntPtr texture);
 }

@@ -962,6 +962,32 @@ public sealed unsafe class FrameDecoder : IFrameDecoder
         }
     }
 
+    /// <inheritdoc />
+    public void TransferOwnership(IntPtr texture)
+    {
+        if (texture == IntPtr.Zero)
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            for (int i = 0; i < _ownedFrames.Count; i++)
+            {
+                if (_ownedFrames[i].Texture != texture)
+                {
+                    continue;
+                }
+
+                // Ownership transferred to another component (e.g. native async
+                // upscale worker). Remove from tracking WITHOUT releasing — the
+                // new owner is responsible for the release.
+                _ownedFrames.RemoveAt(i);
+                return;
+            }
+        }
+    }
+
     private void EnsureOpened()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);

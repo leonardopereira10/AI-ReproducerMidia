@@ -95,6 +95,13 @@ internal sealed class FakeFrameDecoder : IFrameDecoder
         }
     }
 
+    public void TransferOwnership(IntPtr texture)
+    {
+        // Fake: ownership transfer is a no-op (no real GPU resources to track).
+        // The pipeline uses this to mark frames that were submitted to the async
+        // upscale worker (which releases them internally).
+    }
+
     public void Dispose() => _disposed = true;
 }
 
