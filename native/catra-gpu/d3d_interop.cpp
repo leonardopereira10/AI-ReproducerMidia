@@ -1510,6 +1510,54 @@ void interop_shutdown()
 }
 
 // ===========================================================================
+// Health-check
+// ===========================================================================
+
+int interop_device_health(HRESULT* out_reason)
+{
+    if (out_reason != nullptr)
+    {
+        *out_reason = S_OK;
+    }
+
+    // Fast path: if the flag is already set, return immediately without lock.
+    if (g_deviceRemoved.load())
+    {
+        if (out_reason != nullptr)
+        {
+            *out_reason = g_deviceRemovedReason;
+        }
+        BackendLog(CATRA_LOG_ERROR,
+                   "interop_device_health: device already removed "
+                   "(reason=0x%08lX) — recovery required",
+                   static_cast<unsigned long>(g_deviceRemovedReason));
+        return CATRA_ERR_DEVICE;
+    }
+
+    // Live probe: acquire the lock and query the device right now.
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    HRESULT liveReason = S_OK;
+    if (g_d3d12Device)
+    {
+        liveReason = g_d3d12Device->GetDeviceRemovedReason();
+    }
+
+    if (liveReason != S_OK)
+    {
+        // Device just reported a fault — classify and mark state.
+        MarkDeviceFaultIfReal(liveReason, liveReason, "interop_device_health::liveProbe");
+        if (out_reason != nullptr)
+        {
+            *out_reason = g_deviceRemovedReason;
+        }
+        return CATRA_ERR_DEVICE;
+    }
+
+    return CATRA_OK;
+}
+
+// ===========================================================================
 // Sharing
 // ===========================================================================
 

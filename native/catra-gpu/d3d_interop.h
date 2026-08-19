@@ -190,6 +190,26 @@ int interop_copy_d3d11(ID3D11DeviceContext* ctx,
 // Idempotent. Call BEFORE releasing the caller's D3D11 device.
 void interop_shutdown();
 
+// Health-check: returns CATRA_OK if the device is healthy, CATRA_ERR_DEVICE
+// if a device-removed fault has been detected (or is detected live right now).
+// When returning CATRA_ERR_DEVICE, *out_reason receives the HRESULT of
+// GetDeviceRemovedReason() (or the original fault code if the device reports
+// S_OK — rare but possible with driver quirks). out_reason may be nullptr.
+//
+// RECOVERY CONTRACT (caller responsibility — do NOT attempt recovery inside
+// this DLL):
+//   1) detect interop_device_health() != CATRA_OK;
+//   2) call interop_shutdown();
+//   3) recreate the FFmpeg decoder (new ID3D11Device);
+//   4) call interop_init(...) again;
+//   5) recreate RIFE/FSR/AMF contexts (they hold stale device refs).
+//
+// The DLL does NOT recreate the device internally because recovery also
+// requires re-initializing all backends (RIFE/DirectML, FSR 4, AMF) that
+// hold references to the old device — orchestration must happen at the C#
+// layer where the full pipeline lifecycle is known.
+int interop_device_health(HRESULT* out_reason);
+
 // NV12 → BGRA conversion via full-texture CopyResource + two Map calls.
 // AMD RDNA 4 workaround: bypasses av_hwframe_transfer_data (which produces
 // zeros for D3D11VA NV12 decoder textures on this driver). Uses the bridge's
