@@ -100,6 +100,7 @@ using namespace amf;
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace catra {
@@ -326,8 +327,10 @@ struct AmfEncoder::Impl
         fprintf(stderr, "AmfEncoder::Impl::~Impl: END\n");
     }
 
-    // Copies one AMF output buffer into the staging vector (replacing it) and
-    // publishes the pointer/size. An empty buffer yields 0 bytes (not an error).
+    // Copies one AMF output buffer into the reusable staging vector (replacing
+    // it) and publishes the pointer/size. An empty buffer yields 0 bytes (not
+    // an error). A resize can grow the vector only at the start of this call;
+    // the previous pointer has already been consumed before the next call.
     int StagePacket(const AMFBufferPtr& buffer, uint8_t** outBuf, int* outSize)
     {
         const amf_size size = buffer->GetSize();
@@ -340,7 +343,8 @@ struct AmfEncoder::Impl
             return CATRA_OK;
         }
         const uint8_t* begin = static_cast<const uint8_t*>(src);
-        packet.assign(begin, begin + size); // may throw bad_alloc -> CATRA_ERR_UNKNOWN
+        packet.resize(static_cast<size_t>(size)); // reuses capacity when possible
+        std::memcpy(packet.data(), begin, static_cast<size_t>(size));
         *outBuf = packet.data();
         *outSize = static_cast<int>(size);
         return CATRA_OK;
@@ -888,7 +892,9 @@ int AmfEncoder::Flush(uint8_t** outBuf, int* outSize)
             continue;
         }
         const uint8_t* begin = static_cast<const uint8_t*>(src);
-        d.packet.insert(d.packet.end(), begin, begin + size); // may throw -> ERR_UNKNOWN
+        const size_t offset = d.packet.size();
+        d.packet.resize(offset + static_cast<size_t>(size));
+        std::memcpy(d.packet.data() + offset, begin, static_cast<size_t>(size));
     }
 
     if (d.packet.empty())
