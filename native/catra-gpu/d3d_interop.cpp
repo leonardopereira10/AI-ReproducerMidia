@@ -552,8 +552,7 @@ ComPtr<ID3D11Texture2D> ConvertNv12ToBgra11(ID3D11Texture2D* src,
     const size_t yPitch = mapY.RowPitch;
     const size_t uvPitch = mapUV.RowPitch;
 
-    // Diagnostic: log first Y/UV values to detect all-zero decoder output
-    // (the AMD RDNA 4 driver bug where NV12 reads return zeros).
+#if defined(DEBUG) || defined(_DEBUG)
     catra::BackendLog(CATRA_LOG_INFO,
                "[nv12conv] slice=%u Y(0,0)=%u Y(10,0)=%u Y(mid)=%u U=%u V=%u "
                "yPitch=%zu uvPitch=%u",
@@ -562,6 +561,7 @@ ComPtr<ID3D11Texture2D> ConvertNv12ToBgra11(ID3D11Texture2D* src,
                yBase[static_cast<size_t>(h / 2) * yPitch + 10],
                uvBase[0], uvBase[1],
                yPitch, static_cast<unsigned>(uvPitch));
+#endif
 
     auto clamp8 = [](float v) -> uint8_t {
         return v < 0.0f ? 0 : (v > 255.0f ? 255 : static_cast<uint8_t>(v + 0.5f));
@@ -798,7 +798,7 @@ bool ReadBack11ToCpu(ID3D11Texture2D* src, const D3D11_TEXTURE2D_DESC& d,
     }
     outPitch = d.Width * bpp;
     g_d3d11Context->Unmap(staging.Get(), 0);
-    // Always log readback pixels (diagnostic for black-frame issue)
+#if defined(DEBUG) || defined(_DEBUG)
     {
         size_t mid = static_cast<size_t>(d.Height / 2) * d.Width * bpp + 40;
         catra::BackendLog(CATRA_LOG_INFO,
@@ -806,6 +806,7 @@ bool ReadBack11ToCpu(ID3D11Texture2D* src, const D3D11_TEXTURE2D_DESC& d,
                           d.Width, d.Height, out[0], out[1], out[2], out[3], d.Height / 2,
                           out[mid], out[mid + 1], out[mid + 2], out[mid + 3]);
     }
+#endif
     return true;
 }
 

@@ -1,0 +1,44 @@
+{
+  "bug_id": "bugfix_07_amf_encode_format_mismatch",
+  "title": "Crash no encode: AMF SubmitInput falha (res=25) por mismatch NV12/BGRA",
+  "severity": "critical",
+  "description": "Ao processar um vídeo (needInterp=True, needUpscale=True), o pipeline quebra no stage de encode com NativeBridgeException: Native call 'catra_encode_frame' failed with error code -4. O log nativo mostra 'encode_amf: SubmitInput failed (res=25)' logo antes da exceção.",
+  "symptoms": [
+    "[catra-gpu] encode_amf: SubmitInput failed (res=25)",
+    "[ProcessingPipeline] EXCEPTION: NativeBridgeException: Native call 'catra_encode_frame' failed with error code -4",
+    "Pipeline aborta no stage 3 (encoder), após decode+interp+upscale terem rodado"
+  ],
+  "red_herring": [
+    "nv12_bgra_convert: decoder texture NOT shader-bindable (bind=0x200) — NÃO é a causa. É o fallback esperado GPU-compute -> CPU-transfer no driver AMD RDNA4 (documentado em FrameDecoder.cs:370-390). O frame segue pelo caminho CPU (av_hwframe_transfer_data + sws_scale) e vira textura BGRA standalone."
+  ],
+  "expected_behavior": "Pipeline decode -> RIFE -> FSR -> AMF encode completa sem exceção; arquivo HEVC de saída gerado.",
+  "actual_behavior": "catra_encode_frame retorna -4 (CATRA_ERR_DEVICE) em todo frame; pipeline aborta.",
+  "root_cause": "Mudança NÃO commitada em native/catra-gpu/encode_amf.cpp trocou o formato de entrada do encoder AMF HEVC de AMF_SURFACE_BGRA (HEAD) para AMF_SURFACE_NV12 (working tree), em Init() e no AllocSurface() do fallback. Porém o pipeline (ProcessingPipeline.cs stage 3) entrega SEMPRE texturas BGRA (saída de RIFE/FSR, ou NV12->BGRA do decoder). O encoder inicializado para NV12 rejeita a superfície BGRA em SubmitInput -> res=25 -> CATRA_ERR_DEVICE (-4).",
+  "evidence": [
+    "git diff HEAD: Init(AMF_SURFACE_BGRA) -> Init(AMF_SURFACE_NV12); AllocSurface(AMF_SURFACE_BGRA) -> AllocSurface(AMF_SURFACE_NV12); RATE_CONTROL CBR -> HIGH_QUALITY_VBR",
+    "HEAD (git show HEAD:...encode_amf.cpp) linha 412: Init(AMF_SURFACE_BGRA); linha 549: AllocSurface(AMF_SURFACE_BGRA)",
+    "ProcessingPipeline.cs:676 bridge.EncodeFrame(encodeContext, frame.Texture, ...) onde frame.Texture é BGRA (upscaledTexture de FSR/RIFE)",
+    "O erro está em SubmitInput (não em Init): prova que Init(NV12) SUCEDIU no driver; o mismatch é superfície BGRA vs encoder NV12",
+    "Comentário no diff: 'AMF VCN HEVC hardware encoder requires NV12 input — BGRA is not supported by Init() and returns AMF_NOT_SUPPORTED (res=10). The pipeline is responsible for delivering NV12 surfaces (ST-17).'"
+  ],
+  "hypotheses": [
+    "H1 (mais provável): encoder VCN HEVC exige NV12 (limitação de hardware/driver); BGRA Init falha com res=10. Fix: pipeline deve entregar NV12 ao encoder (converter BGRA->NV12 antes do SubmitInput).",
+    "H2: BGRA Init funciona neste driver e a mudança p/ NV12 foi experimento incompleto. Fix: reverter Init/AllocSurface para AMF_SURFACE_BGRA (menor risco, alinha com o que o pipeline entrega)."
+  ],
+  "affected_components": [
+    "native/catra-gpu/encode_amf.cpp (Init/AllocSurface/Encode)",
+    "src/CATRA.Services/Processing/ProcessingPipeline.cs (stage 3 encoder — entrega BGRA)",
+    "src/CATRA.Services/Processing/FrameDecoder.cs (produz BGRA standalone)",
+    "native/catra-gpu/catra_gpu.cpp (catra_encode_frame — roteia D3D11/D3D12 p/ interop)"
+  ],
+  "risk_assessment": {
+    "impact": "critical — nenhum vídeo consegue ser processado (encode sempre falha)",
+    "likelihood": "high — reproduzível em qualquer vídeo com interp+upscale",
+    "complexity": "alta — envolve GPU/AMF/D3D12 interop e decisão de formato (NV12 vs BGRA)"
+  },
+  "fix_approach": "Determinar empiricamente se Init(AMF_SURFACE_BGRA) funciona neste driver. Se funcionar: reverter Init/AllocSurface p/ BGRA (mantém VBR). Se NV12 for obrigatório: inserir conversão BGRA->NV12 (compute shader D3D12 ou reuso do caminho NV12 existente) logo antes de CreateSurfaceFromDX12Native em Encode(), de modo que a superfície entregue ao encoder seja NV12. Preferir o fix MENOS invasivo que faça o pipeline completar end-to-end. Manter o rate control VBR (apropriado p/ transcode offline).",
+  "test_strategy": "dotnet build CATRA.sln + build nativo (build_native_now.bat). Teste nativo de encode (tests/native/test_encode.cpp) se aplicável. Validação final de runtime exige rodar o app com um vídeo (hardware AMD RDNA4) — o dev não consegue simular o GPU; documentar o que foi validado por build e o que resta p/ teste de runtime.",
+  "created_at": "2026-08-17T00:00:00Z",
+  "created_by": "orchestrator",
+  "status": "open"
+}

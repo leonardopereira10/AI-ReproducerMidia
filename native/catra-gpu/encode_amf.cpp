@@ -503,6 +503,7 @@ int AmfEncoder::Encode(ID3D12Resource* texture, uint8_t** outBuf, int* outSize)
             texHeapProps.Type = static_cast<D3D12_HEAP_TYPE>(0xFF); // sentinel
             texHeapFlags = static_cast<D3D12_HEAP_FLAGS>(0xFFFFFFFF);
         }
+#if defined(DEBUG) || defined(_DEBUG)
         BackendLog(CATRA_LOG_INFO,
                    "encode_amf: CreateSurfaceFromDX12Native texture=%p device=%p "
                    "fmt=%u(%s) %llux%u mip=%u arr=%u resFlags=0x%x heapType=%u heapFlags=0x%x",
@@ -515,6 +516,7 @@ int AmfEncoder::Encode(ID3D12Resource* texture, uint8_t** outBuf, int* outSize)
                    static_cast<unsigned>(texDesc.Flags),
                    static_cast<unsigned>(texHeapProps.Type),
                    static_cast<unsigned>(texHeapFlags));
+#endif
         texDevice->Release();
     }
     else

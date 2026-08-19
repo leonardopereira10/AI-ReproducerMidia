@@ -1140,16 +1140,20 @@ int catra_nv12_staging_convert(void* nv12_tex,
         }
 
         ID3D11Texture2D* src = static_cast<ID3D11Texture2D*>(nv12_tex);
+        (void)width;
+        (void)height;
 
         D3D11_TEXTURE2D_DESC desc = {};
         src->GetDesc(&desc);
 
+    #if defined(DEBUG) || defined(_DEBUG)
         catra::BackendLog(CATRA_LOG_INFO,
-                   "catra_nv12_staging_convert: src fmt=%d w=%u h=%u arr=%u "
-                   "bind=0x%02X slice=%u vis=%ux%u",
-                   static_cast<int>(desc.Format), desc.Width, desc.Height,
-                   desc.ArraySize, static_cast<unsigned>(desc.BindFlags),
-                   array_slice, width, height);
+               "catra_nv12_staging_convert: src fmt=%d w=%u h=%u arr=%u "
+               "bind=0x%02X slice=%u vis=%ux%u",
+               static_cast<int>(desc.Format), desc.Width, desc.Height,
+               desc.ArraySize, static_cast<unsigned>(desc.BindFlags),
+               array_slice, width, height);
+    #endif
 
         Microsoft::WRL::ComPtr<ID3D11Texture2D> bgra =
             catra::Nv12ToBgraStaging(src, desc, array_slice);
@@ -1296,14 +1300,18 @@ int catra_encode_frame(int ctx, void* texture,
             {
                 probed12->Release(); // ref from the QI is ours
             }
+#if defined(DEBUG) || defined(_DEBUG)
             log_msg(CATRA_LOG_INFO,
                     "catra_encode_frame: texture is D3D12 -> D3D11 copy workaround (AMF), texture=%p",
                     texture);
+#endif
         }
         else
         {
+#if defined(DEBUG) || defined(_DEBUG)
             log_msg(CATRA_LOG_INFO, "catra_encode_frame: texture is D3D11 (QI hr=0x%08lX), doing interop",
                     static_cast<unsigned long>(qhr));
+#endif
             // D3D11 input: share (or pooled-copy) onto the bridge's shared
             // adapter via the ST-15 interop.
             irc = catra::interop_share_d3d11_to_d3d12(
