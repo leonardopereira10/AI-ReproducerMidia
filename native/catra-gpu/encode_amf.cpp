@@ -715,6 +715,7 @@ int AmfEncoder::Encode(ID3D12Resource* texture, uint8_t** outBuf, int* outSize)
         }
 
         // Log the AMF-allocated resource properties for comparison.
+#if defined(DEBUG) || defined(_DEBUG)
         {
             D3D12_RESOURCE_DESC amfDesc = amfRes->GetDesc();
             D3D12_HEAP_PROPERTIES amfHp = {};
@@ -729,6 +730,7 @@ int AmfEncoder::Encode(ID3D12Resource* texture, uint8_t** outBuf, int* outSize)
                        static_cast<unsigned>(amfHp.Type),
                        static_cast<unsigned>(amfHf));
         }
+#endif
 
         // Copy the caller's texture into the AMF surface via D3D12.
         // Both resources are on the same device. We need a temporary command
@@ -809,9 +811,29 @@ int AmfEncoder::Encode(ID3D12Resource* texture, uint8_t** outBuf, int* outSize)
         surface = allocSurface;
         BackendLog(CATRA_LOG_INFO,
                    "encode_amf: fallback copy succeeded, using AMF-allocated surface");
+
+        // --- Submit + query one output (fallback path) --------------------
+        // CRITICAL: allocSurface MUST remain alive until after QueryOnce
+        // returns. SubmitInput places the surface in AMF's internal input
+        // queue, but the AMF runtime does NOT always AddRef the underlying
+        // D3D12 texture — if allocSurface is destroyed before the encoder
+        // finishes consuming the frame, the D3D12 texture is freed while
+        // the encoder still reads it → GPU access violation / driver crash.
+        // Keeping allocSurface in scope (this inner block) guarantees the
+        // texture lives through the entire encode cycle.
+        {
+            res = d.encoder->SubmitInput(surface);
+            if (res != AMF_OK)
+            {
+                BackendLog(CATRA_LOG_ERROR, "encode_amf: SubmitInput failed (res=%d)",
+                           static_cast<int>(res));
+                return CATRA_ERR_DEVICE;
+            }
+            return d.QueryOnce(outBuf, outSize);
+        }
     }
 
-    // --- Submit + query one output -----------------------------------------
+    // --- Submit + query one output (zero-copy path) ------------------------
     // AMF_INPUT_FULL (input queue full) cannot occur in this synchronous usage
     // because we drain one packet per submit; treat it as a device fault.
     res = d.encoder->SubmitInput(surface);

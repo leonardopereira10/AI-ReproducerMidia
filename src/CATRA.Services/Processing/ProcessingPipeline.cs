@@ -415,14 +415,14 @@ public sealed class ProcessingPipeline : IProcessingPipeline
         // CPU is blocked waiting on the current frame's fence.
         // At 1080p BGRA this is ~512 MB of GPU texture memory per channel —
         // trivial on 16 GB+ systems.
-        var decodeToUpscale = Channel.CreateBounded<EncodableFrame>(new BoundedChannelOptions(200)
+        var decodeToUpscale = Channel.CreateBounded<EncodableFrame>(new BoundedChannelOptions(400)
         {
             FullMode = BoundedChannelFullMode.Wait,
             SingleReader = true,
             SingleWriter = true
         });
 
-        var upscaleToEncode = Channel.CreateBounded<UpscaledFrame>(new BoundedChannelOptions(6)
+        var upscaleToEncode = Channel.CreateBounded<UpscaledFrame>(new BoundedChannelOptions(8)
         {
             FullMode = BoundedChannelFullMode.Wait,
             SingleReader = true,
@@ -571,26 +571,12 @@ public sealed class ProcessingPipeline : IProcessingPipeline
                         {
                             linkedToken.ThrowIfCancellationRequested();
                             result = bridge.PollUpscaleResult(upscaleContext, ticket);
-                            if (result == IntPtr.Zero)
-                            {
-                                BusyWaitMs(0.1);
-                            }
                         }
 
                         upscaledTexture = result;
                         isUpscaled = true;
                         // NOTE: source texture ownership transferred to native worker
                         // on submit — it released the source internally. Do NOT release here.
-
-                        // Conditional busy-wait between submissions to prevent frame
-                        // overlap when GPU queue is backed up. Uses 0.1ms (100μs) to
-                        // minimize CPU competition with decoder. Tight Stopwatch loop
-                        // instead of Task.Delay (which can stall ~15ms).
-                        int pending = bridge.GetUpscalePendingCount(upscaleContext);
-                        if (pending > 1)
-                        {
-                            BusyWaitMs(0.1);
-                        }
                         linkedToken.ThrowIfCancellationRequested();
                     }
                     else
