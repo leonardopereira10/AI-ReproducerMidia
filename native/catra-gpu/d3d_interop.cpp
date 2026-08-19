@@ -26,6 +26,7 @@ void BackendLog(int level, const char* fmt, ...);
 namespace {
 
 using Microsoft::WRL::ComPtr;
+using catra::BackendLog;
 
 // Frames in flight the pool is sized for (spec ST-15: 4-8). 4 covers the
 // decoder -> interp -> upscale -> encode pipeline depth of the offline path.
@@ -81,6 +82,23 @@ bool IsAcquireTimeout(HRESULT hr)
            hr == static_cast<HRESULT>(WAIT_TIMEOUT);
 }
 
+// Decodes a DXGI device-removed HRESULT into a human-readable string.
+// Uses if/else (not switch) because DXGI_ERROR_* are HRESULT macros,
+// not a C++ enum type — MSVC rejects switch on non-integer-enum types.
+static const char* DecodeDeviceRemovedReason(HRESULT reason)
+{
+    if (reason == 0x887A000CL) return "GPU hung (probable TDR)";       // DXGI_ERROR_DEVICE_HUNG
+    if (reason == 0x887A0001L) return "driver stopped the device";     // DXGI_ERROR_DEVICE_REMOVED
+    if (reason == 0x887A0006L) return "device reset (driver upgrade/TDR)"; // DXGI_ERROR_DEVICE_RESET
+    if (reason == 0x887A0003L) return "driver internal error";         // DXGI_ERROR_DRIVER_INTERNAL_ERROR
+    if (reason == 0x887A000EL) return "invalid call (API misuse)";     // DXGI_ERROR_INVALID_CALL
+    return nullptr;
+}
+
+// Forward declaration — definition is after the module state section
+// (g_d3d12Device and BackendLog must be in scope).
+void LogDeviceRemovedReason(const char* context, HRESULT observedHr);
+
 // --- Module state ----------------------------------------------------------
 //
 // Single offline pipeline: one frame loop drives the share path, so the whole
@@ -125,6 +143,42 @@ uint64_t g_frameKey = 0;              // keyed-mutex key, alternates 0/1
 // (5 s timeout -> spurious CATRA_ERR_DEVICE — observed as the NV12->BGRA
 // alternation rebuild in the interpolation pipeline).
 uint64_t g_poolGeneration = 0;
+
+// Logs the root cause when a keyed-mutex or fence operation fails with a
+// device-removed HRESULT (0x887A0001 on AMD RDNA 4). Calls GetDeviceRemovedReason()
+// on g_d3d12Device and emits a structured error with a human-readable reason.
+//
+// CRITICAL: This function MUST be called while g_mutex is held (or from a
+// code path that already holds it), because it accesses g_d3d12Device which
+// is only safe to read under the module lock.
+void LogDeviceRemovedReason(const char* context, HRESULT observedHr)
+{
+    HRESULT reason = S_OK;
+    if (g_d3d12Device)
+    {
+        reason = g_d3d12Device->GetDeviceRemovedReason();
+    }
+
+    const char* human = DecodeDeviceRemovedReason(reason);
+    if (human == nullptr)
+    {
+        human = "unknown";
+    }
+
+    catra::BackendLog(CATRA_LOG_ERROR,
+               "[device-removed] context=%s observedHr=0x%08lX reason=0x%08lX (%s)",
+               context,
+               static_cast<unsigned long>(observedHr),
+               static_cast<unsigned long>(reason),
+               human);
+
+    if (reason != S_OK)
+    {
+        catra::BackendLog(CATRA_LOG_ERROR,
+                   "[device-removed] check Windows Event Viewer (source: Display or amdkmdap) "
+                   "for TDR (Timeout Detection & Recovery) events");
+    }
+}
 
 // Derives the DXGI adapter from a D3D11 device and creates a D3D12 device on
 // it (FEATURE_LEVEL_12_0 per spec). Shared handles REQUIRE the same adapter /
@@ -911,7 +965,10 @@ bool UploadCpuTo12(ID3D12Resource* dst, const D3D11_TEXTURE2D_DESC& d,
     if (g_fence->GetCompletedValue() < fv)
     {
         g_fence->SetEventOnCompletion(fv, g_fenceEvent);
-        WaitForSingleObject(g_fenceEvent, 5000);
+        if (WaitForSingleObject(g_fenceEvent, 5000) != WAIT_OBJECT_0)
+        {
+            LogDeviceRemovedReason("UploadCpuTo12::fenceWait", E_FAIL);
+        }
     }
     return true;
 }
@@ -1063,6 +1120,7 @@ int CopyD3D12ToStagingLocked(ID3D12Resource* src, ID3D12Resource* dst)
         {
             catra::BackendLog(CATRA_LOG_ERROR,
                               "interop: encode staging fence wait timed out (5000 ms)");
+            LogDeviceRemovedReason("CopyD3D12ToStagingLocked::fenceWait", E_FAIL);
             return CATRA_ERR_DEVICE;
         }
     }
@@ -1121,6 +1179,7 @@ int PooledCopyD3D11Locked(ID3D11Texture2D* src,
                       "interop: GPU-GPU copy ReleaseSync(key=%llu) hr=0x%08lX — falling back to CPU round-trip",
                       static_cast<unsigned long long>(key),
                       static_cast<unsigned long>(relHr));
+    LogDeviceRemovedReason("PooledCopyD3D11Locked::ReleaseSync", relHr);
     return CATRA_ERR_DEVICE;
 }
 
@@ -1746,12 +1805,14 @@ int interop_acquire(IDXGIKeyedMutex* mutex, uint64_t key, uint32_t timeout_ms)
                    static_cast<unsigned long long>(key),
                    static_cast<unsigned>(timeout_ms),
                    static_cast<unsigned long>(hr));
+        LogDeviceRemovedReason("interop_acquire::AcquireSync", hr);
         return CATRA_ERR_DEVICE;
     }
     if (SUCCEEDED(hr))
     {
         return CATRA_OK;
     }
+    LogDeviceRemovedReason("interop_acquire::AcquireSync", hr);
     return HrToCatra(hr);
 }
 
