@@ -169,6 +169,15 @@ ComPtr<ID3D12Fence> g_fence;
 UINT64 g_fenceValue = 0;
 HANDLE g_fenceEvent = nullptr;
 
+// Device-fault tracking (SPRINT_05): distinguishes genuine device removal
+// (fail-fast) from RDNA 4 keyed-mutex quirks (degrade, keep pipeline alive).
+// g_deviceRemoved   — true when reason != S_OK (REAL fault → fail-fast).
+// g_keyedMutexQuirk — true when reason == S_OK (driver quirk → degrade).
+// g_deviceRemovedReason — the HRESULT from GetDeviceRemovedReason() at fault time.
+std::atomic<bool> g_keyedMutexQuirk{false};
+std::atomic<bool> g_deviceRemoved{false};
+HRESULT g_deviceRemovedReason = S_OK;
+
 // One pooled shared texture + its opened D3D12 counterpart + keyed mutex.
 struct InteropPoolSlot
 {
@@ -250,6 +259,31 @@ void LogDeviceRemovedReason(const char* context, HRESULT observedHr)
                    "[device-removed] check Windows Event Viewer (source: Display or amdkmdap) "
                    "for TDR (Timeout Detection & Recovery) events");
     }
+}
+
+// Centralized fault classification: called from every keyed-mutex / fence
+// failure point.  Logs the event, then classifies:
+//   - reason != S_OK → REAL device fault: sets g_deviceRemoved=true (fail-fast)
+//   - reason == S_OK → RDNA 4 driver quirk: sets g_keyedMutexQuirk=true (degrade)
+//
+// Returns true if the fault is REAL (g_deviceRemoved was set), false if quirk.
+// IMPORTANT: MUST be called while g_mutex is held (or from a code path that
+// already holds it), because it accesses g_d3d12Device.
+bool MarkDeviceFaultIfReal(HRESULT observed, HRESULT reason, const char* ctx)
+{
+    LogDeviceRemovedReason(ctx, observed);
+
+    if (reason != S_OK)
+    {
+        // REAL device fault — fail-fast: pipeline cannot continue safely.
+        g_deviceRemovedReason = reason;
+        g_deviceRemoved.store(true);
+        return true;
+    }
+    // reason == S_OK → driver quirk (false positive).
+    // Do NOT set g_deviceRemoved — the pipeline continues degraded.
+    g_keyedMutexQuirk.store(true);
+    return false;
 }
 
 // Derives the DXGI adapter from a D3D11 device and creates a D3D12 device on
@@ -1039,7 +1073,9 @@ bool UploadCpuTo12(ID3D12Resource* dst, const D3D11_TEXTURE2D_DESC& d,
         g_fence->SetEventOnCompletion(fv, g_fenceEvent);
         if (WaitForSingleObject(g_fenceEvent, kInteropFenceWaitMs) != WAIT_OBJECT_0)
         {
-            LogDeviceRemovedReason("UploadCpuTo12::fenceWait", E_FAIL);
+            // Fence timeout — classify as real fault or quirk.
+            HRESULT reason = g_d3d12Device ? g_d3d12Device->GetDeviceRemovedReason() : S_OK;
+            MarkDeviceFaultIfReal(E_FAIL, reason, "UploadCpuTo12::fenceWait");
         }
     }
     return true;
@@ -1193,7 +1229,9 @@ int CopyD3D12ToStagingLocked(ID3D12Resource* src, ID3D12Resource* dst)
             catra::BackendLog(CATRA_LOG_ERROR,
                               "interop: encode staging fence wait timed out (%u ms)",
                               kInteropFenceWaitMs);
-            LogDeviceRemovedReason("CopyD3D12ToStagingLocked::fenceWait", E_FAIL);
+            // Classify: real fault → fail-fast; quirk → degrade.
+            HRESULT reason = g_d3d12Device ? g_d3d12Device->GetDeviceRemovedReason() : S_OK;
+            MarkDeviceFaultIfReal(E_FAIL, reason, "CopyD3D12ToStagingLocked::fenceWait");
             return CATRA_ERR_DEVICE;
         }
     }
@@ -1252,7 +1290,9 @@ int PooledCopyD3D11Locked(ID3D11Texture2D* src,
                       "interop: GPU-GPU copy ReleaseSync(key=%llu) hr=0x%08lX — falling back to CPU round-trip",
                       static_cast<unsigned long long>(key),
                       static_cast<unsigned long>(relHr));
-    LogDeviceRemovedReason("PooledCopyD3D11Locked::ReleaseSync", relHr);
+    // Classify: real fault → fail-fast; quirk → degrade only.
+    HRESULT reason = g_d3d12Device ? g_d3d12Device->GetDeviceRemovedReason() : S_OK;
+    MarkDeviceFaultIfReal(relHr, reason, "PooledCopyD3D11Locked::ReleaseSync");
     return CATRA_ERR_DEVICE;
 }
 
@@ -1462,6 +1502,11 @@ void interop_shutdown()
     g_fenceValue = 0;
     g_frameKey = 0;
     g_poolGeneration = 0;
+
+    // Reset fault tracking on shutdown (SPRINT_05): next init starts clean.
+    g_keyedMutexQuirk.store(false);
+    g_deviceRemoved.store(false);
+    g_deviceRemovedReason = S_OK;
 }
 
 // ===========================================================================
@@ -1486,6 +1531,17 @@ int interop_share_d3d11_to_d3d12(ID3D11Texture2D* src,
     }
 
     std::lock_guard<std::mutex> lock(g_mutex);
+
+    // Fail-fast: genuine device removal detected by MarkDeviceFaultIfReal.
+    // Do NOT fail-fast on g_keyedMutexQuirk — that's a driver quirk, the
+    // pipeline continues degraded (CPU round-trip fallback).
+    if (g_deviceRemoved.load())
+    {
+        BackendLog(CATRA_LOG_ERROR,
+                   "interop: device removed (reason=0x%08lX) — fail-fast",
+                   static_cast<unsigned long>(g_deviceRemovedReason));
+        return CATRA_ERR_DEVICE;
+    }
 
     if (!g_d3d12Device)
     {
@@ -1607,6 +1663,15 @@ int interop_share_d3d12_to_d3d11(ID3D12Resource* src,
         return CATRA_ERR_INVALID_ARG;
     }
 
+    // Fail-fast: genuine device removal detected by MarkDeviceFaultIfReal.
+    if (g_deviceRemoved.load())
+    {
+        BackendLog(CATRA_LOG_ERROR,
+                   "interop: device removed (reason=0x%08lX) — fail-fast",
+                   static_cast<unsigned long>(g_deviceRemovedReason));
+        return CATRA_ERR_DEVICE;
+    }
+
     // The creating device travels with the resource; mint the NT handle there.
     ComPtr<ID3D12Device> device12;
     HRESULT hr = src->GetDevice(IID_PPV_ARGS(device12.GetAddressOf()));
@@ -1677,6 +1742,15 @@ int interop_copy_d3d12_for_encode(ID3D12Resource* src,
     }
 
     std::lock_guard<std::mutex> lock(g_mutex);
+
+    // Fail-fast: genuine device removal detected by MarkDeviceFaultIfReal.
+    if (g_deviceRemoved.load())
+    {
+        BackendLog(CATRA_LOG_ERROR,
+                   "interop: device removed (reason=0x%08lX) — fail-fast",
+                   static_cast<unsigned long>(g_deviceRemovedReason));
+        return CATRA_ERR_DEVICE;
+    }
 
     if (!g_d3d11Device || !g_d3d11Context || !g_d3d12Device || !g_d3d12Queue ||
         !g_cmdAllocator || !g_cmdList || !g_fence || g_fenceEvent == nullptr)
@@ -1878,14 +1952,18 @@ int interop_acquire(IDXGIKeyedMutex* mutex, uint64_t key, uint32_t timeout_ms)
                    static_cast<unsigned long long>(key),
                    static_cast<unsigned>(timeout_ms),
                    static_cast<unsigned long>(hr));
-        LogDeviceRemovedReason("interop_acquire::AcquireSync", hr);
+        // Classify timeout: real fault → fail-fast; quirk → degrade.
+        HRESULT reason = g_d3d12Device ? g_d3d12Device->GetDeviceRemovedReason() : S_OK;
+        MarkDeviceFaultIfReal(hr, reason, "interop_acquire::AcquireSync(timeout)");
         return CATRA_ERR_DEVICE;
     }
     if (SUCCEEDED(hr))
     {
         return CATRA_OK;
     }
-    LogDeviceRemovedReason("interop_acquire::AcquireSync", hr);
+    // AcquireSync returned a non-timeout error (e.g. DEVICE_REMOVED).
+    HRESULT reason2 = g_d3d12Device ? g_d3d12Device->GetDeviceRemovedReason() : S_OK;
+    MarkDeviceFaultIfReal(hr, reason2, "interop_acquire::AcquireSync(error)");
     return HrToCatra(hr);
 }
 
@@ -1905,6 +1983,15 @@ int interop_copy_d3d11(ID3D11DeviceContext* ctx,
     if (ctx == nullptr || src == nullptr || dst_shared == nullptr)
     {
         return CATRA_ERR_INVALID_ARG;
+    }
+
+    // Fail-fast: genuine device removal detected by MarkDeviceFaultIfReal.
+    if (g_deviceRemoved.load())
+    {
+        BackendLog(CATRA_LOG_ERROR,
+                   "interop: device removed (reason=0x%08lX) — fail-fast",
+                   static_cast<unsigned long>(g_deviceRemovedReason));
+        return CATRA_ERR_DEVICE;
     }
 
     // CopyResource requires identical geometry; validate up front so a
