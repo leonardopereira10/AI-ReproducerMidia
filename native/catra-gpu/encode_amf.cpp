@@ -377,10 +377,20 @@ int AmfEncoder::Create(ID3D12Device* device12,
     set(AMF_VIDEO_ENCODER_HEVC_PROFILE,
         static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_PROFILE_MAIN), "PROFILE");
     set(AMF_VIDEO_ENCODER_HEVC_TIER, tier, "TIER");
-    // CBR at the requested target bitrate for predictable file sizes (profiles
-    // carry 20 Mbps / 45 Mbps; spec ST-16).
-    set(AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD,
-        static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CBR), "RATE_CONTROL");
+    // Peak-constrained VBR keeps TARGET_BITRATE as the requested average while
+    // allowing the encoder to spend bits on complex frames.
+    const amf_int64 rateControl = static_cast<amf_int64>(
+        AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_PEAK_CONSTRAINED_VBR);
+    res = d.encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD, rateControl);
+    if (res != AMF_OK)
+    {
+        BackendLog(CATRA_LOG_ERROR,
+                   "encode_amf: requested PEAK_CONSTRAINED_VBR unsupported (res=%d)",
+                   static_cast<int>(res));
+        return CATRA_ERR_NOT_IMPL;
+    }
+    BackendLog(CATRA_LOG_INFO,
+               "encode_amf: rate control applied=PEAK_CONSTRAINED_VBR (res=AMF_OK)");
     set(AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE, targetBitrate, "TARGET_BITRATE");
     // Insert VPS/SPS/PPS at every GOP boundary so the output is a self-contained
     // Annex B stream (ST-17 muxes it into MP4 via the hevc bitstream filter).
@@ -419,7 +429,7 @@ int AmfEncoder::Create(ID3D12Device* device12,
     }
 
     BackendLog(CATRA_LOG_INFO,
-               "encode_amf: HEVC encoder ready %dx%d @ %.3f fps, %d kbps (tier=%s)",
+               "encode_amf: HEVC encoder ready %dx%d @ %.3f fps, %d kbps (rate=PEAK_CONSTRAINED_VBR, tier=%s)",
                width, height, fps, bitrateKbps,
                (tier == static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_TIER_HIGH)) ? "High" : "Main");
 
