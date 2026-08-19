@@ -173,6 +173,118 @@ struct AmfEncoder::Impl
 
     bool drained = false; // set by Flush; Encode afterwards is a usage error
 
+    // Lazy, encoder-local fallback copy objects. The command list and allocator
+    // are reset only after fallbackFenceValue has completed on fallbackQueue.
+    ComPtr<ID3D12Device> fallbackDevice;
+    ComPtr<ID3D12CommandQueue> fallbackQueue;
+    ComPtr<ID3D12CommandAllocator> fallbackAllocator;
+    ComPtr<ID3D12GraphicsCommandList> fallbackCommandList;
+    ComPtr<ID3D12Fence> fallbackFence;
+    HANDLE fallbackEvent = nullptr;
+    UINT64 fallbackFenceValue = 0;
+
+    bool EnsureFallbackObjects(ID3D12Device* device)
+    {
+        if (device == nullptr)
+        {
+            return false;
+        }
+        if (fallbackDevice != nullptr && fallbackDevice.Get() != device)
+        {
+            BackendLog(CATRA_LOG_ERROR,
+                       "encode_amf: fallback device changed during encoder lifetime");
+            return false;
+        }
+        if (fallbackDevice != nullptr && fallbackQueue != nullptr &&
+            fallbackAllocator != nullptr && fallbackCommandList != nullptr &&
+            fallbackFence != nullptr && fallbackEvent != nullptr)
+        {
+            return true;
+        }
+
+        fallbackDevice = device;
+        D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+        queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        HRESULT hr = device->CreateCommandQueue(
+            &queueDesc, IID_PPV_ARGS(fallbackQueue.GetAddressOf()));
+        if (SUCCEEDED(hr))
+        {
+            hr = device->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(fallbackAllocator.GetAddressOf()));
+        }
+        if (SUCCEEDED(hr))
+        {
+            hr = device->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, fallbackAllocator.Get(), nullptr,
+                IID_PPV_ARGS(fallbackCommandList.GetAddressOf()));
+        }
+        if (SUCCEEDED(hr))
+        {
+            hr = fallbackCommandList->Close();
+        }
+        if (SUCCEEDED(hr))
+        {
+            hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                     IID_PPV_ARGS(fallbackFence.GetAddressOf()));
+        }
+        if (SUCCEEDED(hr))
+        {
+            fallbackEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (fallbackEvent == nullptr)
+            {
+                hr = HRESULT_FROM_WIN32(GetLastError());
+            }
+        }
+        if (FAILED(hr))
+        {
+            BackendLog(CATRA_LOG_ERROR,
+                       "encode_amf: fallback cmd objects hr=0x%08lX",
+                       static_cast<unsigned long>(hr));
+            if (fallbackEvent != nullptr)
+            {
+                CloseHandle(fallbackEvent);
+                fallbackEvent = nullptr;
+            }
+            fallbackFence = nullptr;
+            fallbackCommandList = nullptr;
+            fallbackAllocator = nullptr;
+            fallbackQueue = nullptr;
+            fallbackDevice = nullptr;
+            return false;
+        }
+        return true;
+    }
+
+    bool WaitForFallbackFence()
+    {
+        if (fallbackFence == nullptr || fallbackFenceValue == 0 ||
+            fallbackFence->GetCompletedValue() >= fallbackFenceValue)
+        {
+            return true;
+        }
+        HRESULT hr = fallbackFence->SetEventOnCompletion(fallbackFenceValue,
+                                                         fallbackEvent);
+        if (FAILED(hr))
+        {
+            BackendLog(CATRA_LOG_ERROR,
+                       "encode_amf: fallback SetEventOnCompletion hr=0x%08lX",
+                       static_cast<unsigned long>(hr));
+            return false;
+        }
+        const DWORD result = WaitForSingleObject(fallbackEvent, 5000);
+        if (result != WAIT_OBJECT_0 ||
+            fallbackFence->GetCompletedValue() < fallbackFenceValue)
+        {
+            BackendLog(CATRA_LOG_ERROR,
+                       "encode_amf: fallback fence wait failed (result=%lu, value=%llu)",
+                       static_cast<unsigned long>(result),
+                       static_cast<unsigned long long>(fallbackFenceValue));
+            return false;
+        }
+        return true;
+    }
+
     ~Impl()
     {
         fprintf(stderr, "AmfEncoder::Impl::~Impl: BEGIN\n");
@@ -193,6 +305,16 @@ struct AmfEncoder::Impl
         encoder = nullptr;
         context2 = nullptr;
         context = nullptr;
+        if (fallbackEvent != nullptr)
+        {
+            CloseHandle(fallbackEvent);
+            fallbackEvent = nullptr;
+        }
+        fallbackFence = nullptr;
+        fallbackCommandList = nullptr;
+        fallbackAllocator = nullptr;
+        fallbackQueue = nullptr;
+        fallbackDevice = nullptr;
         fprintf(stderr, "AmfEncoder::Impl::~Impl: smart ptrs released\n");
         if (amfDll != nullptr)
         {
@@ -612,41 +734,8 @@ int AmfEncoder::Encode(ID3D12Resource* texture, uint8_t** outBuf, int* outSize)
             ID3D12Device* srcDev = nullptr;
             texture->GetDevice(IID_PPV_ARGS(&srcDev));
 
-            // We need a command queue. The interop module owns one, but we
-            // don't have direct access from here. Instead, QI the texture's
-            // device and create a temporary command allocator + list.
-            // For an offline pipeline this one-time allocation per fallback
-            // frame is acceptable (the primary path never hits this).
-            ComPtr<ID3D12CommandAllocator> fbAlloc;
-            ComPtr<ID3D12GraphicsCommandList> fbCmd;
-            ComPtr<ID3D12Fence> fbFence;
-            HANDLE fbEvent = nullptr;
-            HRESULT hr = S_OK;
-
-            hr = srcDev->CreateCommandAllocator(
-                D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(fbAlloc.GetAddressOf()));
-            if (SUCCEEDED(hr))
+            if (!d.EnsureFallbackObjects(srcDev) || !d.WaitForFallbackFence())
             {
-                hr = srcDev->CreateCommandList(
-                    0, D3D12_COMMAND_LIST_TYPE_DIRECT, fbAlloc.Get(), nullptr,
-                    IID_PPV_ARGS(fbCmd.GetAddressOf()));
-            }
-            if (SUCCEEDED(hr))
-            {
-                hr = srcDev->CreateFence(0, D3D12_FENCE_FLAG_NONE,
-                                         IID_PPV_ARGS(fbFence.GetAddressOf()));
-            }
-            if (SUCCEEDED(hr))
-            {
-                fbEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            }
-
-            if (FAILED(hr) || fbEvent == nullptr)
-            {
-                if (fbEvent) CloseHandle(fbEvent);
-                BackendLog(CATRA_LOG_ERROR,
-                           "encode_amf: fallback cmd objects hr=0x%08lX",
-                           static_cast<unsigned long>(hr));
                 if (srcDev) srcDev->Release();
                 return CATRA_ERR_DEVICE;
             }
@@ -664,42 +753,52 @@ int AmfEncoder::Encode(ID3D12Resource* texture, uint8_t** outBuf, int* outSize)
             barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
             barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
 
-            fbCmd->ResourceBarrier(2, barriers);
-            fbCmd->CopyResource(amfRes, texture);
+            HRESULT hr = d.fallbackAllocator->Reset();
+            if (SUCCEEDED(hr))
+            {
+                hr = d.fallbackCommandList->Reset(d.fallbackAllocator.Get(), nullptr);
+            }
+            if (FAILED(hr))
+            {
+                BackendLog(CATRA_LOG_ERROR,
+                           "encode_amf: fallback list reset hr=0x%08lX",
+                           static_cast<unsigned long>(hr));
+                if (srcDev) srcDev->Release();
+                return CATRA_ERR_DEVICE;
+            }
+
+            d.fallbackCommandList->ResourceBarrier(2, barriers);
+            d.fallbackCommandList->CopyResource(amfRes, texture);
 
             // Transition both back to COMMON.
             barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
             barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
             barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
             barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-            fbCmd->ResourceBarrier(2, barriers);
-            fbCmd->Close();
-
-            // We need a command queue to execute on. Create a temporary one.
-            ComPtr<ID3D12CommandQueue> fbQueue;
-            D3D12_COMMAND_QUEUE_DESC qd = {};
-            qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-            hr = srcDev->CreateCommandQueue(&qd, IID_PPV_ARGS(fbQueue.GetAddressOf()));
+            d.fallbackCommandList->ResourceBarrier(2, barriers);
+            hr = d.fallbackCommandList->Close();
             if (FAILED(hr))
             {
-                CloseHandle(fbEvent);
                 BackendLog(CATRA_LOG_ERROR,
-                           "encode_amf: fallback queue hr=0x%08lX",
+                           "encode_amf: fallback list close hr=0x%08lX",
                            static_cast<unsigned long>(hr));
                 srcDev->Release();
                 return CATRA_ERR_DEVICE;
             }
 
-            ID3D12CommandList* lists[] = { fbCmd.Get() };
-            fbQueue->ExecuteCommandLists(1, lists);
-            fbQueue->Signal(fbFence.Get(), 1);
-            if (fbFence->GetCompletedValue() < 1)
+            ID3D12CommandList* lists[] = { d.fallbackCommandList.Get() };
+            d.fallbackQueue->ExecuteCommandLists(1, lists);
+            const UINT64 fenceValue = ++d.fallbackFenceValue;
+            hr = d.fallbackQueue->Signal(d.fallbackFence.Get(), fenceValue);
+            if (FAILED(hr) || !d.WaitForFallbackFence())
             {
-                fbFence->SetEventOnCompletion(1, fbEvent);
-                WaitForSingleObject(fbEvent, 5000);
+                BackendLog(CATRA_LOG_ERROR,
+                           "encode_amf: fallback queue signal/wait hr=0x%08lX",
+                           static_cast<unsigned long>(hr));
+                srcDev->Release();
+                return CATRA_ERR_DEVICE;
             }
 
-            CloseHandle(fbEvent);
             srcDev->Release();
         }
 

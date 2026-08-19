@@ -415,14 +415,14 @@ public sealed class ProcessingPipeline : IProcessingPipeline
         // CPU is blocked waiting on the current frame's fence.
         // At 1080p BGRA this is ~512 MB of GPU texture memory per channel —
         // trivial on 16 GB+ systems.
-        var decodeToUpscale = Channel.CreateBounded<EncodableFrame>(new BoundedChannelOptions(14)
+        var decodeToUpscale = Channel.CreateBounded<EncodableFrame>(new BoundedChannelOptions(64)
         {
             FullMode = BoundedChannelFullMode.Wait,
             SingleReader = true,
             SingleWriter = true
         });
 
-        var upscaleToEncode = Channel.CreateBounded<UpscaledFrame>(new BoundedChannelOptions(48)
+        var upscaleToEncode = Channel.CreateBounded<UpscaledFrame>(new BoundedChannelOptions(3)
         {
             FullMode = BoundedChannelFullMode.Wait,
             SingleReader = true,
