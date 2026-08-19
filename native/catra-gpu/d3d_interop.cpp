@@ -32,8 +32,27 @@ using catra::BackendLog;
 // decoder -> interp -> upscale -> encode pipeline depth of the offline path.
 constexpr size_t kInteropPoolSize = 4;
 
+// Named timeout / spin constants (replaces all hardcoded 5000 / 2000 literals
+// in wait paths).  Pipeline offline throughput-bound: frames 4K pós-DirectML
+// podem deixar a GPU ocupada além de 2 s; timeouts maiores reduzem falsos
+// positivos de device-removed sem exigir alteração de registro (TDR).
+//
+// kInteropAcquireTimeoutMs — keyed-mutex AcquireSync (era 5000 ms).
+//   15 s cobre o caso extremo de pool-rebuild + NV12→BGRA CPU round-trip
+//   antes do AcquireSync, sem acionar false-positive device-removed.
+// kInteropFenceWaitMs      — D3D12 fence signal wait (era 5000 ms inline).
+//   UploadCpuTo12 / CopyD3D12ToStagingLocked: 15 s é mais que suficiente
+//   para cópias same-device; timeout maior evita falhas em GPU sobrecarregada.
+// kInteropGpuIdleSpinMax   — WaitForD3D11GpuIdle loop ceiling (era 2000).
+//   ~10 s (10000 * 1 ms) cobre GPU pós-DirectML com command queue lotado;
+//   2 s era insuficiente em hardware RDNA 4 com inferência pesada.
+constexpr uint32_t kInteropAcquireTimeoutMs = 15000; // era 5000
+constexpr uint32_t kInteropFenceWaitMs      = 15000; // era 5000 inline
+constexpr int      kInteropGpuIdleSpinMax   = 10000; // era 2000 (~2s → ~10s)
+
 // Default keyed-mutex acquire timeout (spec ST-15: 5000 ms).
-constexpr uint32_t kInteropAcquireTimeoutMs = 5000;
+// OBSOLETE: use kInteropAcquireTimeoutMs instead.
+constexpr uint32_t kInteropAcquireTimeoutMsLegacy = 5000;
 
 // Maps an HRESULT to a CATRA_ERR_* code. Timeouts (both spellings DXGI uses)
 // surface as CATRA_ERR_DEVICE: a stalled share is a device-level fault from
@@ -80,6 +99,37 @@ bool IsAcquireTimeout(HRESULT hr)
            // on RDNA 4 (Adrenalin 25.x) during the NV12<->BGRA pool-rebuild
            // sequence in the interpolation pipeline.
            hr == static_cast<HRESULT>(WAIT_TIMEOUT);
+}
+
+// Returns true when observedHr is a genuine device-fault code AND
+// reason != S_OK.  A non-S_OK reason means the DXGI device actually
+// reports itself as removed / hung / reset — this is a real fault
+// that requires pipeline recovery (fail-fast).
+//
+// Returns false when reason == S_OK: the device is healthy and the
+// observed fault code is a driver quirk (false positive).
+bool IsDeviceFaultReal(HRESULT observedHr, HRESULT reason)
+{
+    bool isFaultCode = (observedHr == DXGI_ERROR_DEVICE_REMOVED) ||
+                       (observedHr == DXGI_ERROR_DEVICE_HUNG)  ||
+                       (observedHr == DXGI_ERROR_DEVICE_RESET) ||
+                       (observedHr == DXGI_ERROR_DRIVER_INTERNAL_ERROR);
+    // reason == S_OK => device is healthy, fault code is a driver quirk
+    return isFaultCode && (reason != S_OK);
+}
+
+// Returns true when observedHr is a device-fault code BUT reason == S_OK.
+// This is the RDNA 4 quirk: keyed-mutex operations (AcquireSync /
+// ReleaseSync) report DXGI_ERROR_DEVICE_REMOVED even though the device
+// is perfectly healthy.  The GPU-GPU path must be disabled (CPU
+// round-trip fallback) without killing the entire pipeline.
+bool IsDriverQuirk(HRESULT observedHr, HRESULT reason)
+{
+    bool isFaultCode = (observedHr == DXGI_ERROR_DEVICE_REMOVED) ||
+                       (observedHr == DXGI_ERROR_DEVICE_HUNG)  ||
+                       (observedHr == DXGI_ERROR_DEVICE_RESET) ||
+                       (observedHr == DXGI_ERROR_DRIVER_INTERNAL_ERROR);
+    return isFaultCode && (reason == S_OK);
 }
 
 // Decodes a DXGI device-removed HRESULT into a human-readable string.
@@ -165,15 +215,37 @@ void LogDeviceRemovedReason(const char* context, HRESULT observedHr)
         human = "unknown";
     }
 
-    catra::BackendLog(CATRA_LOG_ERROR,
-               "[device-removed] context=%s observedHr=0x%08lX reason=0x%08lX (%s)",
-               context,
-               static_cast<unsigned long>(observedHr),
-               static_cast<unsigned long>(reason),
-               human);
-
-    if (reason != S_OK)
+    // S_OK => device is healthy; the observed fault is a driver quirk
+    // (false positive from keyed-mutex operations on RDNA 4).
+    if (reason == S_OK)
     {
+        catra::BackendLog(CATRA_LOG_WARN,
+                   "[device-removed] context=%s observedHr=0x%08lX reason=S_OK "
+                   "(device HEALTHY — driver quirk, false positive)",
+                   context,
+                   static_cast<unsigned long>(observedHr));
+    }
+    else
+    {
+        catra::BackendLog(CATRA_LOG_ERROR,
+                   "[device-removed] context=%s observedHr=0x%08lX reason=0x%08lX (%s)",
+                   context,
+                   static_cast<unsigned long>(observedHr),
+                   static_cast<unsigned long>(reason),
+                   human);
+    }
+
+    // Contextual follow-up based on quirk vs. real fault classification
+    if (IsDriverQuirk(observedHr, reason))
+    {
+        catra::BackendLog(CATRA_LOG_WARN,
+                   "[device-removed] driver quirk detected — GPU-GPU keyed-mutex path "
+                   "disabled, CPU round-trip active (device is healthy)");
+    }
+    else if (IsDeviceFaultReal(observedHr, reason))
+    {
+        catra::BackendLog(CATRA_LOG_ERROR,
+                   "[device-removed] REAL device fault — recovery required");
         catra::BackendLog(CATRA_LOG_ERROR,
                    "[device-removed] check Windows Event Viewer (source: Display or amdkmdap) "
                    "for TDR (Timeout Detection & Recovery) events");
@@ -696,7 +768,7 @@ void WaitForD3D11GpuIdle()
     g_d3d11Context->End(query.Get());
     // Spin with a bounded timeout; GetData returns S_OK once the GPU reached
     // the End() marker. Sleep to avoid burning a core while we wait.
-    for (int i = 0; i < 2000; ++i) // ~2s ceiling (2000 * 1ms)
+    for (int i = 0; i < kInteropGpuIdleSpinMax; ++i) // ~10s ceiling (10000 * 1ms)
     {
         BOOL done = FALSE;
         hr = g_d3d11Context->GetData(query.Get(), &done, sizeof(done), 0);
@@ -965,7 +1037,7 @@ bool UploadCpuTo12(ID3D12Resource* dst, const D3D11_TEXTURE2D_DESC& d,
     if (g_fence->GetCompletedValue() < fv)
     {
         g_fence->SetEventOnCompletion(fv, g_fenceEvent);
-        if (WaitForSingleObject(g_fenceEvent, 5000) != WAIT_OBJECT_0)
+        if (WaitForSingleObject(g_fenceEvent, kInteropFenceWaitMs) != WAIT_OBJECT_0)
         {
             LogDeviceRemovedReason("UploadCpuTo12::fenceWait", E_FAIL);
         }
@@ -1116,10 +1188,11 @@ int CopyD3D12ToStagingLocked(ID3D12Resource* src, ID3D12Resource* dst)
     if (g_fence->GetCompletedValue() < fv)
     {
         g_fence->SetEventOnCompletion(fv, g_fenceEvent);
-        if (WaitForSingleObject(g_fenceEvent, 5000) != WAIT_OBJECT_0)
+        if (WaitForSingleObject(g_fenceEvent, kInteropFenceWaitMs) != WAIT_OBJECT_0)
         {
             catra::BackendLog(CATRA_LOG_ERROR,
-                              "interop: encode staging fence wait timed out (5000 ms)");
+                              "interop: encode staging fence wait timed out (%u ms)",
+                              kInteropFenceWaitMs);
             LogDeviceRemovedReason("CopyD3D12ToStagingLocked::fenceWait", E_FAIL);
             return CATRA_ERR_DEVICE;
         }
