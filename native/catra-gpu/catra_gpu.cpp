@@ -1516,3 +1516,20 @@ void catra_fg_destroy(int ctx)
         DestroyFg(ctx); // no-op for an unknown handle
     });
 }
+
+// ===========================================================================
+// Device health-check (ST-15 / SPRINT_05)
+// ===========================================================================
+
+int catra_device_health(int* out_reason)
+{
+    return GuardCabi([&]() -> int {
+        HRESULT hr = S_OK;
+        int rc = catra::interop_device_health(&hr);
+        if (out_reason != nullptr)
+        {
+            *out_reason = static_cast<int>(hr);
+        }
+        return rc;
+    });
+}

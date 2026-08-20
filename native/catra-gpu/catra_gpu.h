@@ -384,6 +384,30 @@ CATRA_API int  catra_encode_flush(int ctx,
 // Destroys an encoder. No-op for an unknown handle.
 CATRA_API void catra_encode_destroy(int ctx);
 
+// ===========================================================================
+// Device health-check (ST-15 / SPRINT_05)
+// ===========================================================================
+//
+// Returns CATRA_OK if the D3D device is healthy. Returns CATRA_ERR_DEVICE if
+// a device-removed fault has been detected (or is detected live right now).
+// When returning CATRA_ERR_DEVICE, *out_reason receives the HRESULT from
+// GetDeviceRemovedReason() (or the original fault code if the device reports
+// S_OK — rare but possible with driver quirks). out_reason may be nullptr.
+//
+// RECOVERY CONTRACT (caller responsibility — do NOT attempt recovery inside
+// this DLL):
+//   1) detect catra_device_health() != CATRA_OK;
+//   2) call catra_shutdown();
+//   3) recreate the FFmpeg decoder (new ID3D11Device);
+//   4) call catra_init(...) again;
+//   5) recreate RIFE/FSR/AMF contexts (they hold stale device refs).
+//
+// The DLL does NOT recreate the device internally because recovery also
+// requires re-initializing all backends (RIFE/DirectML, FSR 4, AMF) that
+// hold references to the old device — orchestration must happen at the C#
+// layer where the full pipeline lifecycle is known.
+CATRA_API int  catra_device_health(int* out_reason);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
