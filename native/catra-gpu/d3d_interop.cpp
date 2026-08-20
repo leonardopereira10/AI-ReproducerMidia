@@ -899,6 +899,132 @@ int EnsurePool12Locked(const D3D11_TEXTURE2D_DESC& d)
     return CATRA_OK;
 }
 
+// GPU copy src (D3D12) -> next round-robin pool12 slot on the same device.
+// Zero CPU, zero D3D11 open, zero keyed mutex — pure D3D12 CopyTextureRegion
+// on the DIRECT queue. Caller holds g_mutex.
+//
+// Returns CATRA_OK with *out set to the AddRef'd slot texture, or a CATRA_ERR_*
+// code. On failure *out is set to nullptr.
+int CopyD3D12ToPool12Locked(ID3D12Resource* src,
+                            const D3D11_TEXTURE2D_DESC& geometryHint,
+                            ID3D12Resource** out)
+{
+    if (out != nullptr)
+    {
+        *out = nullptr;
+    }
+    if (src == nullptr || out == nullptr)
+    {
+        return CATRA_ERR_INVALID_ARG;
+    }
+
+    // Ensure pool exists and matches geometry.
+    int rc = EnsurePool12Locked(geometryHint);
+    if (rc != CATRA_OK)
+    {
+        return rc;
+    }
+
+    // Select next round-robin slot.
+    Pool12Slot& slot = g_pool12[g_pool12Index];
+    g_pool12Index = (g_pool12Index + 1) % g_pool12.size();
+
+    // Record + execute the copy on our DIRECT queue, then wait.
+    HRESULT rs = g_cmdAllocator->Reset();
+    if (SUCCEEDED(rs))
+    {
+        rs = g_cmdList->Reset(g_cmdAllocator.Get(), nullptr);
+    }
+    if (FAILED(rs))
+    {
+        catra::BackendLog(CATRA_LOG_ERROR,
+                          "interop: pool12 direct cmd reset hr=0x%08lX",
+                          static_cast<unsigned long>(rs));
+        return CATRA_ERR_DEVICE;
+    }
+
+    // Pre-barriers: src COMMON -> COPY_SOURCE, dst (tracked state) -> COPY_DEST.
+    D3D12_RESOURCE_BARRIER pre[2] = {};
+    pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    pre[0].Transition.pResource = src;
+    pre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    pre[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    pre[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+    if (slot.state != D3D12_RESOURCE_STATE_COPY_DEST)
+    {
+        pre[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        pre[1].Transition.pResource = slot.tex.Get();
+        pre[1].Transition.StateBefore = slot.state;
+        pre[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        pre[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        slot.state = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+    else
+    {
+        // dst already in COPY_DEST — only one pre-barrier needed.
+        g_cmdList->ResourceBarrier(1, &pre[0]);
+    }
+
+    // Whole-texture copy: geometries are identical by construction.
+    D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+    dstLoc.pResource = slot.tex.Get();
+    dstLoc.Type = static_cast<D3D12_TEXTURE_COPY_TYPE>(0);
+    dstLoc.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+    srcLoc.pResource = src;
+    srcLoc.Type = static_cast<D3D12_TEXTURE_COPY_TYPE>(0);
+    srcLoc.SubresourceIndex = 0;
+    g_cmdList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+
+    // Post-barriers: dst COPY_DEST -> COMMON, src COPY_SOURCE -> COMMON.
+    D3D12_RESOURCE_BARRIER post[2] = {};
+    post[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    post[0].Transition.pResource = slot.tex.Get();
+    post[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    post[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    post[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    post[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    post[1].Transition.pResource = src;
+    post[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    post[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    post[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    g_cmdList->ResourceBarrier(2, post);
+    slot.state = D3D12_RESOURCE_STATE_COMMON;
+
+    rs = g_cmdList->Close();
+    if (FAILED(rs))
+    {
+        catra::BackendLog(CATRA_LOG_ERROR,
+                          "interop: pool12 direct cmd close hr=0x%08lX",
+                          static_cast<unsigned long>(rs));
+        return CATRA_ERR_DEVICE;
+    }
+
+    ID3D12CommandList* lists[] = { g_cmdList.Get() };
+    g_d3d12Queue->ExecuteCommandLists(1, lists);
+
+    const UINT64 fv = ++g_fenceValue;
+    g_d3d12Queue->Signal(g_fence.Get(), fv);
+    if (g_fence->GetCompletedValue() < fv)
+    {
+        g_fence->SetEventOnCompletion(fv, g_fenceEvent);
+        if (WaitForSingleObject(g_fenceEvent, kInteropFenceWaitMs) != WAIT_OBJECT_0)
+        {
+            catra::BackendLog(CATRA_LOG_ERROR,
+                              "interop: pool12 direct fence wait timed out (%u ms)",
+                              kInteropFenceWaitMs);
+            HRESULT reason = g_d3d12Device ? g_d3d12Device->GetDeviceRemovedReason() : S_OK;
+            MarkDeviceFaultIfReal(E_FAIL, reason, "CopyD3D12ToPool12Locked::fenceWait");
+            return CATRA_ERR_DEVICE;
+        }
+    }
+
+    *out = slot.tex.Get();
+    slot.tex->AddRef();
+    return CATRA_OK;
+}
+
 // Logs the active pooled-share path once per transition (a per-frame log
 // would spam the backend sink on a throughput-bound offline transcode).
 // Caller holds g_mutex (the whole share runs under it), so the plain statics
@@ -1832,6 +1958,33 @@ int interop_copy_d3d12_for_encode(ID3D12Resource* src,
                    static_cast<unsigned>(d12.Dimension), d12.MipLevels,
                    d12.DepthOrArraySize, d12.SampleDesc.Count);
         return CATRA_ERR_INVALID_ARG;
+    }
+
+    // FAST PATH: same-device D3D12 copy directly into pool12.
+    // Eliminates staging shared, D3D11 open, keyed mutex and CPU round-trip.
+    // Zero GPU overhead beyond the CopyTextureRegion itself.
+    {
+        D3D11_TEXTURE2D_DESC hint = {};
+        hint.Width = static_cast<UINT>(d12.Width);
+        hint.Height = static_cast<UINT>(d12.Height);
+        hint.Format = d12.Format;
+        hint.ArraySize = 1;
+        hint.MipLevels = 1;
+        hint.SampleDesc.Count = 1;
+
+        ID3D12Resource* direct = nullptr;
+        if (CopyD3D12ToPool12Locked(src, hint, &direct) == CATRA_OK)
+        {
+            BackendLog(CATRA_LOG_INFO,
+                       "interop: encode workaround: D3D12 same-device direct "
+                       "-> pool12 (zero CPU)");
+            *out_pool_tex = direct;
+            *out_shared_handle = nullptr;
+            return CATRA_OK;
+        }
+        // Failed: fall through to the legacy path (staging -> D3D11 -> pool -> CPU).
+        BackendLog(CATRA_LOG_WARN,
+                   "interop: encode direct pool12 copy failed — using legacy path");
     }
 
     // --- Shareability probe: CreateSharedHandle succeeds only on a shared
