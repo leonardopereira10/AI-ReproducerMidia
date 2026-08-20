@@ -178,6 +178,11 @@ std::atomic<bool> g_keyedMutexQuirk{false};
 std::atomic<bool> g_deviceRemoved{false};
 HRESULT g_deviceRemovedReason = S_OK;
 
+// Tracks whether the current pool was built WITH keyed mutex (true) or
+// WITHOUT (false). Used by EnsurePoolLocked to detect when a rebuild is
+// needed due to a quirk mode change.
+bool g_poolBuiltWithMutex = true;
+
 // One pooled shared texture + its opened D3D12 counterpart + keyed mutex.
 struct InteropPoolSlot
 {
@@ -399,9 +404,13 @@ void DestroyPoolLocked()
 // Caller holds g_mutex. On failure the pool is left empty (clean state).
 int EnsurePoolLocked(const D3D11_TEXTURE2D_DESC& srcDesc)
 {
-    if (!g_pool.empty() && SameGeometry(g_poolDesc, srcDesc))
+    // Quirk-aware reuse: pool is valid only if geometry matches AND it was
+    // built for the current quirk mode (with or without keyed mutex).
+    if (!g_pool.empty() &&
+        SameGeometry(g_poolDesc, srcDesc) &&
+        g_poolBuiltWithMutex == !g_keyedMutexQuirk.load())
     {
-        return CATRA_OK;
+        return CATRA_OK; // pool válido para o modo atual
     }
 
     DestroyPoolLocked();
@@ -410,8 +419,19 @@ int EnsurePoolLocked(const D3D11_TEXTURE2D_DESC& srcDesc)
     sharedDesc.Usage = D3D11_USAGE_DEFAULT;
     sharedDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE; // D3D12 side makes SRVs
     sharedDesc.CPUAccessFlags = 0;
-    sharedDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
-                           D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+
+    // Quirk mode: build WITHOUT keyed mutex. Synchronization via
+    // WaitForD3D11GpuIdle on the producer side; consumers detect the
+    // absence of mutex via QI and skip AcquireSync.
+    if (g_keyedMutexQuirk.load())
+    {
+        sharedDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+    }
+    else
+    {
+        sharedDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
+                               D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+    }
 
     std::vector<InteropPoolSlot> fresh;
     fresh.reserve(kInteropPoolSize);
@@ -423,7 +443,13 @@ int EnsurePoolLocked(const D3D11_TEXTURE2D_DESC& srcDesc)
             &sharedDesc, nullptr, slot.tex11.GetAddressOf());
         if (SUCCEEDED(hr))
         {
-            hr = slot.tex11.As(&slot.mutex11);
+            // Quirk mode: skip keyed-mutex QI — pool was built without
+            // SHARED_KEYEDMUTEX, so QI will fail or return a non-functional
+            // interface. mutex11 stays nullptr.
+            if (!g_keyedMutexQuirk.load())
+            {
+                hr = slot.tex11.As(&slot.mutex11);
+            }
         }
         if (SUCCEEDED(hr))
         {
@@ -479,11 +505,15 @@ int EnsurePoolLocked(const D3D11_TEXTURE2D_DESC& srcDesc)
     // Publish the rebuild so consumers reset their ping-pong key in lockstep
     // (see g_poolGeneration above).
     ++g_poolGeneration;
+
+    // Update tracking flag and log quirk-aware status
+    g_poolBuiltWithMutex = !g_keyedMutexQuirk.load();
     catra::BackendLog(CATRA_LOG_INFO,
-                      "interop: pool rebuilt %ux%u fmt=%u (%u slots)",
+                      "interop: pool rebuilt %ux%u fmt=%u (%u slots, keyed-mutex=%s)",
                       sharedDesc.Width, sharedDesc.Height,
                       static_cast<unsigned>(sharedDesc.Format),
-                      static_cast<unsigned>(kInteropPoolSize));
+                      static_cast<unsigned>(kInteropPoolSize),
+                      g_poolBuiltWithMutex ? "true" : "false");
     return CATRA_OK;
 }
 
@@ -1368,9 +1398,11 @@ int CopyD3D12ToStagingLocked(ID3D12Resource* src, ID3D12Resource* dst)
 // extracted verbatim from interop_share_d3d11_to_d3d12 so the AMF encode
 // workaround (interop_copy_d3d12_for_encode) can reuse it. Caller holds
 // g_mutex. Returns CATRA_OK (the slot's D3D12 resource AddRef'd into
-// *out_d3d12_tex) or CATRA_ERR_DEVICE on pool-ensure / ReleaseSync failure —
-// interop_share_d3d11_to_d3d12 translates that into its CPU round-trip
-// fallback (behaviour unchanged by the extraction).
+// *out_d3d12_tex) or a CATRA_ERR_* code.
+//
+// Quirk mode (g_keyedMutexQuirk): pool built WITHOUT keyed mutex.
+// WaitForD3D11GpuIdle guarantees copy completion; consumers detect
+// absence of mutex via QI and skip AcquireSync. No ReleaseSync needed.
 int PooledCopyD3D11Locked(ID3D11Texture2D* src,
                           const D3D11_TEXTURE2D_DESC& desc,
                           ID3D12Resource** out_d3d12_tex)
@@ -1396,12 +1428,22 @@ int PooledCopyD3D11Locked(ID3D11Texture2D* src,
     g_d3d11Context->Flush();
     WaitForD3D11GpuIdle();
 
-    // Producer half of the keyed-mutex ping-pong (spec ST-15): ReleaseSync(key)
-    // hands the slot to the consumer, which does AcquireSync(key) before
-    // reading (encode_amf / upscale_fsr*). The key alternates 0/1; a pool
-    // rebuild resets it to 0 and bumps the generation so consumers resync in
-    // lockstep. The toggle happens only on success — a failed release keeps
-    // the key deterministic.
+    // Quirk mode: pool built WITHOUT keyed mutex. WaitForD3D11GpuIdle already
+    // guaranteed copy completion on the GPU; the consumer detects the absence
+    // of mutex via QI and skips AcquireSync. No ReleaseSync to fail.
+    if (slot.mutex11 == nullptr)
+    {
+        LogSharePath(true); // still GPU-GPU, just no keyed mutex
+        *out_d3d12_tex = slot.res12.Get();
+        slot.res12->AddRef();
+        return CATRA_OK;
+    }
+
+    // With keyed mutex: producer half of the ping-pong (spec ST-15).
+    // ReleaseSync(key) hands the slot to the consumer, which does
+    // AcquireSync(key) before reading (encode_amf / upscale_fsr*).
+    // The key alternates 0/1; a pool rebuild resets it to 0 and bumps
+    // the generation so consumers resync in lockstep.
     const uint64_t key = g_frameKey;
     const HRESULT relHr = slot.mutex11->ReleaseSync(key);
     if (SUCCEEDED(relHr))
@@ -1412,14 +1454,35 @@ int PooledCopyD3D11Locked(ID3D11Texture2D* src,
         slot.res12->AddRef();
         return CATRA_OK;
     }
+
+    // ReleaseSync failed — classify fault and potentially trigger quirk mode.
     catra::BackendLog(CATRA_LOG_WARN,
                       "interop: GPU-GPU copy ReleaseSync(key=%llu) hr=0x%08lX — falling back to CPU round-trip",
                       static_cast<unsigned long long>(key),
                       static_cast<unsigned long>(relHr));
-    // Classify: real fault → fail-fast; quirk → degrade only.
+
     HRESULT reason = g_d3d12Device ? g_d3d12Device->GetDeviceRemovedReason() : S_OK;
-    MarkDeviceFaultIfReal(relHr, reason, "PooledCopyD3D11Locked::ReleaseSync");
-    return CATRA_ERR_DEVICE;
+
+    // Real device fault → fail-fast
+    if (MarkDeviceFaultIfReal(relHr, reason, "PooledCopyD3D11Locked::ReleaseSync"))
+    {
+        return CATRA_ERR_DEVICE; // fault real
+    }
+
+    // Quirk detected: ReleaseSync failed but device is healthy.
+    // Mark quirk and force pool rebuild WITHOUT keyed mutex on next call.
+    // This frame still uses CPU fallback; next frame gets the new pool.
+    if (reason == S_OK && !g_keyedMutexQuirk.load())
+    {
+        catra::BackendLog(CATRA_LOG_WARN,
+                   "interop: keyed-mutex quirk detected — pool will rebuild "
+                   "without keyed mutex on next share");
+        g_keyedMutexQuirk.store(true);
+        // Force rebuild: destroys current pool. EnsurePoolLocked on next
+        // call will recreate without keyed mutex.
+        DestroyPoolLocked();
+    }
+    return CATRA_ERR_DEVICE; // this frame still uses CPU fallback
 }
 
 // Logs the encode-workaround route once per transition (per-frame logging
