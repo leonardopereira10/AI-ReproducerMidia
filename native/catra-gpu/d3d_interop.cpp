@@ -1702,11 +1702,15 @@ void interop_shutdown()
 // Health-check
 // ===========================================================================
 
-int interop_device_health(HRESULT* out_reason)
+int interop_device_health(HRESULT* out_reason, int* out_quirk)
 {
     if (out_reason != nullptr)
     {
         *out_reason = S_OK;
+    }
+    if (out_quirk != nullptr)
+    {
+        *out_quirk = 0;
     }
 
     // Fast path: if the flag is already set, return immediately without lock.
@@ -1715,6 +1719,10 @@ int interop_device_health(HRESULT* out_reason)
         if (out_reason != nullptr)
         {
             *out_reason = g_deviceRemovedReason;
+        }
+        if (out_quirk != nullptr)
+        {
+            *out_quirk = 0;
         }
         BackendLog(CATRA_LOG_ERROR,
                    "interop_device_health: device already removed "
@@ -1740,9 +1748,26 @@ int interop_device_health(HRESULT* out_reason)
         {
             *out_reason = g_deviceRemovedReason;
         }
+        if (out_quirk != nullptr)
+        {
+            *out_quirk = 0;
+        }
         return CATRA_ERR_DEVICE;
     }
 
+    // Device healthy: report quirk state so the caller knows whether the
+    // pooled path is using keyed mutex (quirk=0) or not (quirk=1).
+    // When quirk=1 the pipeline is still fully functional — GPU-GPU copies
+    // sync via WaitForD3D11GpuIdle instead of keyed mutex, so no CPU
+    // round-trip is needed and performance is restored.
+    if (out_reason != nullptr)
+    {
+        *out_reason = S_OK;
+    }
+    if (out_quirk != nullptr)
+    {
+        *out_quirk = g_keyedMutexQuirk.load() ? 1 : 0;
+    }
     return CATRA_OK;
 }
 

@@ -1525,11 +1525,15 @@ int catra_device_health(int* out_reason)
 {
     return GuardCabi([&]() -> int {
         HRESULT hr = S_OK;
-        int rc = catra::interop_device_health(&hr);
+        int quirk = 0;
+        int rc = catra::interop_device_health(&hr, &quirk);
         if (out_reason != nullptr)
         {
             *out_reason = static_cast<int>(hr);
         }
+        // quirk value consumed internally — when CATRA_OK + quirk=1 the
+        // pipeline is functional via pool without keyed mutex; no action needed.
+        (void)quirk;
         return rc;
     });
 }
