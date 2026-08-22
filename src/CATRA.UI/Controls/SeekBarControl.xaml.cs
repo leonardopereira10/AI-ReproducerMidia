@@ -55,7 +55,13 @@ public partial class SeekBarControl : UserControl
         // Track click (IsMoveToPointEnabled moves the value): bracket it with
         // start/commit so the engine seeks exactly once, to the click point.
         SeekBarSlider.PreviewMouseLeftButtonDown += (_, _) => NotifySeekStarted();
-        SeekBarSlider.PreviewMouseLeftButtonUp += (_, _) => NotifySeekCompleted();
+        
+        // Use AddHandler with handledEventsToo=true to ensure the event is captured
+        // even when the Thumb captures the mouse (IsMoveToPointEnabled).
+        SeekBarSlider.AddHandler(
+            UIElement.PreviewMouseLeftButtonUpEvent,
+            new MouseButtonEventHandler((_, _) => NotifySeekCompleted()),
+            handledEventsToo: true);
 
         SeekBarSlider.ValueChanged += (_, _) =>
         {

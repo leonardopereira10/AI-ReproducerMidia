@@ -474,6 +474,7 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
             Position = TimeSpan.FromSeconds(seconds);
             PositionSeconds = seconds;
             _ = _casting.SeekAsync(TimeSpan.FromSeconds(seconds));
+            SkipIntroCommand.NotifyCanExecuteChanged();
             return;
         }
 
@@ -500,19 +501,37 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
         Seek(PositionSeconds);
     }
 
-    /// <summary>RN-04: advances <c>current + SkipIntroSec</c>.</summary>
+    /// <summary>RN-04: advances <c>current + SkipIntroSec</c>.
+    /// While casting (ST-08) the seek goes to the TV via REL_TIME and the
+    /// current position is read from the casting position tracker (the local
+    /// engine is paused and reports a stale position).</summary>
     [RelayCommand(CanExecute = nameof(CanSkipIntro))]
     private void SkipIntro()
     {
-        var target = _engine.GetPosition() + TimeSpan.FromSeconds(_skipIntroSec);
-        _engine.Seek(target);
-        Position = target;
-        PositionSeconds = target.TotalSeconds;
+        var currentPosition = IsCasting ? Position : _engine.GetPosition();
+        var target = currentPosition + TimeSpan.FromSeconds(_skipIntroSec);
+
+        if (IsCasting)
+        {
+            Position = target;
+            PositionSeconds = target.TotalSeconds;
+            _ = _casting.SeekAsync(target);
+        }
+        else
+        {
+            _engine.Seek(target);
+            Position = target;
+            PositionSeconds = target.TotalSeconds;
+        }
+
         SkipIntroCommand.NotifyCanExecuteChanged();
     }
 
     private bool CanSkipIntro()
-        => CanSkipIntroAt(_engine.GetPosition(), Duration, _skipIntroSec);
+    {
+        var currentPosition = IsCasting ? Position : _engine.GetPosition();
+        return CanSkipIntroAt(currentPosition, Duration, _skipIntroSec);
+    }
 
     /// <summary>Toggles mute, remembering the previous volume.</summary>
     [RelayCommand]
@@ -915,12 +934,19 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
                 return;
             }
 
+            if (IsSeeking)
+            {
+                return; // user is dragging the seek bar: keep the preview value
+            }
+
             Position = position;
             PositionSeconds = position.TotalSeconds;
             if (!string.IsNullOrEmpty(CastDeviceName))
             {
                 CastStatusText = BuildCastStatusText(CastDeviceName, position);
             }
+
+            SkipIntroCommand.NotifyCanExecuteChanged();
         });
 
     private void ApplyVolume(double value)

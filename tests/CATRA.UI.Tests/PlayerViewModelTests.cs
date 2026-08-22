@@ -676,4 +676,117 @@ public sealed class PlayerViewModelTests
 
         f.Casting.StartCalls.Should().BeEmpty();
     }
+
+    // ------------------------------------------------------------------
+    // ST-08 — SkipIntro + Seek while casting
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task SkipIntro_WhileCasting_SeeksFromCastingPosition()
+    {
+        var f = new Fixture(skipIntroSec: 85.0);
+        await f.ViewModel.OpenAsync(EpisodeId);
+
+        // Start casting
+        await f.ViewModel.CastToDeviceCommand.ExecuteAsync(CastDevice);
+        f.ViewModel.IsCasting.Should().BeTrue();
+
+        // Simulate the TV reporting position at 100s
+        f.Casting.RaisePositionChanged(TimeSpan.FromSeconds(100));
+
+        f.ViewModel.SkipIntroCommand.Execute(null);
+
+        // Should seek to 100 + 85 = 185s on the casting service, NOT the local engine
+        f.Casting.SeekCalls.Should().ContainSingle()
+            .Which.Should().Be(TimeSpan.FromSeconds(185));
+        f.Engine.SeekCalls.Should().NotContain(TimeSpan.FromSeconds(185));
+        f.ViewModel.Position.Should().Be(TimeSpan.FromSeconds(185));
+        f.ViewModel.PositionSeconds.Should().Be(185);
+    }
+
+    [Fact]
+    public async Task SkipIntro_WhileCasting_UsesCastingPositionForCanExecute()
+    {
+        var f = new Fixture(skipIntroSec: 85.0);
+        await f.ViewModel.OpenAsync(EpisodeId);
+
+        // Start casting
+        await f.ViewModel.CastToDeviceCommand.ExecuteAsync(CastDevice);
+
+        // TV is near the end (1250s of 1320s) -> skip intro should be disabled
+        f.Casting.RaisePositionChanged(TimeSpan.FromSeconds(1250));
+
+        f.ViewModel.SkipIntroCommand.CanExecute(null).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task SkipIntro_WhileCasting_EnabledAtStart()
+    {
+        var f = new Fixture(skipIntroSec: 85.0);
+        await f.ViewModel.OpenAsync(EpisodeId);
+
+        // Start casting
+        await f.ViewModel.CastToDeviceCommand.ExecuteAsync(CastDevice);
+
+        // TV is at start -> skip intro should be enabled
+        f.Casting.RaisePositionChanged(TimeSpan.FromSeconds(0));
+
+        f.ViewModel.SkipIntroCommand.CanExecute(null).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Seek_WhileCasting_UpdatesSkipIntroCanExecute()
+    {
+        var f = new Fixture(skipIntroSec: 85.0);
+        await f.ViewModel.OpenAsync(EpisodeId);
+
+        // Start casting
+        await f.ViewModel.CastToDeviceCommand.ExecuteAsync(CastDevice);
+        f.ViewModel.IsCasting.Should().BeTrue();
+
+        // Seek near the end -> skip intro should become disabled
+        f.ViewModel.SeekCommand.Execute(1250d);
+
+        f.Casting.SeekCalls.Should().ContainSingle()
+            .Which.Should().Be(TimeSpan.FromSeconds(1250));
+        f.ViewModel.SkipIntroCommand.CanExecute(null).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task CastingPosition_DoesNotOverrideSlider_WhileSeeking()
+    {
+        var f = new Fixture();
+        await f.ViewModel.OpenAsync(EpisodeId);
+
+        // Start casting
+        await f.ViewModel.CastToDeviceCommand.ExecuteAsync(CastDevice);
+        f.ViewModel.IsCasting.Should().BeTrue();
+
+        // User starts dragging the seek bar
+        f.ViewModel.BeginSeekCommand.Execute(null);
+        f.ViewModel.PositionSeconds = 500;
+
+        // Casting reports a new position (1s polling) - should NOT override the preview
+        f.Casting.RaisePositionChanged(TimeSpan.FromSeconds(10));
+
+        f.ViewModel.PositionSeconds.Should().Be(500, "the slider preview value must be preserved while dragging");
+        f.ViewModel.IsSeeking.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task CastingPosition_UpdatesSlider_WhenNotSeeking()
+    {
+        var f = new Fixture();
+        await f.ViewModel.OpenAsync(EpisodeId);
+
+        // Start casting
+        await f.ViewModel.CastToDeviceCommand.ExecuteAsync(CastDevice);
+        f.ViewModel.IsCasting.Should().BeTrue();
+
+        // User is NOT dragging - casting position should update the slider
+        f.Casting.RaisePositionChanged(TimeSpan.FromSeconds(42));
+
+        f.ViewModel.PositionSeconds.Should().Be(42);
+        f.ViewModel.Position.Should().Be(TimeSpan.FromSeconds(42));
+    }
 }
