@@ -87,5 +87,6 @@ public sealed class DatabaseInitializer
         ("upscale_method", "fsr1"),
         ("default_skip_intro_sec", "85"),
         ("theme_override", "system"),
+        ("web_panel_port", "5050"),
     };
 }

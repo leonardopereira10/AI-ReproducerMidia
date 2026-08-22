@@ -30,6 +30,7 @@ public sealed class AppSettingsModel
     public const string DefaultSkipIntroSecKey = "default_skip_intro_sec";
     public const string ThemeOverrideKey = "theme_override";
     public const string MaxParallelJobsKey = "max_parallel_jobs";
+    public const string WebPanelPortKey = "web_panel_port";
 
     // --- UI-only keys (not seeded; created on first change, read with defaults) ---
     public const string AutoScanKey = "auto_scan";
@@ -55,6 +56,9 @@ public sealed class AppSettingsModel
     /// without increasing per-video processing time.
     /// </summary>
     public int MaxParallelJobs { get; set; } = 1;
+
+    // --- Web Panel ---
+    public int WebPanelPort { get; set; } = 5050;
 
     // --- DLNA ---
     public string DlnaHttpPort { get; set; } = "auto";
@@ -110,6 +114,7 @@ public string UpscaleMethod { get; set; } = "fsr1";
         model.UpscaleMethod = GetString(all, UpscaleMethodKey, model.UpscaleMethod);
         model.ThemeOverride = ParseTheme(GetString(all, ThemeOverrideKey, "system"));
         model.MaxParallelJobs = Math.Max(1, GetInt(all, MaxParallelJobsKey, model.MaxParallelJobs));
+        model.WebPanelPort = GetInt(all, WebPanelPortKey, model.WebPanelPort);
 
         return model;
     }

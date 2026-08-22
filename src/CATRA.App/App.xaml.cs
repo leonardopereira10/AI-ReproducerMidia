@@ -14,6 +14,7 @@ using CATRA.Services.Metadata;
 using CATRA.Services.Playback;
 using CATRA.Services.Processing;
 using CATRA.Services.Storage;
+using CATRA.Services.WebControl;
 using CATRA.UI.Navigation;
 using CATRA.UI.Services;
 using CATRA.UI.ViewModels;
@@ -128,6 +129,20 @@ public partial class App : Application
                 services.AddSingleton<IAvTransportClient, AvTransportClient>();
                 services.AddSingleton<IRenderingControlClient, RenderingControlClient>();
                 services.AddSingleton<ICastingService, CastingService>();
+
+                // Web control panel (ST-10): REST API + WebSocket for browser/phone
+                // remote control. WebSocketHandler implements IWebControlHub.
+                services.AddSingleton<WebSocketHandler>();
+                services.AddSingleton<IWebControlHub>(sp => sp.GetRequiredService<WebSocketHandler>());
+                services.AddSingleton<IWebControlService, WebControlService>();
+                services.AddSingleton<IWebControlServer>(sp =>
+                {
+                    var settingsRepo = sp.GetRequiredService<IAppSettingsRepository>();
+                    var model = AppSettingsModel.Load(settingsRepo);
+                    var handler = sp.GetRequiredService<WebSocketHandler>();
+                    var service = sp.GetRequiredService<IWebControlService>();
+                    return new WebControlServer(model.WebPanelPort, service, handler);
+                });
 
                 // Library scanning (ST-03): parser, probe, scanner, watcher.
                 // IMediaProbeService is ffprobe-based; the real binary is bundled
@@ -246,6 +261,20 @@ public partial class App : Application
         themeService.ThemeChanged += OnThemeChanged;
         themeService.Start();
 
+        // Start the web control panel server (ST-10): fire-and-forget so
+        // startup never blocks on port conflicts. The server degrades gracefully.
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _host.Services.GetRequiredService<IWebControlServer>().StartAsync();
+            }
+            catch (Exception ex)
+            {
+                DiagnosticsLogger.Fatal("WebControlServer failed to start", ex);
+            }
+        });
+
         var mainWindow = new MainWindow();
         MainWindow = mainWindow;
         mainWindow.Show();
@@ -283,6 +312,20 @@ public partial class App : Application
             if (mediaServer is not null)
             {
                 await mediaServer.StopAsync();
+            }
+
+            // Stop the web control panel server (ST-10).
+            var webServer = _host.Services.GetService<IWebControlServer>();
+            if (webServer is not null)
+            {
+                await webServer.StopAsync();
+            }
+
+            // Dispose the web control service (unsubscribes casting events).
+            var webControlService = _host.Services.GetService<IWebControlService>();
+            if (webControlService is IDisposable disposableWebControl)
+            {
+                disposableWebControl.Dispose();
             }
 
             var themeService = _host.Services.GetService<IThemeService>();

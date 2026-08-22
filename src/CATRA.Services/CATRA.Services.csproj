@@ -29,6 +29,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- ST-10: Web control panel static files served from embedded resources. -->
+    <EmbeddedResource Include="WebControl\wwwroot\**\*" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- ST-12: let NativeBridgeTests drive the internal INativeLibrary seam
          (fake loader) so the P/Invoke wrapper logic is testable without the
          native catra-gpu.dll. -->

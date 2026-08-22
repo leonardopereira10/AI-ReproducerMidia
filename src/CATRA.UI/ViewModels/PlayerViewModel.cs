@@ -58,6 +58,7 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
     private readonly IAppNavigator _navigator;
     private readonly ICastingService _casting;
     private readonly IMediaFileResolver _mediaFileResolver;
+    private readonly IWebControlService? _webControlService;
     private readonly SynchronizationContext? _uiContext;
 
     private Episode? _episode;
@@ -83,7 +84,8 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
         IDialogService dialogs,
         IAppNavigator navigator,
         ICastingService casting,
-        IMediaFileResolver mediaFileResolver)
+        IMediaFileResolver mediaFileResolver,
+        IWebControlService? webControlService = null)
     {
         _engine = engine ?? throw new ArgumentNullException(nameof(engine));
         _episodes = episodes ?? throw new ArgumentNullException(nameof(episodes));
@@ -94,6 +96,7 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
         _navigator = navigator ?? throw new ArgumentNullException(nameof(navigator));
         _casting = casting ?? throw new ArgumentNullException(nameof(casting));
         _mediaFileResolver = mediaFileResolver ?? throw new ArgumentNullException(nameof(mediaFileResolver));
+        _webControlService = webControlService;
 
         _uiContext = SynchronizationContext.Current;
 
@@ -316,6 +319,10 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
         ResolveAdjacentEpisodes(episodeId);
         SkipIntroCommand.NotifyCanExecuteChanged();
         TransmitCommand.NotifyCanExecuteChanged();
+
+        // ST-10: notify the web control service of the current episode
+        // so the panel can display it even before casting starts.
+        _webControlService?.SetCurrentEpisode(episodeId);
     }
 
     /// <summary>Binds the video renderer to the hosted child window (ST-05).</summary>
@@ -912,6 +919,13 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
                 CastingState.Error => _casting.ErrorMessage ?? "Erro na transmissão",
                 _ => string.Empty,
             };
+
+            // ST-10: when casting starts, notify the web control service of
+            // the current episode so the web panel can track next/previous.
+            if (state == CastingState.Streaming && _episode is not null)
+            {
+                _webControlService?.SetCurrentEpisode(_episode.Id);
+            }
 
             if (state == CastingState.Error)
             {

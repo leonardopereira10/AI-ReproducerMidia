@@ -14,6 +14,7 @@
         <Grid.RowDefinitions>
             <RowDefinition x:Name="TitleBarRow" Height="36" />
             <RowDefinition Height="*" />
+            <RowDefinition x:Name="StatusBarRow" Height="Auto" />
         </Grid.RowDefinitions>
 
         <!-- Custom title bar (collapsed by the player in fullscreen, ST-06) -->
@@ -49,5 +50,19 @@
         <Frame x:Name="ContentFrame"
                Grid.Row="1"
                NavigationUIVisibility="Hidden" />
+
+        <!-- Status bar (ST-10): web control panel URL -->
+        <Border x:Name="StatusBarBorder"
+                Grid.Row="2"
+                Background="#1E1E2E"
+                Padding="12,4"
+                Visibility="Collapsed">
+            <TextBlock x:Name="WebPanelUrlText"
+                       Cursor="Hand"
+                       FontSize="12"
+                       Foreground="#8BE9FD"
+                       Text="📱 Painel: ..."
+                       MouseLeftButtonDown="WebPanelUrl_Click" />
+        </Border>
     </Grid>
 </Window>
