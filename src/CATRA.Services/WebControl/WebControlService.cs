@@ -90,10 +90,21 @@ public sealed class WebControlService : IWebControlService, IDisposable
         {
             case "play":
                 await _casting.PlayAsync().ConfigureAwait(false);
+                lock (_lock)
+                {
+                    _isPlaying = true;
+                    _isPaused = false;
+                }
+                RaiseStateChanged();
                 break;
 
             case "pause":
                 await _casting.PauseAsync().ConfigureAwait(false);
+                lock (_lock)
+                {
+                    _isPaused = true;
+                }
+                RaiseStateChanged();
                 break;
 
             case "seek" when command.Position.HasValue:
@@ -176,7 +187,16 @@ public sealed class WebControlService : IWebControlService, IDisposable
         lock (_lock)
         {
             _isPlaying = state == CastingState.Streaming;
-            _isPaused = state == CastingState.Idle && _currentEpisodeId != 0;
+            // When casting goes Idle (stopped) while we have an episode, mark as paused.
+            // When streaming starts, clear the paused flag.
+            if (state == CastingState.Streaming)
+            {
+                _isPaused = false;
+            }
+            else if (state == CastingState.Idle && _currentEpisodeId != 0)
+            {
+                _isPaused = true;
+            }
         }
 
         RaiseStateChanged();
