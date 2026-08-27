@@ -32,6 +32,7 @@ public sealed class PlayerViewModelTests
         public FakeNavigator Navigator { get; } = new();
         public FakeCastingService Casting { get; } = new();
         public FakeMediaFileResolver Resolver { get; } = new();
+        public FakeAppSettingsRepository AppSettings { get; }
         public PlayerViewModel ViewModel { get; }
 
         public Fixture(double skipIntroSec = 85.0)
@@ -40,6 +41,11 @@ public sealed class PlayerViewModelTests
             // events through it. Clearing it makes RunOnUi execute inline so
             // assertions observe the updated bindables synchronously.
             SynchronizationContext.SetSynchronizationContext(null);
+
+            AppSettings = new FakeAppSettingsRepository(new Dictionary<string, string>
+            {
+                [AppSettingsModel.DefaultSkipIntroSecKey] = skipIntroSec.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            });
 
             MediaItems.Add(new MediaItem
             {
@@ -66,7 +72,8 @@ public sealed class PlayerViewModelTests
             };
 
             ViewModel = new PlayerViewModel(
-                Engine, Episodes, MediaItems, WatchStates, WatchStateService, Dialogs, Navigator, Casting, Resolver);
+                Engine, Episodes, MediaItems, WatchStates, WatchStateService, Dialogs, Navigator, Casting, Resolver,
+                appSettings: AppSettings);
         }
 
         public void SetWatchState(double progressPct, double lastPositionSec, bool watched = false)
@@ -100,7 +107,7 @@ public sealed class PlayerViewModelTests
     }
 
     [Fact]
-    public async Task SkipIntro_UsesMediaItemSkipIntroSecOverride()
+    public async Task SkipIntro_UsesAppSettingSkipIntroSec()
     {
         var f = new Fixture(skipIntroSec: 120.0);
         await f.ViewModel.OpenAsync(EpisodeId);
@@ -110,14 +117,50 @@ public sealed class PlayerViewModelTests
     }
 
     [Fact]
-    public async Task SkipIntro_DefaultsTo85SecondsWhenNoOverride()
+    public async Task SkipIntro_DefaultsTo85SecondsWhenNoSetting()
     {
+        // Fixture seeds 85.0 by default; verify the tooltip matches.
         var f = new Fixture();
-        f.MediaItems.GetAll().First().SkipIntroSec = 85.0;
         await f.ViewModel.OpenAsync(EpisodeId);
 
         f.ViewModel.SkipIntroSec.Should().Be(PlayerViewModel.DefaultSkipIntroSec);
         f.ViewModel.SkipIntroTooltip.Should().Be("Pular +1:25");
+    }
+
+    [Fact]
+    public async Task SkipIntro_FallsBackToConstantWhenSettingMissing()
+    {
+        // No setting seeded — should fall back to DefaultSkipIntroSec (85.0).
+        SynchronizationContext.SetSynchronizationContext(null);
+        var appSettings = new FakeAppSettingsRepository(); // empty — no key
+        var engine = new FakePlaybackEngine();
+        var episodes = new FakeEpisodeRepository();
+        var mediaItems = new FakeMediaItemRepository();
+        mediaItems.Add(new MediaItem { Id = MediaItemId, Title = "Serie" });
+        episodes.Add(new Episode
+        {
+            Id = EpisodeId,
+            MediaItemId = MediaItemId,
+            FileName = "s01e01.mkv",
+            FilePath = @"C:\media\s01e01.mkv",
+            DisplayTitle = "Piloto",
+        });
+        var resolver = new FakeMediaFileResolver();
+        resolver.Handler = (id, _) =>
+        {
+            var ep = episodes.GetById(id);
+            return new ResolvedMedia(ep?.FilePath ?? string.Empty, false, null, "📄 Original");
+        };
+
+        var vm = new PlayerViewModel(
+            engine, episodes, mediaItems,
+            new FakeWatchStateRepository(), new FakeWatchStateService(),
+            new FakeDialogService(), new FakeNavigator(), new FakeCastingService(),
+            resolver, appSettings: appSettings);
+
+        await vm.OpenAsync(EpisodeId);
+
+        vm.SkipIntroSec.Should().Be(PlayerViewModel.DefaultSkipIntroSec);
     }
 
     [Fact]

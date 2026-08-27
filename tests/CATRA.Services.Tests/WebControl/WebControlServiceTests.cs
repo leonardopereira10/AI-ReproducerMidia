@@ -266,8 +266,9 @@ public sealed class WebControlServiceTests : IDisposable
     [Fact]
     public async Task HandleCommand_SkipIntro_SeeksToPositionPlusSkipSec()
     {
-        // Arrange — position 50s, duration 1000s, media-item skip 100s ⇒ target 150s.
-        LoadEpisode(11, MediaItem(7, skipIntroSec: 100));
+        // Arrange — position 50s, duration 1000s, setting skip 100s ⇒ target 150s.
+        _appSettings.Set(AppSettingsModel.DefaultSkipIntroSecKey, "100");
+        LoadEpisode(11, MediaItem(7));
         _casting.RaisePositionChanged(TimeSpan.FromSeconds(50));
 
         // Act
@@ -281,7 +282,8 @@ public sealed class WebControlServiceTests : IDisposable
     public async Task HandleCommand_SkipIntro_TooCloseToEnd_DoesNotSeek()
     {
         // Arrange — 940 + 100 > 1000 - 30 (end guard).
-        LoadEpisode(11, MediaItem(7, skipIntroSec: 100));
+        _appSettings.Set(AppSettingsModel.DefaultSkipIntroSecKey, "100");
+        LoadEpisode(11, MediaItem(7));
         _casting.RaisePositionChanged(TimeSpan.FromSeconds(940));
 
         // Act

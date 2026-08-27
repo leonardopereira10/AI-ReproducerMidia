@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Globalization;
 using CATRA.Core.Enums;
 using CATRA.Core.Interfaces;
 using CATRA.Core.Models;
@@ -59,6 +60,7 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
     private readonly ICastingService _casting;
     private readonly IMediaFileResolver _mediaFileResolver;
     private readonly IWebControlService? _webControlService;
+    private readonly IAppSettingsRepository? _appSettings;
     private readonly SynchronizationContext? _uiContext;
 
     private Episode? _episode;
@@ -85,7 +87,8 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
         IAppNavigator navigator,
         ICastingService casting,
         IMediaFileResolver mediaFileResolver,
-        IWebControlService? webControlService = null)
+        IWebControlService? webControlService = null,
+        IAppSettingsRepository? appSettings = null)
     {
         _engine = engine ?? throw new ArgumentNullException(nameof(engine));
         _episodes = episodes ?? throw new ArgumentNullException(nameof(episodes));
@@ -97,6 +100,7 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
         _casting = casting ?? throw new ArgumentNullException(nameof(casting));
         _mediaFileResolver = mediaFileResolver ?? throw new ArgumentNullException(nameof(mediaFileResolver));
         _webControlService = webControlService;
+        _appSettings = appSettings;
 
         _uiContext = SynchronizationContext.Current;
 
@@ -276,7 +280,7 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
 
         _episode = episode;
         _filePath = resolved.FilePath;
-        _skipIntroSec = mediaItem?.SkipIntroSec ?? DefaultSkipIntroSec;
+        _skipIntroSec = GetDefaultSkipIntroSec();
         SkipIntroTooltip = $"Pular +{TimeSpanToStringConverter.Format(TimeSpan.FromSeconds(_skipIntroSec))}";
         Title = string.IsNullOrWhiteSpace(episode.DisplayTitle) ? episode.FileName : episode.DisplayTitle;
         ErrorMessage = null;
@@ -350,6 +354,21 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
 
         return position + TimeSpan.FromSeconds(skipIntroSec)
             <= duration - TimeSpan.FromSeconds(SkipIntroEndGuardSec);
+    }
+
+    /// <summary>
+    /// Reads the default skip-intro seconds from <see cref="IAppSettingsRepository"/>,
+    /// falling back to <see cref="DefaultSkipIntroSec"/> (85s).
+    /// </summary>
+    private double GetDefaultSkipIntroSec()
+    {
+        var raw = _appSettings?.Get(AppSettingsModel.DefaultSkipIntroSecKey);
+        if (raw is not null && double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var val) && val > 0)
+        {
+            return val;
+        }
+
+        return DefaultSkipIntroSec;
     }
 
     /// <summary>

@@ -242,7 +242,7 @@ public sealed class WebControlService : IWebControlService, IDisposable
         {
             currentPos = _positionSec;
             duration = _durationSec;
-            skipSec = _currentMediaItem?.SkipIntroSec ?? GetDefaultSkipIntroSec();
+            skipSec = GetDefaultSkipIntroSec();
         }
 
         var posTs = TimeSpan.FromSeconds(currentPos);
@@ -374,7 +374,7 @@ public sealed class WebControlService : IWebControlService, IDisposable
                 : _currentEpisode.DisplayTitle)
             : string.Empty;
 
-        var skipSec = _currentMediaItem?.SkipIntroSec ?? GetDefaultSkipIntroSec();
+        var skipSec = GetDefaultSkipIntroSec();
         var canSkip = CanSkipIntroAt(
             TimeSpan.FromSeconds(_positionSec),
             TimeSpan.FromSeconds(_durationSec),
