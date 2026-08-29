@@ -39,6 +39,7 @@ function escapeHtml(str) {
 
 const views = {
   home: document.getElementById('view-home'),
+  category: document.getElementById('view-category'),
   detail: document.getElementById('view-detail'),
   player: document.getElementById('view-player'),
 };
@@ -69,6 +70,9 @@ class Router {
     if (parts.length === 0 || parts[0] === 'home') {
       showView('home');
       this.app.loadHome();
+    } else if (parts[0] === 'category' && parts[1]) {
+      showView('category');
+      this.app.loadCategory(parseInt(parts[1], 10));
     } else if (parts[0] === 'item' && parts[1]) {
       showView('detail');
       this.app.loadDetail(parseInt(parts[1], 10));
@@ -99,13 +103,18 @@ const dom = {
   searchResults: document.getElementById('search-results'),
   searchList: document.getElementById('search-list'),
 
-  // Detail
-  btnBackHome: document.getElementById('btn-back-home'),
+  // Category
+  btnBackCategory: document.getElementById('btn-back-category'),
+  categoryTitle: document.getElementById('category-title'),
+  categoryItems: document.getElementById('category-items'),
+
+  // Detail (episodes list)
+  btnBackEpisodes: document.getElementById('btn-back-episodes'),
   detailTitle: document.getElementById('detail-title'),
   episodeList: document.getElementById('episode-list'),
 
   // Player
-  btnBackDetail: document.getElementById('btn-back-detail'),
+  btnBackPlayer: document.getElementById('btn-back-detail'),
   playerTitle: document.getElementById('player-title'),
   profileSelect: document.getElementById('profile-select'),
   videoPlayer: document.getElementById('video-player'),
@@ -141,6 +150,8 @@ class App {
     this.client = null;
     /** @type {Router|null} */
     this.router = null;
+    /** Current category ID being viewed */
+    this.currentCategoryId = null;
     /** Current item ID being viewed in detail */
     this.currentItemId = null;
     /** Current episode ID being played */
@@ -172,11 +183,22 @@ class App {
   // ── Navigation bindings ──────────────────────────────────────────────
 
   _bindNavigation() {
-    dom.btnBackHome.addEventListener('click', () => {
+    // Category view → back to home
+    dom.btnBackCategory.addEventListener('click', () => {
       location.hash = '#/';
     });
 
-    dom.btnBackDetail.addEventListener('click', () => {
+    // Detail (episodes) view → back to category or home
+    dom.btnBackEpisodes.addEventListener('click', () => {
+      if (this.currentCategoryId) {
+        location.hash = `#/category/${this.currentCategoryId}`;
+      } else {
+        location.hash = '#/';
+      }
+    });
+
+    // Player view → back to detail (episodes) or home
+    dom.btnBackPlayer.addEventListener('click', () => {
       if (this.currentItemId) {
         location.hash = `#/item/${this.currentItemId}`;
       } else {
@@ -247,7 +269,7 @@ class App {
     }
 
     dom.categoryList.innerHTML = categories.map(c => `
-      <div class="card" data-nav="#/item/${c.id}">
+      <div class="card" data-nav="#/category/${c.id}">
         <div class="card-title">${escapeHtml(c.name)}</div>
         <div class="card-subtitle">${c.itemCount} itens</div>
       </div>
@@ -286,6 +308,59 @@ class App {
   }
 
   // ── Detail: load episodes for an item ────────────────────────────────
+
+  // ── Category: load items (series/movies) for a category ──────────────
+
+  async loadCategory(categoryId) {
+    this.currentCategoryId = categoryId;
+    this.currentItemId = null; // reset item context
+    dom.categoryTitle.textContent = 'Carregando...';
+    dom.categoryItems.innerHTML = '<div class="loading-spinner">Carregando...</div>';
+
+    try {
+      // Fetch category name + items in parallel
+      const [categories, items] = await Promise.all([
+        this._fetchJson('/api/library/categories'),
+        this._fetchJson(`/api/library/categories/${categoryId}/items`)
+      ]);
+
+      const category = Array.isArray(categories) ? categories.find(c => c.id === categoryId) : null;
+      dom.categoryTitle.textContent = category?.name || `Categoria #${categoryId}`;
+
+      if (Array.isArray(items) && items.length > 0) {
+        this._renderCategoryItems(items);
+      } else {
+        dom.categoryItems.innerHTML = '<div class="empty-state">Nenhum item encontrado</div>';
+      }
+    } catch (err) {
+      console.error('Failed to load category:', err);
+      dom.categoryTitle.textContent = 'Erro';
+      dom.categoryItems.innerHTML = '<div class="empty-state">Erro ao carregar categoria</div>';
+    }
+  }
+
+  _renderCategoryItems(items) {
+    dom.categoryItems.innerHTML = items.map(item => {
+      const typeIcon = item.mediaType === 1 ? '🎬' : '📺'; // MediaType: 0=Series, 1=Movie
+      const posterHtml = item.posterUrl
+        ? `<img class="card-thumb" src="${escapeHtml(item.posterUrl)}" alt="" loading="lazy" />`
+        : '';
+      const subtitle = [item.year, item.genre].filter(Boolean).join(' · ') || (item.mediaType === 1 ? 'Filme' : 'Série');
+
+      return `
+        <div class="card" data-nav="#/item/${item.id}">
+          ${posterHtml}
+          <div class="card-type">${typeIcon}</div>
+          <div class="card-title">${escapeHtml(item.title)}</div>
+          <div class="card-subtitle">${escapeHtml(subtitle)}</div>
+        </div>
+      `;
+    }).join('');
+
+    this._bindCardNavigation(dom.categoryItems);
+  }
+
+  // ── Detail: load episodes for an item ──────────────────────────────
 
   async loadDetail(itemId) {
     this.currentItemId = itemId;
