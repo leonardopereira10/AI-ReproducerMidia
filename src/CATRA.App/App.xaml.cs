@@ -14,6 +14,7 @@ using CATRA.Services.Metadata;
 using CATRA.Services.Playback;
 using CATRA.Services.Processing;
 using CATRA.Services.Storage;
+using CATRA.Services.Streaming;
 using CATRA.Services.WebControl;
 using CATRA.UI.Navigation;
 using CATRA.UI.Services;
@@ -134,6 +135,17 @@ public partial class App : Application
                 // remote control. WebSocketHandler implements IWebControlHub.
                 services.AddSingleton<WebSocketHandler>();
                 services.AddSingleton<IWebControlHub>(sp => sp.GetRequiredService<WebSocketHandler>());
+
+                // Library API (ST-10): maps domain entities to DTOs for the web
+                // control panel REST/browse layer. Singleton — stateless read mapper
+                // over the repositories.
+                services.AddSingleton<ILibraryApiService, LibraryApiService>();
+
+                // Streaming (ST-10): registers concrete files under opaque tokens/URLs
+                // via MediaHttpServer and resolves the best stream per profile.
+                // Singleton — owns the active-token registry.
+                services.AddSingleton<IStreamService, StreamService>();
+
                 services.AddSingleton<IWebControlService, WebControlService>();
                 services.AddSingleton<IWebControlServer>(sp =>
                 {
@@ -141,7 +153,11 @@ public partial class App : Application
                     var model = AppSettingsModel.Load(settingsRepo);
                     var handler = sp.GetRequiredService<WebSocketHandler>();
                     var service = sp.GetRequiredService<IWebControlService>();
-                    return new WebControlServer(model.WebPanelPort, service, handler);
+                    var libraryApi = sp.GetRequiredService<ILibraryApiService>();
+                    var streamService = sp.GetRequiredService<IStreamService>();
+                    var episodeRepo = sp.GetRequiredService<IEpisodeRepository>();
+                    var mediaItemRepo = sp.GetRequiredService<IMediaItemRepository>();
+                    return new WebControlServer(model.WebPanelPort, service, handler, libraryApi, streamService, episodeRepo, mediaItemRepo);
                 });
 
                 // Library scanning (ST-03): parser, probe, scanner, watcher.

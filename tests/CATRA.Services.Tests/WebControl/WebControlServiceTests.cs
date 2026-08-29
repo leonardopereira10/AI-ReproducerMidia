@@ -92,7 +92,7 @@ public sealed class WebControlServiceTests : IDisposable
         // Assert
         state.Title.Should().Be("Piloto");
         state.Duration.Should().Be(300);
-        state.ThumbnailUrl.Should().Be("/thumbs/11.jpg");
+        state.ThumbnailUrl.Should().Be("/api/thumbnail/11");
     }
 
     [Fact]

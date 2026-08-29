@@ -1,6 +1,7 @@
 /* ==========================================================================
-   CATRA — Painel de Controle
-   Mobile-first dark theme (320px – 1024px)
+   CATRA — Frontend SPA
+   Mobile-first dark theme (320px – 1024px+)
+   Views: Home | Detail | Player
    ========================================================================== */
 
 /* --- CSS Custom Properties (Dark Theme) --- */
@@ -73,6 +74,11 @@ button:disabled {
   opacity: 0.4;
 }
 
+/* --- Views: show/hide --- */
+.view {
+  display: block;
+}
+
 /* --- Connection Indicator (fixed top-right) --- */
 #connection-status {
   position: fixed;
@@ -110,30 +116,330 @@ button:disabled {
   color: var(--text-secondary);
 }
 
-/* --- Video Header --- */
-#video-header {
-  text-align: center;
-  margin-bottom: var(--spacing-md);
-  padding: 0 var(--spacing-sm);
+/* ==========================================================================
+   HOME VIEW
+   ========================================================================== */
+
+.home-header {
+  margin-bottom: var(--spacing-lg);
 }
 
-#video-title {
+.app-title {
+  font-size: 1.75rem;
+  font-weight: 700;
+  color: var(--primary);
+  margin-bottom: var(--spacing-md);
+  letter-spacing: 0.05em;
+}
+
+/* --- Search Bar --- */
+.search-bar {
+  width: 100%;
+}
+
+.search-bar input[type="search"] {
+  width: 100%;
+  padding: var(--spacing-sm) var(--spacing-md);
+  min-height: var(--touch-target);
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--surface-alt);
+  border-radius: var(--border-radius);
+  font-size: 1rem;
+  font-family: inherit;
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+
+.search-bar input[type="search"]:focus {
+  border-color: var(--primary);
+}
+
+.search-bar input[type="search"]::placeholder {
+  color: var(--text-secondary);
+}
+
+/* Remove default search input styling */
+.search-bar input[type="search"]::-webkit-search-decoration,
+.search-bar input[type="search"]::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+}
+
+/* --- Home Sections --- */
+.home-section {
+  margin-bottom: var(--spacing-lg);
+}
+
+.section-title {
   font-size: 1.125rem;
   font-weight: 600;
   color: var(--text);
-  line-height: 1.3;
+  margin-bottom: var(--spacing-md);
+  padding: 0 var(--spacing-xs);
+}
+
+/* --- Card Grid --- */
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 12px;
+}
+
+.card {
+  background: var(--surface);
+  border-radius: var(--border-radius);
+  padding: 12px;
+  cursor: pointer;
+  transition: background var(--transition-fast), transform var(--transition-fast);
+  overflow: hidden;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.card:hover {
+  background: var(--surface-alt);
+}
+
+.card:active {
+  transform: scale(0.97);
+}
+
+.card-thumb {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: calc(var(--border-radius) - 4px);
+  margin-bottom: var(--spacing-sm);
+  background: var(--surface-alt);
+}
+
+.card-title {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-#video-series {
-  font-size: 0.875rem;
+.card-subtitle {
+  font-size: 0.75rem;
   color: var(--text-secondary);
-  margin-top: var(--spacing-xs);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-/* --- Thumbnail --- */
+/* Continue watching card: progress indicator */
+.card-progress {
+  width: 100%;
+  height: 3px;
+  background: var(--surface-alt);
+  border-radius: 2px;
+  margin-top: var(--spacing-xs);
+  overflow: hidden;
+}
+
+.card-progress-bar {
+  height: 100%;
+  background: var(--primary);
+  border-radius: 2px;
+  transition: width var(--transition-normal);
+}
+
+/* ==========================================================================
+   DETAIL VIEW
+   ========================================================================== */
+
+.detail-header {
+  margin-bottom: var(--spacing-lg);
+}
+
+.back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  padding: var(--spacing-sm) var(--spacing-md);
+  min-height: var(--touch-target);
+  color: var(--primary);
+  font-size: 0.9375rem;
+  font-weight: 500;
+  border-radius: var(--border-radius);
+  transition: background var(--transition-fast);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.back-btn:hover {
+  background: var(--surface);
+}
+
+.back-btn:active {
+  background: var(--surface-alt);
+}
+
+.detail-title {
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--text);
+  margin-top: var(--spacing-sm);
+  line-height: 1.3;
+}
+
+/* --- Episode Grid --- */
+.episode-grid {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+}
+
+.episode-card {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+  padding: var(--spacing-sm);
+  background: var(--surface);
+  border-radius: var(--border-radius);
+  cursor: pointer;
+  transition: background var(--transition-fast), transform var(--transition-fast);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.episode-card:hover {
+  background: var(--surface-alt);
+}
+
+.episode-card:active {
+  transform: scale(0.98);
+}
+
+.episode-thumb {
+  flex: 0 0 auto;
+  width: 120px;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: calc(var(--border-radius) - 4px);
+  background: var(--surface-alt);
+}
+
+.episode-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.episode-title {
+  font-size: 0.9375rem;
+  font-weight: 500;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.episode-duration {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  margin-top: 2px;
+  font-variant-numeric: tabular-nums;
+}
+
+.episode-profiles {
+  display: flex;
+  gap: var(--spacing-xs);
+  margin-top: var(--spacing-xs);
+  flex-wrap: wrap;
+}
+
+.profile-badge {
+  font-size: 0.625rem;
+  padding: 2px 6px;
+  background: var(--surface-alt);
+  color: var(--text-secondary);
+  border-radius: 4px;
+  text-transform: uppercase;
+  font-weight: 500;
+}
+
+.profile-badge.processed {
+  background: rgba(124, 77, 255, 0.2);
+  color: var(--primary);
+}
+
+/* ==========================================================================
+   PLAYER VIEW
+   ========================================================================== */
+
+.player-header-bar {
+  margin-bottom: var(--spacing-md);
+}
+
+.player-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-sm);
+  margin-top: var(--spacing-sm);
+}
+
+.player-title {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#profile-select {
+  flex: 0 0 auto;
+  padding: var(--spacing-xs) var(--spacing-sm);
+  min-height: 36px;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--surface-alt);
+  border-radius: var(--border-radius);
+  font-size: 0.8125rem;
+  font-family: inherit;
+  cursor: pointer;
+  outline: none;
+}
+
+#profile-select:focus {
+  border-color: var(--primary);
+}
+
+/* --- Video Container --- */
+#video-container {
+  width: 100%;
+  max-width: 640px;
+  margin: 0 auto var(--spacing-md);
+  border-radius: var(--border-radius-lg);
+  overflow: hidden;
+  background: #000;
+  aspect-ratio: 16 / 9;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+
+#video-player {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+/* When no stream, hide video container and show thumbnail instead */
+#video-container[hidden] {
+  display: none;
+}
+
+/* --- Thumbnail (fallback) --- */
 #thumbnail-container {
   width: 100%;
   max-width: 640px;
@@ -175,7 +481,6 @@ input[type="range"] {
   width: 100%;
   background: transparent;
   outline: none;
-  /* Touch-friendly: 44px total touch area */
   height: var(--touch-target);
   margin: 0;
   padding: 0;
@@ -205,7 +510,7 @@ input[type="range"]::-webkit-slider-thumb {
   border-radius: 50%;
   background: var(--primary);
   border: none;
-  margin-top: -8px; /* center on 4px track */
+  margin-top: -8px;
   cursor: pointer;
   transition: transform var(--transition-fast), box-shadow var(--transition-fast);
 }
@@ -421,7 +726,58 @@ input[type="range"]:active::-moz-range-thumb {
   white-space: nowrap;
 }
 
-/* --- Responsive: larger screens (tablet) --- */
+/* Queue cards (JS-generated clickable cards) */
+.queue-card {
+  flex: 0 0 auto;
+  min-width: 160px;
+  max-width: 220px;
+  scroll-snap-align: start;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-sm) var(--spacing-md);
+  background: var(--surface);
+  border-radius: var(--border-radius);
+  cursor: pointer;
+  transition: background var(--transition-fast), transform var(--transition-fast);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.queue-card:hover {
+  background: var(--surface-alt);
+}
+
+.queue-card:active {
+  transform: scale(0.97);
+}
+
+.queue-card--current {
+  border-left: 3px solid var(--primary);
+}
+
+.queue-card__title {
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.queue-card__duration {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ==========================================================================
+   RESPONSIVE: larger screens (tablet)
+   ========================================================================== */
 @media (min-width: 600px) {
   body {
     max-width: 600px;
@@ -430,8 +786,17 @@ input[type="range"]:active::-moz-range-thumb {
     padding-top: var(--spacing-xl);
   }
 
-  #video-title {
-    font-size: 1.375rem;
+  .app-title {
+    font-size: 2rem;
+  }
+
+  .card-grid {
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 16px;
+  }
+
+  .player-title {
+    font-size: 1.25rem;
     white-space: normal;
   }
 
@@ -452,16 +817,49 @@ input[type="range"]:active::-moz-range-thumb {
   #queue-list .queue-item {
     width: 180px;
   }
+
+  .episode-thumb {
+    width: 160px;
+  }
 }
 
-/* --- Responsive: desktop-ish (1024px) --- */
+/* ==========================================================================
+   RESPONSIVE: desktop-ish (1024px)
+   ========================================================================== */
 @media (min-width: 1024px) {
   body {
     max-width: 720px;
   }
+
+  .card-grid {
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  }
 }
 
-/* --- Accessibility: focus-visible outlines --- */
+/* ==========================================================================
+   LOADING STATE
+   ========================================================================== */
+
+.loading-spinner {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: var(--spacing-xl);
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+}
+
+.empty-state {
+  text-align: center;
+  padding: var(--spacing-xl);
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+}
+
+/* ==========================================================================
+   ACCESSIBILITY
+   ========================================================================== */
+
 :focus-visible {
   outline: 2px solid var(--primary);
   outline-offset: 2px;

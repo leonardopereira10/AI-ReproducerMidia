@@ -89,9 +89,15 @@ public sealed class AudioMuxer : IAudioMuxer
             // source (stream 1); copy the H.265 video untouched, copy/re-encode the
             // audio as decided above. -f hevc + -framerate pin the input rate so the
             // MP4 muxer assigns correct PTS/DTS (the raw demuxer sets none itself).
+            // -movflags +faststart moves the moov atom to the beginning of the file
+            // so playback can start before the download completes (MP4 only).
+            string movflags = finalOutputPath.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase)
+                ? " -movflags +faststart"
+                : string.Empty;
+
             string arguments =
                 $"-y -f hevc -framerate {rate} -i \"{correctedVideoPath}\" -i \"{sourcePath}\" " +
-                $"-map 0:v:0 -map 1:a:0 -c:v copy {audioCodec} \"{finalOutputPath}\"";
+                $"-map 0:v:0 -map 1:a:0 -c:v copy {audioCodec}{movflags} \"{finalOutputPath}\"";
 
             Run(_ffmpegPath, arguments, "audio mux");
 

@@ -25,6 +25,9 @@ public sealed class WebControlService : IWebControlService, IDisposable
     private readonly IMediaItemRepository _mediaItems;
     private readonly IAppSettingsRepository _appSettings;
     private readonly IThumbnailService _thumbnails;
+    private readonly IStreamService? _streamService;
+    private readonly ILibraryApiService? _libraryApiService;
+    private readonly IWatchStateRepository? _watchStates;
 
     // ── Lock ──────────────────────────────────────────────────
     private readonly object _lock = new();
@@ -40,6 +43,13 @@ public sealed class WebControlService : IWebControlService, IDisposable
     private bool _isPaused;
     private bool _disposed;
 
+    // ── Browser-mode state (guarded by _lock) ────────────────
+    private string? _playerClientId;
+    private string? _currentStreamUrl;
+    private string _activeProfile = "original";
+    private string _mode = "idle"; // "browser" | "dlna" | "idle"
+    private string? _currentStreamToken;
+
     // ── Constants (mirror PlayerViewModel) ────────────────────
     private const double DefaultSkipIntroSec = 85.0;
     private const double SkipIntroEndGuardSec = 30.0;
@@ -53,7 +63,10 @@ public sealed class WebControlService : IWebControlService, IDisposable
         IEpisodeRepository episodes,
         IMediaItemRepository mediaItems,
         IAppSettingsRepository appSettings,
-        IThumbnailService thumbnails)
+        IThumbnailService thumbnails,
+        IStreamService? streamService = null,
+        ILibraryApiService? libraryApiService = null,
+        IWatchStateRepository? watchStates = null)
     {
         _casting = casting ?? throw new ArgumentNullException(nameof(casting));
         _slidingWindow = slidingWindow ?? throw new ArgumentNullException(nameof(slidingWindow));
@@ -61,6 +74,9 @@ public sealed class WebControlService : IWebControlService, IDisposable
         _mediaItems = mediaItems ?? throw new ArgumentNullException(nameof(mediaItems));
         _appSettings = appSettings ?? throw new ArgumentNullException(nameof(appSettings));
         _thumbnails = thumbnails ?? throw new ArgumentNullException(nameof(thumbnails));
+        _streamService = streamService;
+        _libraryApiService = libraryApiService;
+        _watchStates = watchStates;
 
         // Subscribe to casting events (may fire on background threads).
         _casting.StateChanged += OnCastingStateChanged;
@@ -89,7 +105,7 @@ public sealed class WebControlService : IWebControlService, IDisposable
         switch (command.Type)
         {
             case "play":
-                await _casting.PlayAsync().ConfigureAwait(false);
+                await DispatchTransportCommandAsync(command).ConfigureAwait(false);
                 lock (_lock)
                 {
                     _isPlaying = true;
@@ -99,7 +115,7 @@ public sealed class WebControlService : IWebControlService, IDisposable
                 break;
 
             case "pause":
-                await _casting.PauseAsync().ConfigureAwait(false);
+                await DispatchTransportCommandAsync(command).ConfigureAwait(false);
                 lock (_lock)
                 {
                     _isPaused = true;
@@ -108,12 +124,12 @@ public sealed class WebControlService : IWebControlService, IDisposable
                 break;
 
             case "seek" when command.Position.HasValue:
-                await _casting.SeekAsync(TimeSpan.FromSeconds(command.Position.Value)).ConfigureAwait(false);
+                await DispatchTransportCommandAsync(command).ConfigureAwait(false);
                 break;
 
             case "volume" when command.Level.HasValue:
                 var clampedLevel = Math.Clamp(command.Level.Value, 0, 100);
-                await _casting.SetVolumeAsync(clampedLevel).ConfigureAwait(false);
+                await DispatchTransportCommandAsync(command).ConfigureAwait(false);
                 lock (_lock)
                 {
                     _volume = clampedLevel;
@@ -131,6 +147,41 @@ public sealed class WebControlService : IWebControlService, IDisposable
             case "previousEpisode":
                 await HandleEpisodeNavigationAsync(forward: false).ConfigureAwait(false);
                 break;
+
+            // ── Browser-mode commands ───────────────────────────
+
+            case "playEpisode":
+                await HandlePlayEpisodeAsync(command).ConfigureAwait(false);
+                break;
+
+            case "switchProfile":
+                await HandleSwitchProfileAsync(command).ConfigureAwait(false);
+                break;
+
+            case "reportProgress":
+                HandleReportProgress(command);
+                break;
+
+            case "ended":
+                await HandleEndedAsync().ConfigureAwait(false);
+                break;
+
+            case "ready":
+                HandleReady(command);
+                break;
+
+            case "browse":
+                await HandleBrowseAsync(command).ConfigureAwait(false);
+                break;
+
+            case "castTo":
+                await HandleCastToAsync(command).ConfigureAwait(false);
+                break;
+
+            case "stopCast":
+            case "stopCasting":
+                await HandleStopCastAsync().ConfigureAwait(false);
+                break;
         }
     }
 
@@ -143,6 +194,27 @@ public sealed class WebControlService : IWebControlService, IDisposable
 
     /// <inheritdoc />
     public event EventHandler<(double Position, double Duration)>? PositionChanged;
+
+    /// <inheritdoc />
+    public event EventHandler<WebControlCommand>? CommandForPlayer;
+
+    /// <inheritdoc />
+    public event EventHandler<(string Target, object Data)>? LibraryDataReady;
+
+    /// <inheritdoc />
+    public string? PlayerClientId
+    {
+        get { lock (_lock) { return _playerClientId; } }
+    }
+
+    /// <inheritdoc />
+    public void SetPlayerClient(string? clientId)
+    {
+        lock (_lock)
+        {
+            _playerClientId = clientId;
+        }
+    }
 
     // ════════════════════════════════════════════════════════════
     //  SetCurrentEpisode — called by PlayerViewModel
@@ -359,6 +431,340 @@ public sealed class WebControlService : IWebControlService, IDisposable
     }
 
     // ════════════════════════════════════════════════════════════
+    //  Browser-mode command handlers
+    // ════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Handles <c>playEpisode</c>: resolves the stream for the requested episode
+    /// and profile, switches to browser mode, and raises state changed.
+    /// If currently in DLNA mode, stops casting first.
+    /// </summary>
+    private async Task HandlePlayEpisodeAsync(WebControlCommand command)
+    {
+        if (_streamService is null || command.EpisodeId is null)
+        {
+            return;
+        }
+
+        var profile = command.Profile ?? "original";
+        var resolution = _streamService.ResolveEpisode(command.EpisodeId.Value, profile);
+        if (resolution is null)
+        {
+            return; // profile not available
+        }
+
+        // Stop DLNA casting if active.
+        string prevMode;
+        lock (_lock)
+        {
+            prevMode = _mode;
+        }
+
+        if (prevMode == "dlna")
+        {
+            await _casting.StopCastingAsync().ConfigureAwait(false);
+        }
+
+        // Unregister previous stream token if any.
+        string? oldToken;
+        lock (_lock)
+        {
+            oldToken = _currentStreamToken;
+        }
+
+        if (oldToken is not null)
+        {
+            _streamService.Unregister(oldToken);
+        }
+
+        // Load episode and media item.
+        var episode = _episodes.GetById(command.EpisodeId.Value);
+        MediaItem? mediaItem = null;
+        if (episode is not null)
+        {
+            mediaItem = _mediaItems.GetById(episode.MediaItemId);
+        }
+
+        lock (_lock)
+        {
+            _playerClientId = null; // will be set by WebSocket handler via SetPlayerClient
+            _mode = "browser";
+            _currentStreamUrl = resolution.StreamUrl;
+            _activeProfile = resolution.Profile;
+            _currentStreamToken = resolution.StreamUrl; // token is the URL itself
+            _currentEpisodeId = command.EpisodeId.Value;
+            _currentEpisode = episode;
+            _currentMediaItem = mediaItem;
+            _positionSec = 0;
+            _durationSec = episode?.DurationSec ?? 0;
+            _isPlaying = true;
+            _isPaused = false;
+        }
+
+        RaiseStateChanged();
+    }
+
+    /// <summary>
+    /// Handles <c>switchProfile</c>: resolves the same episode under a different
+    /// profile and updates the stream URL. The player client receives the new
+    /// URL and seeks to the current position.
+    /// </summary>
+    private Task HandleSwitchProfileAsync(WebControlCommand command)
+    {
+        if (_streamService is null || command.Profile is null)
+        {
+            return Task.CompletedTask;
+        }
+
+        string currentMode;
+        int episodeId;
+
+        lock (_lock)
+        {
+            currentMode = _mode;
+            episodeId = _currentEpisodeId;
+        }
+
+        if (currentMode != "browser" || episodeId == 0)
+        {
+            return Task.CompletedTask;
+        }
+
+        var resolution = _streamService.ResolveEpisode(episodeId, command.Profile);
+        if (resolution is null)
+        {
+            return Task.CompletedTask;
+        }
+
+        // Unregister old token.
+        string? oldToken;
+        lock (_lock)
+        {
+            oldToken = _currentStreamToken;
+        }
+
+        if (oldToken is not null)
+        {
+            _streamService.Unregister(oldToken);
+        }
+
+        lock (_lock)
+        {
+            _currentStreamUrl = resolution.StreamUrl;
+            _activeProfile = resolution.Profile;
+            _currentStreamToken = resolution.StreamUrl;
+            // Preserve _positionSec so the player client can seek to it.
+        }
+
+        RaiseStateChanged();
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Handles <c>reportProgress</c>: updates position and persists WatchState.
+    /// </summary>
+    private void HandleReportProgress(WebControlCommand command)
+    {
+        if (!command.Position.HasValue)
+        {
+            return;
+        }
+
+        int episodeId;
+        double duration;
+
+        lock (_lock)
+        {
+            _positionSec = command.Position.Value;
+            episodeId = _currentEpisodeId;
+            duration = _durationSec;
+        }
+
+        PositionChanged?.Invoke(this, (command.Position.Value, duration));
+
+        // Persist WatchState.
+        PersistWatchState(episodeId, command.Position.Value, duration, ended: false);
+    }
+
+    /// <summary>
+    /// Handles <c>ended</c>: marks playback as stopped, persists WatchState at 100%.
+    /// </summary>
+    private Task HandleEndedAsync()
+    {
+        int episodeId;
+        double duration;
+
+        lock (_lock)
+        {
+            _isPlaying = false;
+            _isPaused = false;
+            episodeId = _currentEpisodeId;
+            duration = _durationSec;
+        }
+
+        PersistWatchState(episodeId, duration, duration, ended: true);
+
+        RaiseStateChanged();
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Handles <c>ready</c>: the player client reports its duration via the Position field.
+    /// </summary>
+    private void HandleReady(WebControlCommand command)
+    {
+        if (command.Position.HasValue && command.Position.Value > 0)
+        {
+            lock (_lock)
+            {
+                _durationSec = command.Position.Value;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Handles <c>browse</c>: delegates to <see cref="ILibraryApiService"/> based
+    /// on <see cref="WebControlCommand.Target"/> and raises <see cref="LibraryDataReady"/>.
+    /// </summary>
+    private async Task HandleBrowseAsync(WebControlCommand command)
+    {
+        if (_libraryApiService is null || command.Target is null)
+        {
+            return;
+        }
+
+        object? data = command.Target switch
+        {
+            "categories" => await _libraryApiService.GetCategoriesAsync().ConfigureAwait(false),
+            "items" when command.CategoryId.HasValue
+                => await _libraryApiService.GetItemsByCategoryAsync(command.CategoryId.Value).ConfigureAwait(false),
+            "episodes" when command.ItemId.HasValue
+                => await _libraryApiService.GetEpisodesByItemAsync(command.ItemId.Value).ConfigureAwait(false),
+            "search" when !string.IsNullOrWhiteSpace(command.Profile)
+                => await _libraryApiService.SearchAsync(command.Profile).ConfigureAwait(false),
+            "continueWatching"
+                => await _libraryApiService.GetContinueWatchingAsync().ConfigureAwait(false),
+            _ => null
+        };
+
+        if (data is not null)
+        {
+            LibraryDataReady?.Invoke(this, (command.Target, data));
+        }
+    }
+
+    /// <summary>
+    /// Handles <c>castTo</c>: switches from browser mode to DLNA mode.
+    /// Clears browser state, discovers devices, and starts casting.
+    /// </summary>
+    private async Task HandleCastToAsync(WebControlCommand command)
+    {
+        if (command.DeviceUdn is null)
+        {
+            return;
+        }
+
+        // Clear browser state if switching from browser mode.
+        string prevMode;
+        string? oldToken;
+
+        lock (_lock)
+        {
+            prevMode = _mode;
+            oldToken = _currentStreamToken;
+        }
+
+        if (prevMode == "browser")
+        {
+            if (oldToken is not null && _streamService is not null)
+            {
+                _streamService.Unregister(oldToken);
+            }
+
+            lock (_lock)
+            {
+                _playerClientId = null;
+                _currentStreamUrl = null;
+                _currentStreamToken = null;
+            }
+        }
+
+        lock (_lock)
+        {
+            _mode = "dlna";
+        }
+
+        // Discover and find the target device.
+        var devices = await _casting.DiscoverDevicesAsync().ConfigureAwait(false);
+        var device = devices.FirstOrDefault(d =>
+            string.Equals(d.Udn, command.DeviceUdn, StringComparison.OrdinalIgnoreCase));
+
+        if (device is not null && _currentEpisodeId != 0)
+        {
+            await StartCastingForCurrentEpisodeAsync(device).ConfigureAwait(false);
+        }
+
+        RaiseStateChanged();
+    }
+
+    /// <summary>
+    /// Handles <c>stopCast</c> / <c>stopCasting</c>: stops DLNA casting and
+    /// transitions to idle mode.
+    /// </summary>
+    private async Task HandleStopCastAsync()
+    {
+        await _casting.StopCastingAsync().ConfigureAwait(false);
+
+        lock (_lock)
+        {
+            _mode = "idle";
+            _isPlaying = false;
+            _isPaused = false;
+        }
+
+        RaiseStateChanged();
+    }
+
+    /// <summary>
+    /// Persists a <see cref="WatchState"/> for the given episode.
+    /// No-op when <see cref="IWatchStateRepository"/> is not available or episode id is 0.
+    /// </summary>
+    private void PersistWatchState(int episodeId, double positionSec, double durationSec, bool ended)
+    {
+        if (_watchStates is null || episodeId == 0)
+        {
+            return;
+        }
+
+        var pct = durationSec > 0 ? Math.Min(100, (positionSec / durationSec) * 100) : 0;
+        if (ended)
+        {
+            pct = 100;
+        }
+
+        var existing = _watchStates.GetByEpisodeId(episodeId);
+        if (existing is not null)
+        {
+            existing.LastPositionSec = positionSec;
+            existing.ProgressPct = pct;
+            existing.Watched = ended || pct >= 95;
+            existing.UpdatedAt = DateTime.UtcNow;
+            _watchStates.Update(existing);
+        }
+        else
+        {
+            _watchStates.Insert(new WatchState
+            {
+                EpisodeId = episodeId,
+                LastPositionSec = positionSec,
+                ProgressPct = pct,
+                Watched = ended || pct >= 95,
+                UpdatedAt = DateTime.UtcNow
+            });
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════
     //  State snapshot builder
     // ════════════════════════════════════════════════════════════
 
@@ -388,6 +794,11 @@ public sealed class WebControlService : IWebControlService, IDisposable
         // Build queue from sliding window.
         var queue = BuildQueue();
 
+        var seriesTitle = _currentMediaItem?.Title;
+        var availableProfiles = _currentEpisodeId != 0 && _streamService is not null
+            ? _streamService.GetAvailableProfiles(_currentEpisodeId)
+            : null;
+
         return new WebControlState(
             IsPlaying: _isPlaying,
             IsPaused: _isPaused,
@@ -401,8 +812,14 @@ public sealed class WebControlService : IWebControlService, IDisposable
             HasNextEpisode: hasNext,
             HasPreviousEpisode: hasPrev,
             CastDeviceName: castDeviceName,
-            ProfileLabel: _slidingWindow.ActiveProfile?.ToString(),
-            Queue: queue);
+            ProfileLabel: _mode == "browser" ? _activeProfile : _slidingWindow.ActiveProfile?.ToString(),
+            Queue: queue,
+            Mode: _mode,
+            StreamUrl: _currentStreamUrl,
+            SeriesTitle: seriesTitle,
+            AvailableProfiles: availableProfiles,
+            AvailableDevices: null, // populated on demand via discover command
+            IsPlayerClient: false); // set by WebSocketHandler per-connection
     }
 
     /// <summary>
@@ -443,17 +860,65 @@ public sealed class WebControlService : IWebControlService, IDisposable
 
     /// <summary>
     /// Resolves thumbnail URL for the current episode.
-    /// Uses <see cref="Episode.ThumbnailPath"/> when available.
+    /// Returns a relative API URL (<c>/api/thumbnail/{id}</c>) that the
+    /// <see cref="WebControlServer"/> serves as image content.
     /// Must be called while holding <see cref="_lock"/>.
     /// </summary>
     private string? ResolveThumbnailUrl()
     {
-        if (_currentEpisode?.ThumbnailPath is { } path && !string.IsNullOrEmpty(path))
+        if (_currentEpisode is not null
+            && _currentEpisode.Id > 0
+            && !string.IsNullOrEmpty(_currentEpisode.ThumbnailPath))
         {
-            return path;
+            return $"/api/thumbnail/{_currentEpisode.Id}";
         }
 
         return null;
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Transport dispatch (DLNA vs browser)
+    // ════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Dispatches a transport command (play/pause/seek/volume) to either the
+    /// DLNA casting service or the browser player client, depending on the
+    /// current mode. In browser mode, raises <see cref="CommandForPlayer"/>
+    /// so the WebSocket handler can relay the command to the player client.
+    /// In DLNA mode, calls the corresponding <see cref="ICastingService"/> method.
+    /// </summary>
+    private async Task DispatchTransportCommandAsync(WebControlCommand command)
+    {
+        string mode;
+        lock (_lock)
+        {
+            mode = _mode;
+        }
+
+        if (mode == "browser")
+        {
+            // Relay to player client via event.
+            CommandForPlayer?.Invoke(this, command);
+            return;
+        }
+
+        // DLNA path.
+        switch (command.Type)
+        {
+            case "play":
+                await _casting.PlayAsync().ConfigureAwait(false);
+                break;
+            case "pause":
+                await _casting.PauseAsync().ConfigureAwait(false);
+                break;
+            case "seek" when command.Position.HasValue:
+                await _casting.SeekAsync(TimeSpan.FromSeconds(command.Position.Value)).ConfigureAwait(false);
+                break;
+            case "volume" when command.Level.HasValue:
+                var clamped = Math.Clamp(command.Level.Value, 0, 100);
+                await _casting.SetVolumeAsync(clamped).ConfigureAwait(false);
+                break;
+        }
     }
 
     // ════════════════════════════════════════════════════════════
@@ -502,5 +967,18 @@ public sealed class WebControlService : IWebControlService, IDisposable
         _casting.StateChanged -= OnCastingStateChanged;
         _casting.PositionChanged -= OnCastingPositionChanged;
         _casting.MediaEnded -= OnCastingMediaEnded;
+
+        // Unregister active stream token.
+        string? token;
+        lock (_lock)
+        {
+            token = _currentStreamToken;
+            _currentStreamToken = null;
+        }
+
+        if (token is not null && _streamService is not null)
+        {
+            _streamService.Unregister(token);
+        }
     }
 }

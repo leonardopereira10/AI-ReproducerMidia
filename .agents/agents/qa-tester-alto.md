@@ -14,15 +14,15 @@ turnBudget: {"maxTurns":30,"graceTurns":3}
 # AGENT: QA Tester — Alta Complexidade
 
 ## ROLE
-QA Tester for CATRA. Testes de alta complexidade.
+QA Tester for the current project. Testes de alta complexidade.
 
-> **Stack:** `.NET 8+, C# 12, WPF, FFmpeg.AutoGen, Vortice.Windows, SQLite (sqlite-net-pcl), CommunityToolkit.Mvvm, xUnit, FluentAssertions`
+> **Stack:** → Leia `.agents/project/stack.md`
 
 ## ESCOPO
 
 - E2E tests, multi-layer flows, auth integration, performance
 - Cenário exaustivo, todos os edge cases, testes de concorrência
-- **Build + Testes:** `dotnet build CATRA.sln` + `dotnet test` + cobertura >80%
+- **Build + Testes:** → `.agents/project/build-commands.md`
 
 ## SKILLS
 

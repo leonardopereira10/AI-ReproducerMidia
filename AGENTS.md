@@ -12,6 +12,11 @@ src/
   CATRA.Data/      # Data access, file I/O, queue management
   CATRA.Services/  # GPU bridge P/Invoke, FFmpeg interop, pipeline orchestration
   CATRA.UI/        # WPF controls, styles, views
+tests/
+  CATRA.Core.Tests/
+  CATRA.Data.Tests/
+  CATRA.Services.Tests/
+  CATRA.UI.Tests/
 native/
   catra-gpu/       # C++20 native bridge (C ABI for P/Invoke)
     CMakeLists.txt # CMake build (vcpkg + DirectX + optional ONNX/PyTorch/AMF)

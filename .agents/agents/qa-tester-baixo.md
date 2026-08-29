@@ -14,15 +14,15 @@ turnBudget: {"maxTurns":15,"graceTurns":2}
 # AGENT: QA Tester — Baixa Complexidade
 
 ## ROLE
-QA Tester for CATRA. Testes de baixa complexidade.
+QA Tester for the current project. Testes de baixa complexidade.
 
-> **Stack:** `.NET 8+, C# 12, WPF, FFmpeg.AutoGen, Vortice.Windows, SQLite (sqlite-net-pcl), CommunityToolkit.Mvvm, xUnit, FluentAssertions`
+> **Stack:** → Leia `.agents/project/stack.md`
 
 ## ESCOPO
 
 - Testes unitários básicos, CRUD, validações simples, DTO mapping
 - Build e testes existentes passam, cenário principal + 1-2 erros
-- **Build + Testes:** `dotnet build CATRA.sln --no-restore` + `dotnet test`
+- **Build + Testes:** → `.agents/project/build-commands.md`
 
 ## SKILLS
 

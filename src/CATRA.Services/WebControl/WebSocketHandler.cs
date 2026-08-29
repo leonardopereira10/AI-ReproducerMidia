@@ -34,6 +34,13 @@ public sealed class WebSocketHandler : IWebControlHub, IAsyncDisposable
     private int _connectionIdCounter;
 
     /// <summary>
+    /// Connection id of the client that issued the most recent <c>browse</c> command.
+    /// Used to route the asynchronous <see cref="IWebControlService.LibraryDataReady"/>
+    /// response back to the correct connection. Cleared after the response is sent.
+    /// </summary>
+    private string? _pendingBrowseConnectionId;
+
+    /// <summary>
     /// Creates a new handler wired to the given <see cref="IWebControlService"/>.
     /// Subscribes to <see cref="IWebControlService.StateChanged"/> and
     /// <see cref="IWebControlService.PositionChanged"/> for push updates.
@@ -43,6 +50,8 @@ public sealed class WebSocketHandler : IWebControlHub, IAsyncDisposable
         _service = service ?? throw new ArgumentNullException(nameof(service));
         _service.StateChanged += OnStateChanged;
         _service.PositionChanged += OnPositionChanged;
+        _service.CommandForPlayer += OnCommandForPlayer;
+        _service.LibraryDataReady += OnLibraryDataReady;
     }
 
     /// <summary>
@@ -101,7 +110,7 @@ public sealed class WebSocketHandler : IWebControlHub, IAsyncDisposable
                 if (result.MessageType == WebSocketMessageType.Text)
                 {
                     var message = System.Text.Encoding.UTF8.GetString(buffer, 0, result.Count);
-                    await HandleIncomingMessageAsync(message).ConfigureAwait(false);
+                    await HandleIncomingMessageAsync(message, connectionId).ConfigureAwait(false);
                 }
             }
         }
@@ -117,6 +126,18 @@ public sealed class WebSocketHandler : IWebControlHub, IAsyncDisposable
         {
             _connections.TryRemove(connectionId, out _);
             connection.Dispose();
+
+            // Clear player client registration when the player disconnects
+            if (_service.PlayerClientId == connectionId)
+            {
+                _service.SetPlayerClient(null);
+            }
+
+            // Clear pending browse if this connection was waiting for a library response
+            if (_pendingBrowseConnectionId == connectionId)
+            {
+                _pendingBrowseConnectionId = null;
+            }
 
             // Stop position timer if no connections remain
             if (_connections.IsEmpty)
@@ -153,6 +174,31 @@ public sealed class WebSocketHandler : IWebControlHub, IAsyncDisposable
         await BroadcastAsync(message).ConfigureAwait(false);
     }
 
+    /// <inheritdoc />
+    public async Task SendToConnectionAsync(string connectionId, string message)
+    {
+        if (_connections.TryGetValue(connectionId, out var connection))
+        {
+            try
+            {
+                await SendToConnectionAsync(connection, message, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch
+            {
+                // Remove defective connection
+                _connections.TryRemove(connectionId, out _);
+                connection.Dispose();
+            }
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task NotifyLibraryDataAsync(string connectionId, string target, object data)
+    {
+        var message = SerializeLibraryMessage(target, data);
+        await SendToConnectionAsync(connectionId, message).ConfigureAwait(false);
+    }
+
     // ════════════════════════════════════════════════════════════
     //  Event subscriptions (IWebControlService)
     // ════════════════════════════════════════════════════════════
@@ -179,6 +225,53 @@ public sealed class WebSocketHandler : IWebControlHub, IAsyncDisposable
         catch
         {
             // Broadcast failures are non-fatal
+        }
+    }
+
+    /// <summary>
+    /// Relays a command to the designated player client connection.
+    /// The message is wrapped as <c>{"type":"command","command":{…}}</c>.
+    /// </summary>
+    private async void OnCommandForPlayer(object? sender, WebControlCommand command)
+    {
+        try
+        {
+            var playerConnId = _service.PlayerClientId;
+            if (playerConnId is not null)
+            {
+                var message = SerializeCommandRelayMessage(command);
+                await SendToConnectionAsync(playerConnId, message).ConfigureAwait(false);
+            }
+        }
+        catch
+        {
+            // Relay failures are non-fatal
+        }
+    }
+
+    /// <summary>
+    /// Sends library browse data to the connection that issued the <c>browse</c> request.
+    /// Falls back to broadcast when no pending connection is tracked.
+    /// </summary>
+    private async void OnLibraryDataReady(object? sender, (string Target, object Data) args)
+    {
+        try
+        {
+            var connId = Interlocked.Exchange(ref _pendingBrowseConnectionId, null);
+            if (connId is not null)
+            {
+                await NotifyLibraryDataAsync(connId, args.Target, args.Data).ConfigureAwait(false);
+            }
+            else
+            {
+                // Fallback: broadcast to all connections
+                var message = SerializeLibraryMessage(args.Target, args.Data);
+                await BroadcastAsync(message).ConfigureAwait(false);
+            }
+        }
+        catch
+        {
+            // Send failures are non-fatal
         }
     }
 
@@ -320,14 +413,34 @@ public sealed class WebSocketHandler : IWebControlHub, IAsyncDisposable
 
     /// <summary>
     /// Parses a JSON message into a <see cref="WebControlCommand"/> and dispatches
-    /// it to <see cref="IWebControlService.HandleCommandAsync"/>.
+    /// it to <see cref="IWebControlService.HandleCommandAsync"/>. Routes player-client
+    /// registration (<c>playEpisode</c>) and targeted browse responses based on
+    /// <paramref name="connectionId"/>.
     /// Silently ignores malformed JSON.
     /// </summary>
-    private async Task HandleIncomingMessageAsync(string json)
+    private async Task HandleIncomingMessageAsync(string json, string connectionId)
     {
         try
         {
             var command = WebControlCommand.FromJson(json);
+
+            // Commands that mark this client as the designated player
+            if (command.Type == "playEpisode")
+            {
+                _service.SetPlayerClient(connectionId);
+                if (_connections.TryGetValue(connectionId, out var conn))
+                {
+                    conn.PlayerClientId = connectionId;
+                }
+            }
+
+            // Browse: track which connection requested data so the async
+            // LibraryDataReady response is routed to the correct client.
+            if (command.Type == "browse")
+            {
+                _pendingBrowseConnectionId = connectionId;
+            }
+
             await _service.HandleCommandAsync(command).ConfigureAwait(false);
         }
         catch (JsonException)
@@ -362,6 +475,43 @@ public sealed class WebSocketHandler : IWebControlHub, IAsyncDisposable
         return System.Text.Encoding.UTF8.GetString(stream.ToArray());
     }
 
+    /// <summary>
+    /// Serializes a library data message: <c>{"type":"library","target":"…","items":…}</c>.
+    /// </summary>
+    private string SerializeLibraryMessage(string target, object data)
+    {
+        using var stream = new MemoryStream();
+        using var writer = new Utf8JsonWriter(stream);
+
+        writer.WriteStartObject();
+        writer.WriteString("type", "library");
+        writer.WriteString("target", target);
+        writer.WritePropertyName("items");
+        JsonSerializer.Serialize(writer, data, _jsonOptions);
+        writer.WriteEndObject();
+
+        writer.Flush();
+        return System.Text.Encoding.UTF8.GetString(stream.ToArray());
+    }
+
+    /// <summary>
+    /// Serializes a command relay message: <c>{"type":"command","command":{…}}</c>.
+    /// </summary>
+    private string SerializeCommandRelayMessage(WebControlCommand command)
+    {
+        using var stream = new MemoryStream();
+        using var writer = new Utf8JsonWriter(stream);
+
+        writer.WriteStartObject();
+        writer.WriteString("type", "command");
+        writer.WritePropertyName("command");
+        JsonSerializer.Serialize(writer, command, _jsonOptions);
+        writer.WriteEndObject();
+
+        writer.Flush();
+        return System.Text.Encoding.UTF8.GetString(stream.ToArray());
+    }
+
     // ════════════════════════════════════════════════════════════
     //  IDisposable
     // ════════════════════════════════════════════════════════════
@@ -378,6 +528,8 @@ public sealed class WebSocketHandler : IWebControlHub, IAsyncDisposable
 
         _service.StateChanged -= OnStateChanged;
         _service.PositionChanged -= OnPositionChanged;
+        _service.CommandForPlayer -= OnCommandForPlayer;
+        _service.LibraryDataReady -= OnLibraryDataReady;
 
         StopPositionTimer();
 
@@ -404,6 +556,12 @@ public sealed class WebSocketHandler : IWebControlHub, IAsyncDisposable
         public string Id { get; }
         public WebSocket WebSocket { get; }
         public SemaphoreSlim SendSemaphore { get; } = new(1, 1);
+
+        /// <summary>
+        /// Set when this connection is the designated player client.
+        /// Mirrors <see cref="IWebControlService.PlayerClientId"/> for quick lookup.
+        /// </summary>
+        public string? PlayerClientId { get; set; }
 
         public ClientConnection(string id, WebSocket webSocket)
         {

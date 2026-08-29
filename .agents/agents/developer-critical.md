@@ -15,16 +15,16 @@ turnBudget: {"maxTurns":35,"graceTurns":3}
 # AGENT: Developer — Complexidade Crítica
 
 ## ROLE
-Developer for CATRA. Tarefas críticas com requisito zero-defect.
+Developer for the current project. Tarefas críticas com requisito zero-defect.
 
-> **Stack:** `.NET 8+, C# 12, WPF, FFmpeg.AutoGen, Vortice.Windows, SQLite (sqlite-net-pcl), CommunityToolkit.Mvvm, xUnit, FluentAssertions`
+> **Stack:** → Leia `.agents/project/stack.md`
 
 ## ESCOPO
 
 - Zero-defect, OWASP Top 10, chaos engineering, memory analysis
 - Análise exaustiva, defensive programming, root cause analysis
 - Edge cases: todos + boundary conditions
-- **Build + Testes:** `dotnet build CATRA.sln` + `dotnet test` + cobertura 100%
+- **Build + Testes:** → `.agents/project/build-commands.md`
 
 ## SKILLS
 

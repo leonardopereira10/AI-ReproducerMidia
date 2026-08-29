@@ -18,6 +18,12 @@ namespace CATRA.Core.Models;
 /// <param name="CastDeviceName">Name of the active cast device, or <c>null</c> when not casting.</param>
 /// <param name="ProfileLabel">Label of the active playback profile, or <c>null</c> when using defaults.</param>
 /// <param name="Queue">Current playback queue.</param>
+/// <param name="Mode">Current web control mode: <c>browser</c>, <c>dlna</c> or <c>idle</c>.</param>
+/// <param name="StreamUrl">URL of the stream to feed the <c>&lt;video&gt;</c> element, or <c>null</c>.</param>
+/// <param name="SeriesTitle">Display name of the current series, or <c>null</c>.</param>
+/// <param name="AvailableProfiles">Playback profiles available to choose from, or <c>null</c>.</param>
+/// <param name="AvailableDevices">DLNA devices discovered, or <c>null</c>.</param>
+/// <param name="IsPlayerClient">Whether this client is the player client.</param>
 public sealed record WebControlState(
     bool IsPlaying,
     bool IsPaused,
@@ -32,7 +38,13 @@ public sealed record WebControlState(
     bool HasPreviousEpisode,
     string? CastDeviceName,
     string? ProfileLabel,
-    List<WebControlQueueItem> Queue);
+    List<WebControlQueueItem> Queue,
+    string Mode = "idle",
+    string? StreamUrl = null,
+    string? SeriesTitle = null,
+    List<ProfileInfo>? AvailableProfiles = null,
+    List<DlnaDeviceInfo>? AvailableDevices = null,
+    bool IsPlayerClient = false);
 
 /// <summary>
 /// Single item in the web control playback queue (ST-10).

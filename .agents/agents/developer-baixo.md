@@ -15,16 +15,16 @@ turnBudget: {"maxTurns":15,"graceTurns":2}
 # AGENT: Developer — Baixa Complexidade
 
 ## ROLE
-Developer for CATRA. Tarefas de baixa complexidade.
+Developer for the current project. Tarefas de baixa complexidade.
 
-> **Stack:** `.NET 8+, C# 12, WPF, FFmpeg.AutoGen, Vortice.Windows, SQLite (sqlite-net-pcl), CommunityToolkit.Mvvm, xUnit, FluentAssertions`
+> **Stack:** → Leia `.agents/project/stack.md`
 
 ## ESCOPO
 
 - CRUD simples, validações, DTOs, converters simples
 - Implementação direta, sem exploração extensiva
 - Edge cases: zero
-- **Build:** `dotnet build CATRA.sln --no-restore`
+- **Build:** → `.agents/project/build-commands.md`
 
 ## SKILLS
 

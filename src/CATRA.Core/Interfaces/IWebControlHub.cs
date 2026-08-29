@@ -27,4 +27,21 @@ public interface IWebControlHub
     /// </summary>
     /// <param name="queue">The updated queue.</param>
     Task NotifyQueueChangedAsync(IReadOnlyList<WebControlQueueItem> queue);
+
+    /// <summary>
+    /// Sends a raw text message to a specific connection identified by <paramref name="connectionId"/>.
+    /// No-op when the connection id is not found (client already disconnected).
+    /// </summary>
+    /// <param name="connectionId">Target connection id.</param>
+    /// <param name="message">Pre-serialized JSON message to send.</param>
+    Task SendToConnectionAsync(string connectionId, string message);
+
+    /// <summary>
+    /// Sends library browse data to a specific connection.
+    /// The message is shaped as <c>{"type":"library","target":"…","items":…}</c>.
+    /// </summary>
+    /// <param name="connectionId">Target connection id.</param>
+    /// <param name="target">Browse target kind (categories, items, episodes, etc.).</param>
+    /// <param name="data">The resolved data payload.</param>
+    Task NotifyLibraryDataAsync(string connectionId, string target, object data);
 }

@@ -1,5 +1,5 @@
 // ==========================================================================
-// CATRA — Painel de Controle: WebSocket Client + Controles
+// CATRA — Frontend SPA: Router + Home + Player
 // JavaScript puro (ES6+), sem framework, sem build tool.
 // ==========================================================================
 
@@ -23,36 +23,503 @@ function formatTime(seconds) {
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
-// ── DOM references (cached once) ───────────────────────────────────────────
+/**
+ * Escape HTML to prevent XSS when injecting user data.
+ * @param {string} str
+ * @returns {string}
+ */
+function escapeHtml(str) {
+  if (!str) return '';
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
 
-const dom = {
-  connectionStatus: document.getElementById('connection-status'),
-  videoTitle:       document.getElementById('video-title'),
-  videoSeries:      document.getElementById('video-series'),
-  thumbnailContainer: document.getElementById('thumbnail-container'),
-  thumbnail:        document.getElementById('thumbnail'),
-  currentTime:      document.getElementById('current-time'),
-  seekBar:          document.getElementById('seek-bar'),
-  totalTime:        document.getElementById('total-time'),
-  btnPrev:          document.getElementById('btn-prev'),
-  btnBack:          document.getElementById('btn-back'),
-  btnPlayPause:     document.getElementById('btn-play-pause'),
-  btnForward:       document.getElementById('btn-forward'),
-  btnNext:          document.getElementById('btn-next'),
-  btnSkipIntro:     document.getElementById('btn-skip-intro'),
-  volumeIcon:       document.getElementById('volume-icon'),
-  volumeBar:        document.getElementById('volume-bar'),
-  volumeValue:      document.getElementById('volume-value'),
-  deviceName:       document.getElementById('device-name'),
-  profileLabel:     document.getElementById('profile-label'),
-  queueSection:     document.getElementById('queue-section'),
-  queueList:        document.getElementById('queue-list'),
+// ── View management ────────────────────────────────────────────────────────
+
+const views = {
+  home: document.getElementById('view-home'),
+  detail: document.getElementById('view-detail'),
+  player: document.getElementById('view-player'),
 };
 
-// ── CatraClient ────────────────────────────────────────────────────────────
+function showView(viewName) {
+  for (const [key, el] of Object.entries(views)) {
+    el.style.display = key === viewName ? '' : 'none';
+  }
+  // Scroll to top on view change
+  window.scrollTo(0, 0);
+}
+
+// ── Router ─────────────────────────────────────────────────────────────────
+
+class Router {
+  constructor(app) {
+    this.app = app;
+    window.addEventListener('hashchange', () => this.navigate());
+    this.navigate();
+  }
+
+  navigate() {
+    const hash = location.hash || '#/';
+    const [path, queryString] = hash.slice(2).split('?');
+    const parts = path.split('/').filter(Boolean);
+    const params = new URLSearchParams(queryString || '');
+
+    if (parts.length === 0 || parts[0] === 'home') {
+      showView('home');
+      this.app.loadHome();
+    } else if (parts[0] === 'item' && parts[1]) {
+      showView('detail');
+      this.app.loadDetail(parseInt(parts[1], 10));
+    } else if (parts[0] === 'play' && parts[1]) {
+      showView('player');
+      const profile = params.get('profile') || 'original';
+      this.app.loadPlayer(parseInt(parts[1], 10), profile);
+    } else if (parts[0] === 'search') {
+      showView('home');
+      const q = params.get('q') || '';
+      this.app.loadSearch(q);
+    } else {
+      // Fallback to home
+      location.hash = '#/';
+    }
+  }
+}
+
+// ── DOM references ─────────────────────────────────────────────────────────
+
+const dom = {
+  // Home
+  searchInput: document.getElementById('search-input'),
+  continueList: document.getElementById('continue-list'),
+  categoryList: document.getElementById('category-list'),
+  continueWatching: document.getElementById('continue-watching'),
+  categories: document.getElementById('categories'),
+  searchResults: document.getElementById('search-results'),
+  searchList: document.getElementById('search-list'),
+
+  // Detail
+  btnBackHome: document.getElementById('btn-back-home'),
+  detailTitle: document.getElementById('detail-title'),
+  episodeList: document.getElementById('episode-list'),
+
+  // Player
+  btnBackDetail: document.getElementById('btn-back-detail'),
+  playerTitle: document.getElementById('player-title'),
+  profileSelect: document.getElementById('profile-select'),
+  videoPlayer: document.getElementById('video-player'),
+  videoContainer: document.getElementById('video-container'),
+  thumbnailContainer: document.getElementById('thumbnail-container'),
+  thumbnail: document.getElementById('thumbnail'),
+  currentTime: document.getElementById('current-time'),
+  seekBar: document.getElementById('seek-bar'),
+  totalTime: document.getElementById('total-time'),
+  btnPrev: document.getElementById('btn-prev'),
+  btnBack: document.getElementById('btn-back'),
+  btnPlayPause: document.getElementById('btn-play-pause'),
+  btnForward: document.getElementById('btn-forward'),
+  btnNext: document.getElementById('btn-next'),
+  btnSkipIntro: document.getElementById('btn-skip-intro'),
+  volumeIcon: document.getElementById('volume-icon'),
+  volumeBar: document.getElementById('volume-bar'),
+  volumeValue: document.getElementById('volume-value'),
+  deviceName: document.getElementById('device-name'),
+  profileLabel: document.getElementById('profile-label'),
+  queueSection: document.getElementById('queue-section'),
+  queueList: document.getElementById('queue-list'),
+
+  // Connection
+  connectionStatus: document.getElementById('connection-status'),
+};
+
+// ── App (main controller) ──────────────────────────────────────────────────
+
+class App {
+  constructor() {
+    /** @type {CatraClient|null} */
+    this.client = null;
+    /** @type {Router|null} */
+    this.router = null;
+    /** Current item ID being viewed in detail */
+    this.currentItemId = null;
+    /** Current episode ID being played */
+    this.currentEpisodeId = null;
+    /** Search debounce timer */
+    this._searchTimeout = null;
+    /** Whether HEVC (H.265) is supported by this browser */
+    this._hevcSupported = false;
+  }
+
+  init() {
+    this.client = new CatraClient(this);
+    this._bindNavigation();
+    this._bindSearch();
+    this._checkCodecSupport();
+    this._setupVideoHandlers();
+    this.router = new Router(this);
+  }
+
+  // ── HEVC codec detection ─────────────────────────────────────────────
+
+  _checkCodecSupport() {
+    const video = dom.videoPlayer;
+    // Check for HEVC Main Profile Level 3.1
+    const canPlay = video.canPlayType('video/mp4; codecs="hev1.1.6.L93.B0"');
+    this._hevcSupported = canPlay !== '';
+  }
+
+  // ── Navigation bindings ──────────────────────────────────────────────
+
+  _bindNavigation() {
+    dom.btnBackHome.addEventListener('click', () => {
+      location.hash = '#/';
+    });
+
+    dom.btnBackDetail.addEventListener('click', () => {
+      if (this.currentItemId) {
+        location.hash = `#/item/${this.currentItemId}`;
+      } else {
+        location.hash = '#/';
+      }
+    });
+
+    // Profile select change → send switchProfile via WebSocket + update URL
+    dom.profileSelect.addEventListener('change', () => {
+      const profile = dom.profileSelect.value;
+      if (this.client) {
+        this.client.send({ type: 'switchProfile', profile });
+      }
+      // Update URL to reflect profile (replaceState avoids hashchange re-trigger)
+      const episodeId = this.currentEpisodeId;
+      if (episodeId) {
+        history.replaceState(null, '', `#/play/${episodeId}?profile=${profile}`);
+      }
+    });
+  }
+
+  // ── Search with debounce ─────────────────────────────────────────────
+
+  _bindSearch() {
+    dom.searchInput.addEventListener('input', (e) => {
+      clearTimeout(this._searchTimeout);
+      const value = e.target.value.trim();
+      this._searchTimeout = setTimeout(() => {
+        if (value.length > 0) {
+          location.hash = `#/search?q=${encodeURIComponent(value)}`;
+        } else {
+          // Clear search, show normal home
+          dom.searchResults.style.display = 'none';
+          dom.continueWatching.style.display = '';
+          dom.categories.style.display = '';
+        }
+      }, 300);
+    });
+  }
+
+  // ── Home: load categories + continue watching ────────────────────────
+
+  async loadHome() {
+    // Reset search
+    dom.searchResults.style.display = 'none';
+    dom.continueWatching.style.display = '';
+    dom.categories.style.display = '';
+
+    try {
+      const [categories, continueWatching] = await Promise.all([
+        this._fetchJson('/api/library/categories'),
+        this._fetchJson('/api/library/continue-watching'),
+      ]);
+
+      this._renderCategories(categories);
+      this._renderContinueWatching(continueWatching);
+    } catch (err) {
+      console.error('Failed to load home:', err);
+      dom.categoryList.innerHTML = '<div class="empty-state">Erro ao carregar categorias</div>';
+      dom.continueList.innerHTML = '';
+    }
+  }
+
+  _renderCategories(categories) {
+    if (!Array.isArray(categories) || categories.length === 0) {
+      dom.categoryList.innerHTML = '<div class="empty-state">Nenhuma categoria encontrada</div>';
+      return;
+    }
+
+    dom.categoryList.innerHTML = categories.map(c => `
+      <div class="card" data-nav="#/item/${c.id}">
+        <div class="card-title">${escapeHtml(c.name)}</div>
+        <div class="card-subtitle">${c.itemCount} itens</div>
+      </div>
+    `).join('');
+
+    this._bindCardNavigation(dom.categoryList);
+  }
+
+  _renderContinueWatching(items) {
+    if (!Array.isArray(items) || items.length === 0) {
+      dom.continueList.innerHTML = '<div class="empty-state">Nenhum vídeo em andamento</div>';
+      return;
+    }
+
+    dom.continueList.innerHTML = items.map(item => {
+      const progress = item.duration > 0
+        ? Math.min(100, Math.round((item.position / item.duration) * 100))
+        : 0;
+      const thumbHtml = item.thumbnailUrl
+        ? `<img class="card-thumb" src="${escapeHtml(item.thumbnailUrl)}" alt="" loading="lazy" />`
+        : '';
+
+      return `
+        <div class="card" data-nav="#/play/${item.episodeId}">
+          ${thumbHtml}
+          <div class="card-title">${escapeHtml(item.title)}</div>
+          <div class="card-subtitle">${formatTime(item.position)} / ${formatTime(item.duration)}</div>
+          <div class="card-progress">
+            <div class="card-progress-bar" style="width:${progress}%"></div>
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    this._bindCardNavigation(dom.continueList);
+  }
+
+  // ── Detail: load episodes for an item ────────────────────────────────
+
+  async loadDetail(itemId) {
+    this.currentItemId = itemId;
+    dom.detailTitle.textContent = 'Carregando...';
+    dom.episodeList.innerHTML = '<div class="loading-spinner">Carregando episódios...</div>';
+
+    try {
+      const episodes = await this._fetchJson(`/api/library/items/${itemId}/episodes`);
+
+      // Use first episode title as header if available
+      if (Array.isArray(episodes) && episodes.length > 0) {
+        // Try to derive series title from episode data or use item ID
+        dom.detailTitle.textContent = `Item #${itemId}`;
+        this._renderEpisodes(episodes);
+      } else {
+        dom.detailTitle.textContent = `Item #${itemId}`;
+        dom.episodeList.innerHTML = '<div class="empty-state">Nenhum episódio encontrado</div>';
+      }
+    } catch (err) {
+      console.error('Failed to load detail:', err);
+      dom.detailTitle.textContent = 'Erro';
+      dom.episodeList.innerHTML = '<div class="empty-state">Erro ao carregar episódios</div>';
+    }
+  }
+
+  _renderEpisodes(episodes) {
+    if (!Array.isArray(episodes) || episodes.length === 0) {
+      dom.episodeList.innerHTML = '<div class="empty-state">Nenhum episódio encontrado</div>';
+      return;
+    }
+
+    dom.episodeList.innerHTML = episodes.map(ep => {
+      const thumbHtml = ep.thumbnailUrl
+        ? `<img class="episode-thumb" src="${escapeHtml(ep.thumbnailUrl)}" alt="" loading="lazy" />`
+        : '';
+
+      return `
+        <div class="episode-card" data-nav="#/play/${ep.id}">
+          ${thumbHtml}
+          <div class="episode-info">
+            <div class="episode-title">${escapeHtml(ep.displayTitle)}</div>
+            <div class="episode-duration">${formatTime(ep.durationSec || 0)}</div>
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    this._bindCardNavigation(dom.episodeList);
+  }
+
+  // ── Player: load player view for an episode ──────────────────────────
+
+  async loadPlayer(episodeId, profile) {
+    this.currentEpisodeId = episodeId;
+    dom.playerTitle.textContent = 'Carregando...';
+
+    try {
+      // Load profiles for this episode
+      const profiles = await this._fetchJson(`/api/library/episodes/${episodeId}/profiles`);
+      this._renderProfileOptions(profiles, profile);
+      dom.playerTitle.textContent = `Episódio #${episodeId}`;
+    } catch (err) {
+      console.error('Failed to load player:', err);
+      dom.playerTitle.textContent = `Episódio #${episodeId}`;
+    }
+
+    // HEVC fallback: if profile is not "original" and HEVC not supported, switch
+    if (!this._hevcSupported && profile !== 'original') {
+      console.warn('HEVC not supported, falling back to original profile');
+      profile = 'original';
+      dom.profileSelect.value = profile;
+    }
+
+    // Send playEpisode command via WebSocket (server will respond with state containing streamUrl)
+    this.client.send({ type: 'playEpisode', episodeId, profile });
+  }
+
+  _renderProfileOptions(profiles, currentProfile) {
+    const select = dom.profileSelect;
+    // Keep the three base options, add processed profiles
+    select.innerHTML = `
+      <option value="original">Original</option>
+      <option value="local">Local</option>
+      <option value="dlna">DLNA</option>
+    `;
+
+    if (Array.isArray(profiles)) {
+      for (const p of profiles) {
+        if (p.isProcessed) {
+          const opt = document.createElement('option');
+          opt.value = p.name;
+          opt.textContent = `${p.label || p.name} (${p.width}x${p.height} @ ${p.fps}fps)`;
+          select.appendChild(opt);
+        }
+      }
+    }
+
+    select.value = currentProfile;
+  }
+
+  // ── Search ───────────────────────────────────────────────────────────
+
+  async loadSearch(query) {
+    // Update search input to reflect current query
+    dom.searchInput.value = query;
+
+    if (!query || query.trim().length === 0) {
+      dom.searchResults.style.display = 'none';
+      dom.continueWatching.style.display = '';
+      dom.categories.style.display = '';
+      return;
+    }
+
+    // Hide home sections, show search
+    dom.continueWatching.style.display = 'none';
+    dom.categories.style.display = 'none';
+    dom.searchResults.style.display = '';
+    dom.searchList.innerHTML = '<div class="loading-spinner">Buscando...</div>';
+
+    try {
+      const results = await this._fetchJson(`/api/library/search?q=${encodeURIComponent(query)}`);
+      this._renderSearchResults(results);
+    } catch (err) {
+      console.error('Search failed:', err);
+      dom.searchList.innerHTML = '<div class="empty-state">Erro na busca</div>';
+    }
+  }
+
+  _renderSearchResults(results) {
+    if (!Array.isArray(results) || results.length === 0) {
+      dom.searchList.innerHTML = '<div class="empty-state">Nenhum resultado encontrado</div>';
+      return;
+    }
+
+    dom.searchList.innerHTML = results.map(item => {
+      const typeLabel = item.type || '';
+      // Route to detail for series/items, play for episodes
+      const nav = item.type === 'episode'
+        ? `#/play/${item.id}`
+        : `#/item/${item.id}`;
+
+      return `
+        <div class="card" data-nav="${nav}">
+          <div class="card-title">${escapeHtml(item.title)}</div>
+          <div class="card-subtitle">${escapeHtml(typeLabel)}</div>
+        </div>
+      `;
+    }).join('');
+
+    this._bindCardNavigation(dom.searchList);
+  }
+
+  // ── Card navigation (event delegation) ───────────────────────────────
+
+  _bindCardNavigation(container) {
+    // Event delegation — persists across re-renders of inner content
+    // Use a data attribute flag to avoid duplicate listeners
+    if (!container.dataset.bound) {
+      container.dataset.bound = '1';
+      container.addEventListener('click', (e) => {
+        const card = e.target.closest('[data-nav]');
+        if (card) {
+          location.hash = card.dataset.nav;
+        }
+      });
+    }
+  }
+
+  // ── Video event handlers ─────────────────────────────────────────────
+
+  _setupVideoHandlers() {
+    const video = dom.videoPlayer;
+    let lastProgressReport = 0;
+
+    // timeupdate → report position to server (~1s throttle)
+    video.addEventListener('timeupdate', () => {
+      const now = Date.now();
+      if (now - lastProgressReport > 1000) {
+        lastProgressReport = now;
+        if (this.client) {
+          this.client.send({ type: 'reportProgress', position: video.currentTime });
+        }
+      }
+    });
+
+    // ended → notify server, auto-play handled by server sending new state
+    video.addEventListener('ended', () => {
+      if (this.client) {
+        this.client.send({ type: 'ended' });
+      }
+    });
+
+    // loadedmetadata → report duration to server
+    video.addEventListener('loadedmetadata', () => {
+      if (this.client && Number.isFinite(video.duration)) {
+        this.client.send({ type: 'ready', position: video.duration });
+      }
+    });
+
+    // play/pause → sync UI button
+    video.addEventListener('play', () => {
+      dom.btnPlayPause.textContent = '⏸';
+    });
+    video.addEventListener('pause', () => {
+      dom.btnPlayPause.textContent = '▶';
+    });
+
+    // error → log for debugging
+    video.addEventListener('error', () => {
+      const err = video.error;
+      if (err) {
+        console.error('Video error:', err.code, err.message);
+      }
+    });
+  }
+
+  // ── Fetch helper ─────────────────────────────────────────────────────
+
+  async _fetchJson(url) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+}
+
+// ── CatraClient (WebSocket) ────────────────────────────────────────────────
 
 class CatraClient {
-  constructor() {
+  /**
+   * @param {App} app - Reference to the App controller
+   */
+  constructor(app) {
+    /** @type {App} */
+    this.app = app;
     /** @type {WebSocket|null} */
     this.ws = null;
     this.reconnectDelay = 1000;
@@ -71,11 +538,17 @@ class CatraClient {
     /** Last known duration. */
     this.currentDuration = 0;
 
+    /** Current active profile name. */
+    this._activeProfile = 'original';
+
+    /** Current stream URL (to detect changes for src reassignment). */
+    this._currentStreamUrl = null;
+
     this._bindControls();
     this.connect();
   }
 
-  // ── WebSocket lifecycle ────────────────────────────────────────────────
+  // ── WebSocket lifecycle ──────────────────────────────────────────────
 
   connect() {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -131,7 +604,7 @@ class CatraClient {
     }
   }
 
-  // ── Message dispatch ───────────────────────────────────────────────────
+  // ── Message dispatch ─────────────────────────────────────────────────
 
   _handleMessage(msg) {
     switch (msg.type) {
@@ -141,21 +614,55 @@ class CatraClient {
       case 'position':
         this._updatePosition(msg.position, msg.duration);
         break;
+      case 'command':
+        this._handleRelayCommand(msg.command);
+        break;
       case 'queue':
         this._renderQueue(msg.items);
         break;
     }
   }
 
-  // ── Full state application ─────────────────────────────────────────────
+  // ── Relay command from another client (remote control) ───────────────
+
+  _handleRelayCommand(cmd) {
+    if (!cmd) return;
+    const video = dom.videoPlayer;
+
+    switch (cmd.type) {
+      case 'play':
+        video.play().catch(() => {});
+        break;
+      case 'pause':
+        video.pause();
+        break;
+      case 'seek':
+        if (Number.isFinite(cmd.position)) {
+          video.currentTime = cmd.position;
+        }
+        break;
+      case 'volume':
+        if (Number.isFinite(cmd.level)) {
+          video.volume = Math.max(0, Math.min(100, cmd.level)) / 100;
+          dom.volumeBar.value = cmd.level;
+          dom.volumeValue.textContent = String(cmd.level);
+          this._updateVolumeIcon(cmd.level);
+        }
+        break;
+      case 'switchProfile':
+        // Handled by subsequent state update from server
+        break;
+    }
+  }
+
+  // ── Full state application ───────────────────────────────────────────
 
   _applyFullState(data) {
     if (!data) return;
     this.state = data;
 
-    // Title & series
-    dom.videoTitle.textContent = data.title || 'Nenhum vídeo em reprodução';
-    dom.videoSeries.textContent = '';
+    // Title
+    dom.playerTitle.textContent = data.title || 'Nenhum vídeo em reprodução';
 
     // Thumbnail
     if (data.thumbnailUrl) {
@@ -204,13 +711,86 @@ class CatraClient {
     dom.deviceName.textContent = data.castDeviceName || '';
     dom.profileLabel.textContent = data.profileLabel || '';
 
+    // Track active profile
+    if (data.activeProfile) {
+      this._activeProfile = data.activeProfile;
+      dom.profileSelect.value = data.activeProfile;
+    }
+
+    // HEVC fallback: if browser can't play HEVC and active profile isn't original
+    if (!this.app._hevcSupported && data.activeProfile && data.activeProfile !== 'original') {
+      console.warn('HEVC not supported — requesting original profile');
+      this.send({ type: 'switchProfile', profile: 'original' });
+      return; // State will be re-sent with original profile
+    }
+
+    // ── HTML5 Video: browser mode streaming ──
+    if (data.mode === 'browser' && data.streamUrl) {
+      this._applyStreamUrl(data);
+    }
+
+    // Populate available profiles
+    if (Array.isArray(data.availableProfiles)) {
+      this._renderProfileSelect(data.availableProfiles);
+    }
+
     // Queue (from state)
     if (Array.isArray(data.queue)) {
       this._renderQueue(data.queue);
     }
   }
 
-  // ── Position update (lightweight, frequent) ────────────────────────────
+  // ── Stream URL assignment (browser mode) ─────────────────────────────
+
+  _applyStreamUrl(data) {
+    const video = dom.videoPlayer;
+    const savedPos = video.currentTime || 0;
+
+    // Only reassign src if streamUrl changed (new episode or profile switch)
+    if (data.streamUrl !== this._currentStreamUrl) {
+      this._currentStreamUrl = data.streamUrl;
+      video.src = data.streamUrl;
+
+      // Restore position on profile switch (keep current playback position)
+      if (savedPos > 1 && data.position > 0) {
+        video.addEventListener('loadedmetadata', () => {
+          video.currentTime = data.position;
+        }, { once: true });
+      } else if (data.position > 0) {
+        // Server-specified resume position
+        video.addEventListener('loadedmetadata', () => {
+          video.currentTime = data.position;
+        }, { once: true });
+      }
+
+      // Auto-play (may fail on iOS without user gesture — that's OK)
+      video.play().catch(() => {});
+
+      // Hide thumbnail, show video
+      dom.thumbnailContainer.style.display = 'none';
+      dom.videoContainer.style.display = '';
+    }
+  }
+
+  // ── Profile select rendering (from server data) ──────────────────────
+
+  _renderProfileSelect(profiles) {
+    const select = dom.profileSelect;
+    const currentValue = select.value;
+    select.innerHTML = '';
+
+    for (const p of profiles) {
+      const opt = document.createElement('option');
+      opt.value = p.name;
+      opt.textContent = p.label || p.name;
+      select.appendChild(opt);
+    }
+
+    // Restore selection
+    select.value = this._activeProfile || currentValue;
+  }
+
+  // ── Position update (lightweight, frequent) ──────────────────────────
 
   _updatePosition(position, duration) {
     if (!Number.isFinite(position)) return;
@@ -227,7 +807,7 @@ class CatraClient {
     }
   }
 
-  // ── Queue rendering ────────────────────────────────────────────────────
+  // ── Queue rendering (clickable cards → navigate to episode) ──────────
 
   _renderQueue(items) {
     if (!Array.isArray(items) || items.length === 0) {
@@ -242,6 +822,7 @@ class CatraClient {
     for (const item of items) {
       const card = document.createElement('div');
       card.className = 'queue-card' + (item.isCurrent ? ' queue-card--current' : '');
+      card.dataset.nav = `#/play/${item.id || item.episodeId}`;
 
       const title = document.createElement('span');
       title.className = 'queue-card__title';
@@ -258,9 +839,20 @@ class CatraClient {
 
     dom.queueList.innerHTML = '';
     dom.queueList.appendChild(fragment);
+
+    // Bind click delegation for queue navigation
+    if (!dom.queueList.dataset.bound) {
+      dom.queueList.dataset.bound = '1';
+      dom.queueList.addEventListener('click', (e) => {
+        const card = e.target.closest('[data-nav]');
+        if (card) {
+          location.hash = card.dataset.nav;
+        }
+      });
+    }
   }
 
-  // ── Connection status ──────────────────────────────────────────────────
+  // ── Connection status ────────────────────────────────────────────────
 
   _setConnectionStatus(connected) {
     if (connected) {
@@ -272,7 +864,7 @@ class CatraClient {
     }
   }
 
-  // ── Volume icon helper ─────────────────────────────────────────────────
+  // ── Volume icon helper ───────────────────────────────────────────────
 
   _updateVolumeIcon(level) {
     if (level === 0) {
@@ -284,11 +876,21 @@ class CatraClient {
     }
   }
 
-  // ── Control bindings ───────────────────────────────────────────────────
+  // ── Control bindings (transport → HTML5 video + WebSocket) ───────────
 
   _bindControls() {
-    // ── Play / Pause toggle ──
+    const video = dom.videoPlayer;
+
+    // ── Play / Pause toggle (controls both video element and remote) ──
     dom.btnPlayPause.addEventListener('click', () => {
+      if (this._hasBrowserStream()) {
+        if (video.paused) {
+          video.play().catch(() => {});
+        } else {
+          video.pause();
+        }
+      }
+      // Always send to server for remote clients
       const { isPlaying, isPaused } = this.state;
       if (isPlaying && !isPaused) {
         this.send({ type: 'pause' });
@@ -299,11 +901,17 @@ class CatraClient {
 
     // ── Forward (+10s) ──
     dom.btnForward.addEventListener('click', () => {
+      if (this._hasBrowserStream()) {
+        video.currentTime = Math.min(video.duration || Infinity, video.currentTime + 10);
+      }
       this.send({ type: 'seek', position: this.currentPosition + 10 });
     });
 
     // ── Back (-10s) ──
     dom.btnBack.addEventListener('click', () => {
+      if (this._hasBrowserStream()) {
+        video.currentTime = Math.max(0, video.currentTime - 10);
+      }
       this.send({ type: 'seek', position: Math.max(0, this.currentPosition - 10) });
     });
 
@@ -330,6 +938,9 @@ class CatraClient {
       this.seeking = false;
       const pos = parseFloat(dom.seekBar.value) || 0;
       dom.currentTime.textContent = formatTime(pos);
+      if (this._hasBrowserStream()) {
+        video.currentTime = pos;
+      }
       this.send({ type: 'seek', position: pos });
     };
 
@@ -344,11 +955,14 @@ class CatraClient {
       dom.currentTime.textContent = formatTime(parseFloat(dom.seekBar.value) || 0);
     });
 
-    // ── Volume bar ──
+    // ── Volume bar (controls local video + sends to server) ──
     dom.volumeBar.addEventListener('input', () => {
       const val = parseInt(dom.volumeBar.value, 10);
       dom.volumeValue.textContent = String(val);
       this._updateVolumeIcon(val);
+      if (this._hasBrowserStream()) {
+        video.volume = val / 100;
+      }
     });
 
     dom.volumeBar.addEventListener('change', () => {
@@ -356,10 +970,19 @@ class CatraClient {
       this.send({ type: 'volume', level: val });
     });
   }
+
+  /**
+   * Check if the current state has an active browser-mode stream.
+   * @returns {boolean}
+   */
+  _hasBrowserStream() {
+    return this.state.mode === 'browser' && !!this._currentStreamUrl;
+  }
 }
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
 
 document.addEventListener('DOMContentLoaded', () => {
-  window.catraClient = new CatraClient();
+  window.app = new App();
+  window.app.init();
 });

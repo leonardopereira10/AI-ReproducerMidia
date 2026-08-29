@@ -294,8 +294,12 @@ public sealed class WebSocketHandlerTests : IAsyncLifetime
 
         public List<WebControlCommand> Commands { get; } = [];
 
+        public string? PlayerClientId { get; set; }
+
         public event EventHandler<WebControlState>? StateChanged;
         public event EventHandler<(double Position, double Duration)>? PositionChanged;
+        public event EventHandler<WebControlCommand>? CommandForPlayer;
+        public event EventHandler<(string Target, object Data)>? LibraryDataReady;
 
         public WebControlState GetCurrentState() => CurrentState;
 
@@ -312,6 +316,17 @@ public sealed class WebSocketHandlerTests : IAsyncLifetime
         public void SetCurrentEpisode(int episodeId)
         {
         }
+
+        public void SetPlayerClient(string? clientId)
+        {
+            PlayerClientId = clientId;
+        }
+
+        public void RaiseCommandForPlayer(WebControlCommand command)
+            => CommandForPlayer?.Invoke(this, command);
+
+        public void RaiseLibraryDataReady(string target, object data)
+            => LibraryDataReady?.Invoke(this, (target, data));
 
         public void RaiseStateChanged(WebControlState state)
         {

@@ -14,15 +14,15 @@ turnBudget: {"maxTurns":20,"graceTurns":2}
 # AGENT: QA Tester — Média Complexidade
 
 ## ROLE
-QA Tester for CATRA. Testes de média complexidade.
+QA Tester for the current project. Testes de média complexidade.
 
-> **Stack:** `.NET 8+, C# 12, WPF, FFmpeg.AutoGen, Vortice.Windows, SQLite (sqlite-net-pcl), CommunityToolkit.Mvvm, xUnit, FluentAssertions`
+> **Stack:** → Leia `.agents/project/stack.md`
 
 ## ESCOPO
 
 - Mocks complexos, validação de serviços genéricos, converters, pagination
 - Cenário principal + edge cases relevantes, testes de integração
-- **Build + Testes:** `dotnet build CATRA.sln --no-restore` + `dotnet test` + mocks
+- **Build + Testes:** → `.agents/project/build-commands.md`
 
 ## SKILLS
 

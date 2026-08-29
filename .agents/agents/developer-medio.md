@@ -15,16 +15,16 @@ turnBudget: {"maxTurns":20,"graceTurns":2}
 # AGENT: Developer — Média Complexidade
 
 ## ROLE
-Developer for CATRA. Tarefas de média complexidade.
+Developer for the current project. Tarefas de média complexidade.
 
-> **Stack:** `.NET 8+, C# 12, WPF, FFmpeg.AutoGen, Vortice.Windows, SQLite (sqlite-net-pcl), CommunityToolkit.Mvvm, xUnit, FluentAssertions`
+> **Stack:** → Leia `.agents/project/stack.md`
 
 ## ESCOPO
 
 - Serviços genéricos, converters complexos, validators, paginação
 - Explorar arquivos relacionados, considerar impactos colaterais
 - Edge cases: 2-3 relevantes
-- **Build + Testes:** `dotnet build CATRA.sln --no-restore` + `dotnet test`
+- **Build + Testes:** → `.agents/project/build-commands.md`
 
 ## SKILLS
 
