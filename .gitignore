@@ -91,3 +91,6 @@ Desktop.ini
 *.tmp
 *.cache
 .pi-subagents/
+
+# Publish output
+publish/
