@@ -1,4 +1,8 @@
-# ---- .NET ----
+# =============================================================================
+# CATRA .gitignore
+# =============================================================================
+
+# ---- .NET / Visual Studio ----
 bin/
 obj/
 out/
@@ -9,6 +13,7 @@ out/
 .vs/
 .idea/
 *.DotSettings.user
+*.binlog
 
 # Build results
 [Dd]ebug/
@@ -19,7 +24,6 @@ x86/
 bld/
 [Bb]in/
 [Oo]bj/
-*.binlog
 
 # NuGet
 *.nupkg
@@ -27,17 +31,14 @@ bld/
 .nuget/
 packages/
 
-# Test results
+# Test results / coverage
 [Tt]est[Rr]esult*/
 [Bb]uild[Ll]og.*
 *.trx
 coverage*.json
 coverage*.xml
 
-# ---- Native / FFmpeg / Media ----
-*.dll
-*.exe
-!tools/**/*.exe
+# ---- Native build artifacts ----
 *.pdb
 *.ilk
 *.exp
@@ -49,40 +50,44 @@ coverage*.xml
 *.so.*
 *.dylib
 
+# Binaries (DLLs/EXEs are build outputs or vendored downloads — never commit;
+# FFX/FFmpeg/ONNX binaries are downloaded or built on demand by scripts).
+*.dll
+*.exe
+
+# ---- lib/ vendored third-party ----
+# Everything under lib/ is vendor-supplied or downloaded on demand EXCEPT the
+# FidelityFX SDK 2.3.0 headers (small, required to build the FFX runtime loader,
+# MIT license — tracked intentionally).
+lib/*
+!lib/FidelityFX-SDK-2.3.0/
+# Notes on the ignored content:
+#   lib/ffmpeg/        -> scripts/download-ffmpeg.ps1 (avcodec incl. libx265/nvenc/qsv/amf)
+#   lib/rife/          -> RIFE ONNX models + export guide (*.onnx)
+#   lib/onnxruntime/   -> ONNX Runtime binaries (scripts/build-native.ps1)
+#   lib/amf/           -> AMF SDK headers, supplied via -DCATRA_AMF_ROOT
+#   lib/FidelityFX-Samples-v2.3.0-prebuilt/ -> GPUOpen prebuilt samples (reference only)
+#   lib/docs/          -> local reference docs
+
+# ---- Native bridge build trees ----
+native/catra-gpu/build/
+native/catra-gpu/install/
+native/catra-gpu/vcpkg_installed/
+
+# ---- Models ----
+*.onnx
+
+# ---- Editor / tooling ----
+.vscode/
+
 # ---- OS ----
 Thumbs.db
 ehthumbs.db
 Desktop.ini
 .DS_Store
 
-# ---- Logs / temp ----
+# ---- Logs / temp / agent artifacts ----
 *.log
 *.tmp
 *.cache
 .pi-subagents/
-
-# ---- FFmpeg shared binaries (ST-05) ----
-# Downloaded on demand by scripts/download-ffmpeg.ps1; never committed.
-lib/ffmpeg/
-
-# ---- RIFE model + ONNX Runtime binaries (ST-13) ----
-# Large binaries downloaded on demand by scripts/build-native.ps1; never committed.
-lib/rife/*.onnx
-lib/onnxruntime/
-*.onnx
-
-# ---- FSR 4 / FidelityFX SDK (ST-14) ----
-# License-gated GPUOpen SDK supplied by the integrator via -DCATRA_FSR_SDK_ROOT;
-# never vendored or downloaded by this repo. FSR 1 (EASU) is the self-contained
-# fallback when the SDK is absent.
-lib/fsr-sdk/
-
-# ---- AMF SDK headers (ST-16) ----
-# Headers-only GPUOpen SDK (https://github.com/GPUOpen-LibrariesAndSDKs/AMF)
-# supplied by the integrator via -DCATRA_AMF_ROOT; never vendored or downloaded
-# by this repo. The AMF runtime (amfrt64.dll) ships with the AMD driver. Without
-# the headers the encode backend compiles to a CATRA_ERR_NOT_IMPL stub.
-lib/amf/
-native/catra-gpu/vcpkg_installed/
-native/catra-gpu/build/
-native/catra-gpu/install/
