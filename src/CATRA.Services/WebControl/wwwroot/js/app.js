@@ -35,6 +35,36 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
+// ── Font Awesome icons (self-hosted solid subset — css/fontawesome.css) ─
+
+/** Icon markup used across the panel. */
+const FA_ICONS = {
+  play: '<i class="fa-solid fa-play"></i>',
+  pause: '<i class="fa-solid fa-pause"></i>',
+  tv: '<i class="fa-solid fa-tv"></i>',
+  film: '<i class="fa-solid fa-film"></i>',
+  volumeHigh: '<i class="fa-solid fa-volume-high"></i>',
+  volumeLow: '<i class="fa-solid fa-volume-low"></i>',
+  volumeMuted: '<i class="fa-solid fa-volume-xmark"></i>',
+};
+
+/**
+ * Renders a server-provided profile label, replacing the legacy emoji prefix
+ * (🖥 / 📄 / 📺 — shared with the desktop UI) with a Font Awesome icon.
+ * @param {string} label
+ * @returns {string} HTML
+ */
+function renderProfileLabel(label) {
+  if (!label) return '';
+  const map = { '\u{1F5A5}': 'fa-desktop', '\u{1F4C4}': 'fa-file', '\u{1F4BA}': 'fa-tv' };
+  for (const [emoji, cls] of Object.entries(map)) {
+    if (label.startsWith(emoji)) {
+      return `<i class="fa-solid ${cls}"></i> ${escapeHtml(label.slice(emoji.length).trimStart())}`;
+    }
+  }
+  return escapeHtml(label);
+}
+
 // ── View management ────────────────────────────────────────────────────────
 
 const views = {
@@ -80,6 +110,9 @@ class Router {
       showView('player');
       const profile = params.get('profile') || 'original';
       this.app.loadPlayer(parseInt(parts[1], 10), profile);
+    } else if (parts[0] === 'transmissao') {
+      showView('player');
+      this.app.loadCastSession();
     } else if (parts[0] === 'search') {
       showView('home');
       const q = params.get('q') || '';
@@ -102,6 +135,9 @@ const dom = {
   categories: document.getElementById('categories'),
   searchResults: document.getElementById('search-results'),
   searchList: document.getElementById('search-list'),
+  castBanner: document.getElementById('cast-banner'),
+  btnFollowCast: document.getElementById('btn-follow-cast'),
+  castBannerDetail: document.getElementById('cast-banner-detail'),
 
   // Category
   btnBackCategory: document.getElementById('btn-back-category'),
@@ -135,6 +171,9 @@ const dom = {
   volumeValue: document.getElementById('volume-value'),
   deviceName: document.getElementById('device-name'),
   profileLabel: document.getElementById('profile-label'),
+  btnCast: document.getElementById('btn-cast'),
+  castDeviceList: document.getElementById('cast-device-list'),
+  btnStopCast: document.getElementById('btn-stop-cast'),
   queueSection: document.getElementById('queue-section'),
   queueList: document.getElementById('queue-list'),
 
@@ -168,6 +207,12 @@ class App {
     this._bindSearch();
     this._checkCodecSupport();
     this._setupVideoHandlers();
+
+    // Home transmission banner → open the "Acompanhar transmissão" screen
+    dom.btnFollowCast.addEventListener('click', () => {
+      location.hash = '#/transmissao';
+    });
+
     this.router = new Router(this);
   }
 
@@ -271,7 +316,7 @@ class App {
     dom.categoryList.innerHTML = categories.map(c => `
       <div class="card" data-nav="#/category/${c.id}">
         <div class="card-title">${escapeHtml(c.name)}</div>
-        <div class="card-subtitle">${c.itemCount} itens</div>
+        <div class="card-subtitle">${c.itemCount ?? 0} itens</div>
       </div>
     `).join('');
 
@@ -285,18 +330,23 @@ class App {
     }
 
     dom.continueList.innerHTML = items.map(item => {
-      const progress = item.duration > 0
-        ? Math.min(100, Math.round((item.position / item.duration) * 100))
-        : 0;
-      const thumbHtml = item.thumbnailUrl
-        ? `<img class="card-thumb" src="${escapeHtml(item.thumbnailUrl)}" alt="" loading="lazy" />`
+      const position = item.lastPositionSec || 0;
+      const duration = item.durationSec || 0;
+      const progress = typeof item.progressPct === 'number'
+        ? Math.min(100, Math.round(item.progressPct))
+        : (duration > 0 ? Math.min(100, Math.round((position / duration) * 100)) : 0);
+      const thumbUrl = item.thumbnailPath ? `/api/thumbnail/${item.episodeId}` : null;
+      const thumbHtml = thumbUrl
+        ? `<img class="card-thumb" src="${escapeHtml(thumbUrl)}" alt="" loading="lazy" />`
         : '';
+      const seriesTitle = item.itemTitle || '';
+      const episodeLabel = item.displayTitle || '';
 
       return `
         <div class="card" data-nav="#/play/${item.episodeId}">
           ${thumbHtml}
-          <div class="card-title">${escapeHtml(item.title)}</div>
-          <div class="card-subtitle">${formatTime(item.position)} / ${formatTime(item.duration)}</div>
+          <div class="card-title">${escapeHtml(seriesTitle || episodeLabel)}</div>
+          <div class="card-subtitle">${episodeLabel ? `${escapeHtml(episodeLabel)} · ` : ''}${formatTime(position)} / ${formatTime(duration)}</div>
           <div class="card-progress">
             <div class="card-progress-bar" style="width:${progress}%"></div>
           </div>
@@ -341,7 +391,7 @@ class App {
 
   _renderCategoryItems(items) {
     dom.categoryItems.innerHTML = items.map(item => {
-      const typeIcon = item.mediaType === 1 ? '🎬' : '📺'; // MediaType: 0=Series, 1=Movie
+      const typeIcon = item.mediaType === 1 ? FA_ICONS.film : FA_ICONS.tv; // MediaType: 0=Series, 1=Movie
       const posterHtml = item.posterUrl
         ? `<img class="card-thumb" src="${escapeHtml(item.posterUrl)}" alt="" loading="lazy" />`
         : '';
@@ -368,15 +418,16 @@ class App {
     dom.episodeList.innerHTML = '<div class="loading-spinner">Carregando episódios...</div>';
 
     try {
-      const episodes = await this._fetchJson(`/api/library/items/${itemId}/episodes`);
+      const [item, episodes] = await Promise.all([
+        this._fetchJson(`/api/library/items/${itemId}`).catch(() => null),
+        this._fetchJson(`/api/library/items/${itemId}/episodes`),
+      ]);
 
-      // Use first episode title as header if available
+      dom.detailTitle.textContent = (item && item.title) ? item.title : `Item #${itemId}`;
+
       if (Array.isArray(episodes) && episodes.length > 0) {
-        // Try to derive series title from episode data or use item ID
-        dom.detailTitle.textContent = `Item #${itemId}`;
         this._renderEpisodes(episodes);
       } else {
-        dom.detailTitle.textContent = `Item #${itemId}`;
         dom.episodeList.innerHTML = '<div class="empty-state">Nenhum episódio encontrado</div>';
       }
     } catch (err) {
@@ -393,8 +444,8 @@ class App {
     }
 
     dom.episodeList.innerHTML = episodes.map(ep => {
-      const thumbHtml = ep.thumbnailUrl
-        ? `<img class="episode-thumb" src="${escapeHtml(ep.thumbnailUrl)}" alt="" loading="lazy" />`
+      const thumbHtml = ep.thumbnailPath
+        ? `<img class="episode-thumb" src="/api/thumbnail/${ep.id}" alt="" loading="lazy" />`
         : '';
 
       return `
@@ -416,6 +467,16 @@ class App {
   async loadPlayer(episodeId, profile) {
     this.currentEpisodeId = episodeId;
     dom.playerTitle.textContent = 'Carregando...';
+    dom.profileSelect.style.display = '';
+
+    // If a transmission to the TV is already active, the backend owns the
+    // playback session — render the cast screen instead of requesting a
+    // browser stream (a playEpisode here would otherwise interrupt the TV).
+    const state = this.client && this.client.state;
+    if (state && state.mode === 'dlna' && state.castDeviceName) {
+      this.loadCastSession();
+      return;
+    }
 
     try {
       // Load profiles for this episode
@@ -462,6 +523,35 @@ class App {
   }
 
   // ── Search ───────────────────────────────────────────────────────────
+
+  // ── Cast session: "Acompanhar transmissão" ────────────────────────
+
+  /**
+   * Opens the remote-control screen for an active DLNA transmission.
+   * The backend owns the stream: nothing is requested here — the UI is
+   * rendered from the current WebSocket state and every control is sent
+   * as a command that the backend relays to the TV.
+   */
+  loadCastSession() {
+    this.client._currentStreamUrl = null;
+    dom.profileSelect.style.display = 'none';
+
+    // Never leave a stale local <video> running — the TV is the player.
+    const video = dom.videoPlayer;
+    if (video.getAttribute('src')) {
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
+    }
+    dom.videoContainer.style.display = 'none';
+
+    const state = this.client.state;
+    if (state && Object.keys(state).length > 0) {
+      this.client._applyFullState(state);
+    } else {
+      dom.playerTitle.textContent = 'Nenhuma transmissão ativa';
+    }
+  }
 
   async loadSearch(query) {
     // Update search input to reflect current query
@@ -562,10 +652,10 @@ class App {
 
     // play/pause → sync UI button
     video.addEventListener('play', () => {
-      dom.btnPlayPause.textContent = '⏸';
+      dom.btnPlayPause.innerHTML = FA_ICONS.pause;
     });
     video.addEventListener('pause', () => {
-      dom.btnPlayPause.textContent = '▶';
+      dom.btnPlayPause.innerHTML = FA_ICONS.play;
     });
 
     // error → log for debugging
@@ -679,6 +769,44 @@ class CatraClient {
     }
   }
 
+  /**
+   * Toggles the DLNA device picker: discovers devices via REST and casts
+   * the current episode to the selected one (`castTo` command).
+   */
+  async _toggleCastDeviceList() {
+    const list = dom.castDeviceList;
+    if (list.style.display !== 'none') {
+      list.style.display = 'none';
+      return;
+    }
+
+    list.innerHTML = '<div class="cast-device-item">Buscando dispositivos...</div>';
+    list.style.display = '';
+
+    try {
+      const devices = await this.app._fetchJson('/api/cast/devices');
+      if (!Array.isArray(devices) || devices.length === 0) {
+        list.innerHTML = '<div class="cast-device-item">Nenhum dispositivo encontrado</div>';
+        return;
+      }
+
+      list.innerHTML = '';
+      for (const d of devices) {
+        const btn = document.createElement('button');
+        btn.className = 'cast-device-item';
+        btn.textContent = d.friendlyName || d.udn;
+        btn.addEventListener('click', () => {
+          this.send({ type: 'castTo', deviceUdn: d.udn });
+          list.style.display = 'none';
+        });
+        list.appendChild(btn);
+      }
+    } catch (err) {
+      console.error('Failed to discover cast devices:', err);
+      list.innerHTML = '<div class="cast-device-item">Erro ao buscar dispositivos</div>';
+    }
+  }
+
   // ── Message dispatch ─────────────────────────────────────────────────
 
   _handleMessage(msg) {
@@ -739,8 +867,11 @@ class CatraClient {
     // Title
     dom.playerTitle.textContent = data.title || 'Nenhum vídeo em reprodução';
 
-    // Thumbnail
-    if (data.thumbnailUrl) {
+    // Thumbnail: fallback art for when there is NO active browser stream.
+    // Never re-show it while streaming, otherwise the still image stacks with
+    // the <video> element (old/episode frame appearing alongside the video).
+    const hasBrowserStream = data.mode === 'browser' && !!data.streamUrl;
+    if (data.thumbnailUrl && !hasBrowserStream) {
       dom.thumbnail.src = data.thumbnailUrl;
       dom.thumbnail.alt = data.title || '';
       dom.thumbnailContainer.style.display = '';
@@ -767,7 +898,7 @@ class CatraClient {
     this._updateVolumeIcon(vol);
 
     // Play/Pause button
-    dom.btnPlayPause.textContent = (data.isPlaying && !data.isPaused) ? '⏸' : '▶';
+    dom.btnPlayPause.innerHTML = (data.isPlaying && !data.isPaused) ? FA_ICONS.pause : FA_ICONS.play;
 
     // Next / Previous
     dom.btnNext.disabled = !data.hasNextEpisode;
@@ -783,8 +914,13 @@ class CatraClient {
     }
 
     // Device + Profile
-    dom.deviceName.textContent = data.castDeviceName || '';
-    dom.profileLabel.textContent = data.profileLabel || '';
+    if (data.castDeviceName) {
+      dom.deviceName.innerHTML = `${FA_ICONS.tv} ${escapeHtml(data.castDeviceName)}`;
+    } else {
+      dom.deviceName.textContent = '';
+    }
+    dom.btnStopCast.style.display = data.castDeviceName ? '' : 'none';
+    dom.profileLabel.innerHTML = renderProfileLabel(data.profileLabel);
 
     // Track active profile
     if (data.activeProfile) {
@@ -799,9 +935,25 @@ class CatraClient {
       return; // State will be re-sent with original profile
     }
 
+    // ── Transmission banner on home ──
+    const casting = !!data.castDeviceName;
+    dom.castBanner.style.display = casting ? '' : 'none';
+    if (casting) {
+      dom.castBannerDetail.textContent =
+        `${data.title || 'Transmissão ativa'} → ${data.castDeviceName}`;
+    }
+
     // ── HTML5 Video: browser mode streaming ──
     if (data.mode === 'browser' && data.streamUrl) {
       this._applyStreamUrl(data);
+    } else if (this._currentStreamUrl) {
+      // Transmission is owned by the backend (DLNA): release the local
+      // <video> so the panel does not keep playing while the TV streams.
+      this._currentStreamUrl = null;
+      dom.videoPlayer.pause();
+      dom.videoPlayer.removeAttribute('src');
+      dom.videoPlayer.load();
+      dom.videoContainer.style.display = 'none';
     }
 
     // Populate available profiles
@@ -943,11 +1095,11 @@ class CatraClient {
 
   _updateVolumeIcon(level) {
     if (level === 0) {
-      dom.volumeIcon.textContent = '🔇';
+      dom.volumeIcon.innerHTML = FA_ICONS.volumeMuted;
     } else if (level < 50) {
-      dom.volumeIcon.textContent = '🔉';
+      dom.volumeIcon.innerHTML = FA_ICONS.volumeLow;
     } else {
-      dom.volumeIcon.textContent = '🔊';
+      dom.volumeIcon.innerHTML = FA_ICONS.volumeHigh;
     }
   }
 
@@ -1002,6 +1154,16 @@ class CatraClient {
     // ── Skip Intro ──
     dom.btnSkipIntro.addEventListener('click', () => {
       this.send({ type: 'skipIntro' });
+    });
+
+    // ── Cast (DLNA) ──
+    dom.btnCast.addEventListener('click', () => {
+      this._toggleCastDeviceList();
+    });
+
+    dom.btnStopCast.addEventListener('click', () => {
+      this.send({ type: 'stopCasting' });
+      dom.castDeviceList.style.display = 'none';
     });
 
     // ── Seek bar ──

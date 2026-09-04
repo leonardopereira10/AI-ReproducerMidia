@@ -352,6 +352,46 @@ public sealed class WebControlServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task HandleCommand_NextEpisode_Twice_AdvancesTwoDistinctEpisodes()
+    {
+        // Arrange — regression guard: the service must track the episode it
+        // navigated to, so a second "next" advances again instead of replaying
+        // the first target (stale _currentEpisodeId).
+        LoadEpisode(11);
+        var second = Episode(12, title: "Ep 2", duration: 500);
+        var third = Episode(13, title: "Ep 3", duration: 600);
+        _episodes.Store(second);
+        _episodes.Store(third);
+        _episodes.NextByEpisode[11] = second;
+        _episodes.NextByEpisode[12] = third;
+
+        // Act
+        await _sut.HandleCommandAsync(new WebControlCommand("nextEpisode"));
+        _sut.GetCurrentState().Title.Should().Be("Ep 2");
+
+        await _sut.HandleCommandAsync(new WebControlCommand("nextEpisode"));
+
+        // Assert
+        var state = _sut.GetCurrentState();
+        state.Title.Should().Be("Ep 3");
+        state.EpisodeId.Should().Be(13);
+        _casting.StartCastingCalls.Should().BeEmpty(); // no active device ⇒ no resume
+    }
+
+    [Fact]
+    public void GetCurrentState_ExposesCurrentEpisodeId()
+    {
+        // Arrange
+        LoadEpisode(11);
+
+        // Act
+        var state = _sut.GetCurrentState();
+
+        // Assert
+        state.EpisodeId.Should().Be(11);
+    }
+
+    [Fact]
     public async Task HandleCommand_PreviousEpisode_WithoutCurrentEpisode_IsNoOp()
     {
         // Act
@@ -377,6 +417,51 @@ public sealed class WebControlServiceTests : IDisposable
         // Assert
         _casting.StopCastingCount.Should().Be(1);
         _sut.GetCurrentState().Title.Should().Be("Ep 0");
+    }
+
+    // ── Backend-owned transmission (playEpisode during active cast) ──
+
+    private async Task EnterDlnaModeWithActiveDeviceAsync()
+    {
+        LoadEpisode(11);
+        await _sut.HandleCommandAsync(new WebControlCommand("castTo", DeviceUdn: "uuid:1"));
+        _casting.CurrentDevice = new DlnaDeviceInfo { FriendlyName = "TV", Udn = "uuid:1" };
+    }
+
+    [Fact]
+    public async Task HandleCommand_PlayEpisode_DuringActiveCast_SameEpisode_KeepsCasting()
+    {
+        // Arrange — page refresh re-sends playEpisode while the TV is streaming
+        await EnterDlnaModeWithActiveDeviceAsync();
+
+        // Act
+        await _sut.HandleCommandAsync(new WebControlCommand("playEpisode", EpisodeId: 11));
+
+        // Assert — transmission must survive untouched
+        _casting.StopCastingCount.Should().Be(0);
+        _casting.StartCastingCalls.Should().BeEmpty();
+        _sut.GetCurrentState().Mode.Should().Be("dlna");
+    }
+
+    [Fact]
+    public async Task HandleCommand_PlayEpisode_DuringActiveCast_DifferentEpisode_SwitchesCasting()
+    {
+        // Arrange
+        await EnterDlnaModeWithActiveDeviceAsync();
+        var other = Episode(12, title: "Ep 2", duration: 500);
+        _episodes.Store(other);
+        _mediaItems.Store(MediaItem(other.MediaItemId));
+
+        // Act
+        await _sut.HandleCommandAsync(new WebControlCommand("playEpisode", EpisodeId: 12));
+
+        // Assert — session moves to the new episode on the same renderer
+        _casting.StopCastingCount.Should().Be(1);
+        _casting.StartCastingCalls.Should().ContainSingle()
+            .Which.FilePath.Should().Be(other.FilePath);
+        var state = _sut.GetCurrentState();
+        state.Mode.Should().Be("dlna");
+        state.Title.Should().Be("Ep 2");
     }
 
     // ── Casting event propagation ───────────────────────────────
@@ -506,9 +591,17 @@ public sealed class WebControlServiceTests : IDisposable
         public int NextLookups { get; private set; }
         public int PreviousLookups { get; private set; }
 
+        /// <summary>Per-current-episode next overrides; lets tests chain
+        /// consecutive navigations (falls back to <see cref="NextEpisode"/>).</summary>
+        public Dictionary<int, Episode> NextByEpisode { get; } = [];
+
         public void Store(Episode episode) => _store[episode.Id] = episode;
 
-        public Episode? GetNextEpisode(int currentEpisodeId) { NextLookups++; return NextEpisode; }
+        public Episode? GetNextEpisode(int currentEpisodeId)
+        {
+            NextLookups++;
+            return NextByEpisode.TryGetValue(currentEpisodeId, out var chained) ? chained : NextEpisode;
+        }
         public Episode? GetPreviousEpisode(int currentEpisodeId) { PreviousLookups++; return PreviousEpisode; }
         public IReadOnlyList<Episode> GetByMediaItem(int mediaItemId) => [];
         public IReadOnlyList<Episode> GetUnwatchedByMediaItem(int mediaItemId) => [];

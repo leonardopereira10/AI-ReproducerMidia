@@ -112,6 +112,14 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
         _casting.StateChanged += OnCastingStateChanged;
         _casting.PositionChanged += OnCastingPositionChanged;
         _casting.MediaEnded += OnCastingMediaEnded;
+
+        // ST-10: follow panel-driven episode navigation so desktop bookkeeping
+        // (auto-advance, cast resume, next/previous) tracks the real current
+        // episode instead of the stale one last opened locally.
+        if (_webControlService is not null)
+        {
+            _webControlService.StateChanged += OnWebControlStateChanged;
+        }
     }
 
     /// <summary>Current playback position.</summary>
@@ -833,6 +841,10 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
         _casting.StateChanged -= OnCastingStateChanged;
         _casting.PositionChanged -= OnCastingPositionChanged;
         _casting.MediaEnded -= OnCastingMediaEnded;
+        if (_webControlService is not null)
+        {
+            _webControlService.StateChanged -= OnWebControlStateChanged;
+        }
     }
 
     /// <summary>
@@ -939,12 +951,12 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
                 _ => string.Empty,
             };
 
-            // ST-10: when casting starts, notify the web control service of
-            // the current episode so the web panel can track next/previous.
-            if (state == CastingState.Streaming && _episode is not null)
-            {
-                _webControlService?.SetCurrentEpisode(_episode.Id);
-            }
+            // ST-10: do NOT re-assert the desktop episode here. When the web
+            // panel drives navigation (next/previous/playEpisode) the casting
+            // session is resumed by WebControlService for the NEW episode; a
+            // SetCurrentEpisode with the desktop's stale episode would revert
+            // the service state and make every subsequent "next" replay the
+            // same video. Episode state is pushed by OpenEpisodeAsync instead.
 
             if (state == CastingState.Error)
             {
@@ -957,6 +969,39 @@ public sealed partial class PlayerViewModel : ObservableObject, IDisposable
             }
 
             TransmitCommand.NotifyCanExecuteChanged();
+        });
+
+    /// <summary>
+    /// ST-10: raised by <see cref="IWebControlService"/> whenever the panel-side
+    /// state changes. When the web panel navigates to another episode while a
+    /// cast session is live (panel-driven next/previous or playEpisode), the
+    /// desktop bookkeeping must follow — otherwise the stale local episode
+    /// drives auto-advance and cast resume.
+    /// </summary>
+    private void OnWebControlStateChanged(object? sender, WebControlState state)
+        => RunOnUi(() =>
+        {
+            // Only follow while a cast session is streaming: without one the
+            // desktop owns its local playback session (or the panel streams to
+            // itself in browser mode) and must not be disturbed.
+            if (_casting.State != CastingState.Streaming)
+            {
+                return;
+            }
+
+            if (state.EpisodeId <= 0 || _episode?.Id == state.EpisodeId)
+            {
+                return;
+            }
+
+            var episode = _episodes.GetById(state.EpisodeId);
+            if (episode is null)
+            {
+                return;
+            }
+
+            _episode = episode;
+            ResolveAdjacentEpisodes(episode.Id);
         });
 
     private void OnCastingPositionChanged(object? sender, TimeSpan position)

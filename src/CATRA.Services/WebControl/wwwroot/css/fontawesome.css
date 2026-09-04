@@ -1,0 +1,66 @@
+/*!
+ * Font Awesome Free 6.7.2 by @fontawesome - https://fontawesome.com
+ * License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License)
+ * Copyright 2024 Fonticons, Inc.
+ *
+ * Self-hosted SUBSET for the CATRA web control panel: solid style only,
+ * restricted to the icons the panel uses (no CDN/internet dependency).
+ * Glyph code points verified against the official 6.7.2 `all.min.css`.
+ */
+
+@font-face {
+  font-family: "Font Awesome 6 Free";
+  font-style: normal;
+  font-weight: 900;
+  font-display: block;
+  src: url("../webfonts/fa_solid_900.woff2") format("woff2");
+}
+
+/* ── Core rendering rules (subset of the official core) ── */
+.fa,
+.fa-solid,
+.fas {
+  font-family: var(--fa-style-family, "Font Awesome 6 Free");
+  font-weight: var(--fa-style, 900);
+}
+
+.fa,
+.fa-solid,
+.fas {
+  -moz-osx-font-smoothing: grayscale;
+  -webkit-font-smoothing: antialiased;
+  display: var(--fa-display, inline-block);
+  font-style: normal;
+  font-variant: normal;
+  line-height: 1;
+  text-rendering: auto;
+}
+
+.fa-solid:before,
+.fas:before,
+.fa:before {
+  content: var(--fa);
+}
+
+.fa-fw {
+  text-align: center;
+  width: 1.25em;
+}
+
+/* ── Icons used by the panel (FA Free 6.7.2 solid) ── */
+.fa-play { --fa: "\f04b"; }
+.fa-pause { --fa: "\f04c"; }
+.fa-stop { --fa: "\f04d"; }
+.fa-backward-step { --fa: "\f048"; }
+.fa-forward-step { --fa: "\f051"; }
+.fa-rotate-left { --fa: "\f2ea"; }
+.fa-rotate-right { --fa: "\f2f9"; }
+.fa-volume-high { --fa: "\f028"; }
+.fa-volume-low { --fa: "\f027"; }
+.fa-volume-xmark { --fa: "\f6a9"; }
+.fa-tv { --fa: "\f26c"; }
+.fa-film { --fa: "\f008"; }
+.fa-arrow-left { --fa: "\f060"; }
+.fa-chevron-right { --fa: "\f054"; }
+.fa-desktop { --fa: "\f390"; }
+.fa-file { --fa: "\f15b"; }

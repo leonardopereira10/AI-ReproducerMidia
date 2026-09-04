@@ -127,7 +127,17 @@ public sealed class ThumbnailService : IThumbnailService
             return coverPath;
         }
 
-        // Priority 3: extract from the first episode.
+        // Priority 3: thumbnail já extraído de qualquer episódio (aleatório).
+        var thumbCandidates = _episodes.GetByMediaItem(mediaItem.Id)
+            .Where(e => !string.IsNullOrWhiteSpace(e.ThumbnailPath) && File.Exists(e.ThumbnailPath))
+            .ToList();
+
+        if (thumbCandidates.Count > 0)
+        {
+            return thumbCandidates[Random.Shared.Next(thumbCandidates.Count)].ThumbnailPath;
+        }
+
+        // Priority 4: extract from the first episode.
         var firstEpisode = FirstEpisode(mediaItem.Id);
         if (firstEpisode is null)
         {

@@ -7,4 +7,5 @@ namespace CATRA.Core.Models;
 public sealed record CategoryDto(
     int Id,
     string Name,
-    string FolderPath);
+    string FolderPath,
+    int ItemCount);

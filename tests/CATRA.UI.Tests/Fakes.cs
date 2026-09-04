@@ -737,3 +737,66 @@ internal sealed class FakeMediaFileResolver : IMediaFileResolver
         return Task.FromResult(Default ?? new ResolvedMedia(string.Empty, false, null, "📄 Original"));
     }
 }
+
+/// <summary>
+/// Recording <see cref="IWebControlService"/> fake (ST-10). Records
+/// <see cref="SetCurrentEpisode"/> calls and lets tests raise
+/// <see cref="StateChanged"/> to simulate panel-driven navigation.
+/// </summary>
+internal sealed class FakeWebControlService : IWebControlService
+{
+    public List<int> SetCurrentEpisodeCalls { get; } = new();
+
+    public List<WebControlCommand> HandledCommands { get; } = new();
+
+    public string? PlayerClientId { get; private set; }
+
+    public WebControlState StateToReturn { get; set; } = new(
+        IsPlaying: false,
+        IsPaused: false,
+        Position: 0,
+        Duration: 0,
+        Volume: 100,
+        Title: string.Empty,
+        ThumbnailUrl: null,
+        SkipIntroSec: 0,
+        CanSkipIntro: false,
+        HasNextEpisode: false,
+        HasPreviousEpisode: false,
+        CastDeviceName: null,
+        ProfileLabel: null,
+        Queue: []);
+
+    public event EventHandler<WebControlState>? StateChanged;
+
+    public event EventHandler<(double Position, double Duration)>? PositionChanged;
+
+#pragma warning disable CS0067 // unused in current tests; kept for interface completeness
+    public event EventHandler<WebControlCommand>? CommandForPlayer;
+
+    public event EventHandler<(string Target, object Data)>? LibraryDataReady;
+#pragma warning restore CS0067
+
+    public WebControlState GetCurrentState() => StateToReturn;
+
+    public Task HandleCommandAsync(WebControlCommand command)
+    {
+        HandledCommands.Add(command);
+        return Task.CompletedTask;
+    }
+
+    public void SetCurrentEpisode(int episodeId) => SetCurrentEpisodeCalls.Add(episodeId);
+
+    public void SetPlayerClient(string? clientId) => PlayerClientId = clientId;
+
+    public Task<List<DlnaDeviceInfo>> DiscoverDevicesAsync() => Task.FromResult(new List<DlnaDeviceInfo>());
+
+    public void RaiseStateChanged(WebControlState state)
+    {
+        StateToReturn = state;
+        StateChanged?.Invoke(this, state);
+    }
+
+    public void RaisePositionChanged(double position, double duration)
+        => PositionChanged?.Invoke(this, (position, duration));
+}

@@ -37,8 +37,10 @@ public interface IWebControlService
     event EventHandler<(double Position, double Duration)>? PositionChanged;
 
     /// <summary>
-    /// Informs the service which episode is currently loaded in the player.
-    /// Called by the PlayerViewModel when casting starts or the episode changes.
+    /// Informs the service which episode is currently loaded in the desktop
+    /// player. Called by the PlayerViewModel when the local episode changes;
+    /// must NOT be re-asserted on casting events, or panel-driven navigation
+    /// gets overwritten by the stale desktop episode.
     /// </summary>
     /// <param name="episodeId">Database id of the current episode.</param>
     void SetCurrentEpisode(int episodeId);
@@ -68,4 +70,10 @@ public interface IWebControlService
     /// <c>episodes</c>) and the resolved data object.
     /// </summary>
     event EventHandler<(string Target, object Data)>? LibraryDataReady;
+
+    /// <summary>
+    /// Discovers DLNA renderers currently reachable on the network, for the
+    /// web panel's "Transmitir" device picker.
+    /// </summary>
+    Task<List<DlnaDeviceInfo>> DiscoverDevicesAsync();
 }

@@ -133,6 +133,7 @@ public sealed class StreamService : IStreamService, IDisposable
             FilePath = filePath,
             ContentType = contentType,
             StreamUrl = streamUrl,
+            Token = token,
             Width = width,
             Height = height,
             Fps = fps,

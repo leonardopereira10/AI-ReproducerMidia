@@ -15,6 +15,10 @@ public sealed record StreamResolution
     /// <summary>LAN URL clients use to consume the stream.</summary>
     public required string StreamUrl { get; init; }
 
+    /// <summary>Opaque media-server token backing this stream; used to
+    /// unregister the registration when the stream is replaced.</summary>
+    public required string Token { get; init; }
+
     /// <summary>Nominal video width in pixels.</summary>
     public int Width { get; init; }
 

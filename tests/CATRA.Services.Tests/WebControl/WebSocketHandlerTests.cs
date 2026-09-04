@@ -301,6 +301,9 @@ public sealed class WebSocketHandlerTests : IAsyncLifetime
         public event EventHandler<WebControlCommand>? CommandForPlayer;
         public event EventHandler<(string Target, object Data)>? LibraryDataReady;
 
+        public Task<List<DlnaDeviceInfo>> DiscoverDevicesAsync()
+            => Task.FromResult(new List<DlnaDeviceInfo>());
+
         public WebControlState GetCurrentState() => CurrentState;
 
         public Task HandleCommandAsync(WebControlCommand command)

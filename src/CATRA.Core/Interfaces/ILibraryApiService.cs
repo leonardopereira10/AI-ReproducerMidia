@@ -14,6 +14,9 @@ public interface ILibraryApiService
     /// <summary>Returns the media items belonging to a category.</summary>
     Task<List<MediaItemDto>> GetItemsByCategoryAsync(int categoryId);
 
+    /// <summary>Returns a single media item by id, or <c>null</c> when absent.</summary>
+    Task<MediaItemDto?> GetItemAsync(int mediaItemId);
+
     /// <summary>Returns the episodes of a media item.</summary>
     Task<List<EpisodeDto>> GetEpisodesByItemAsync(int mediaItemId);
 

@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
   <title>CATRA</title>
+  <link rel="stylesheet" href="/css/fontawesome.css">
   <link rel="stylesheet" href="/css/style.css">
 </head>
 <body>
@@ -22,6 +23,18 @@
         <input type="search" id="search-input" placeholder="Buscar..." autocomplete="off" />
       </div>
     </header>
+
+    <!-- Live transmission banner (visible while casting to a TV) -->
+    <section id="cast-banner" class="home-section" style="display:none">
+      <button id="btn-follow-cast" class="cast-banner-btn" type="button">
+        <span class="cast-banner-icon"><i class="fa-solid fa-tv"></i></span>
+        <span class="cast-banner-text">
+          <strong>Acompanhar transmissão</strong>
+          <span id="cast-banner-detail"></span>
+        </span>
+        <span class="cast-banner-arrow"><i class="fa-solid fa-chevron-right"></i></span>
+      </button>
+    </section>
 
     <section id="continue-watching" class="home-section">
       <h2 class="section-title">Continue Assistindo</h2>
@@ -44,7 +57,7 @@
        ============================================================ -->
   <div id="view-category" class="view" style="display:none">
     <header class="detail-header">
-      <button id="btn-back-category" class="back-btn">← Voltar</button>
+      <button id="btn-back-category" class="back-btn"><i class="fa-solid fa-arrow-left"></i> Voltar</button>
       <h1 id="category-title" class="detail-title"></h1>
     </header>
     <div id="category-items" class="card-grid"></div>
@@ -55,7 +68,7 @@
        ============================================================ -->
   <div id="view-detail" class="view" style="display:none">
     <header class="detail-header">
-      <button id="btn-back-episodes" class="back-btn">← Voltar</button>
+      <button id="btn-back-episodes" class="back-btn"><i class="fa-solid fa-arrow-left"></i> Voltar</button>
       <h1 id="detail-title" class="detail-title"></h1>
     </header>
     <div id="episode-list" class="episode-grid"></div>
@@ -66,7 +79,7 @@
        ============================================================ -->
   <div id="view-player" class="view" style="display:none">
     <header class="player-header-bar">
-      <button id="btn-back-detail" class="back-btn">← Voltar</button>
+      <button id="btn-back-detail" class="back-btn"><i class="fa-solid fa-arrow-left"></i> Voltar</button>
       <div class="player-header">
         <h1 id="player-title" class="player-title">Nenhum vídeo em reprodução</h1>
         <select id="profile-select">
@@ -74,6 +87,10 @@
           <option value="local">Local</option>
           <option value="dlna">DLNA</option>
         </select>
+        <div class="cast-box">
+          <button id="btn-cast" class="transport-btn" title="Transmitir para dispositivo (DLNA)"><i class="fa-solid fa-tv"></i> Transmitir</button>
+          <div id="cast-device-list" class="cast-device-list" style="display:none"></div>
+        </div>
       </div>
     </header>
 
@@ -96,11 +113,11 @@
 
     <!-- Transport controls -->
     <div id="transport-controls">
-      <button id="btn-prev" class="transport-btn" disabled>⏮</button>
-      <button id="btn-back" class="transport-btn">⏪</button>
-      <button id="btn-play-pause" class="transport-btn primary">▶</button>
-      <button id="btn-forward" class="transport-btn">⏩</button>
-      <button id="btn-next" class="transport-btn" disabled>⏭</button>
+      <button id="btn-prev" class="transport-btn" disabled><i class="fa-solid fa-backward-step"></i></button>
+      <button id="btn-back" class="transport-btn"><i class="fa-solid fa-rotate-left"></i></button>
+      <button id="btn-play-pause" class="transport-btn primary"><i class="fa-solid fa-play"></i></button>
+      <button id="btn-forward" class="transport-btn"><i class="fa-solid fa-rotate-right"></i></button>
+      <button id="btn-next" class="transport-btn" disabled><i class="fa-solid fa-forward-step"></i></button>
     </div>
 
     <!-- Skip intro button -->
@@ -110,7 +127,7 @@
 
     <!-- Volume -->
     <div id="volume-container">
-      <span id="volume-icon">🔊</span>
+      <span id="volume-icon"><i class="fa-solid fa-volume-high"></i></span>
       <input type="range" id="volume-bar" min="0" max="100" value="100" />
       <span id="volume-value">100</span>
     </div>
@@ -118,6 +135,7 @@
     <!-- Device + Profile info -->
     <div id="device-info">
       <span id="device-name"></span>
+      <button id="btn-stop-cast" class="transport-btn" style="display:none"><i class="fa-solid fa-stop"></i> Parar transmissão</button>
       <span id="profile-label"></span>
     </div>
 

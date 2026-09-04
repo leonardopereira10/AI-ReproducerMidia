@@ -33,9 +33,10 @@ public sealed class PlayerViewModelTests
         public FakeCastingService Casting { get; } = new();
         public FakeMediaFileResolver Resolver { get; } = new();
         public FakeAppSettingsRepository AppSettings { get; }
+        public FakeWebControlService? WebControl { get; }
         public PlayerViewModel ViewModel { get; }
 
-        public Fixture(double skipIntroSec = 85.0)
+        public Fixture(double skipIntroSec = 85.0, bool withWebControl = false)
         {
             // xUnit installs a SynchronizationContext; the VM marshals engine
             // events through it. Clearing it makes RunOnUi execute inline so
@@ -73,6 +74,7 @@ public sealed class PlayerViewModelTests
 
             ViewModel = new PlayerViewModel(
                 Engine, Episodes, MediaItems, WatchStates, WatchStateService, Dialogs, Navigator, Casting, Resolver,
+                webControlService: withWebControl ? WebControl = new FakeWebControlService() : null,
                 appSettings: AppSettings);
         }
 
@@ -831,5 +833,98 @@ public sealed class PlayerViewModelTests
 
         f.ViewModel.PositionSeconds.Should().Be(42);
         f.ViewModel.Position.Should().Be(TimeSpan.FromSeconds(42));
+    }
+
+    // ------------------------------------------------------------------
+    // ST-10 — Web panel navigation sync
+    // Regression: the 2nd "next" from the panel replayed the same video,
+    // as if the queue had ended — PlayerViewModel re-asserted its stale
+    // desktop episode into WebControlService every time casting reached
+    // Streaming, reverting the panel-driven navigation.
+    // ------------------------------------------------------------------
+
+    private static Episode SideEpisode(int id, int episodeNumber)
+        => new()
+        {
+            Id = id,
+            MediaItemId = MediaItemId,
+            FileName = $"s01e{episodeNumber:D2}.mkv",
+            FilePath = $@"C:\media\s01e{episodeNumber:D2}.mkv",
+            DisplayTitle = $"Ep {episodeNumber}",
+            EpisodeNumber = episodeNumber,
+        };
+
+    private static WebControlState PanelState(int episodeId, string mode = "dlna")
+        => new(
+            IsPlaying: true,
+            IsPaused: false,
+            Position: 0,
+            Duration: 1000,
+            Volume: 100,
+            Title: "Panel episode",
+            ThumbnailUrl: null,
+            SkipIntroSec: 0,
+            CanSkipIntro: false,
+            HasNextEpisode: true,
+            HasPreviousEpisode: false,
+            CastDeviceName: "TV",
+            ProfileLabel: null,
+            Queue: [],
+            Mode: mode,
+            EpisodeId: episodeId);
+
+    [Fact]
+    public async Task CastingStreaming_DoesNotReassertDesktopEpisode_ToWebService()
+    {
+        var f = new Fixture(withWebControl: true);
+        await f.ViewModel.OpenAsync(EpisodeId);
+        f.WebControl!.SetCurrentEpisodeCalls.Clear();
+
+        // Casting reaches Streaming (e.g. panel-driven navigation resumed the
+        // transmission). The desktop episode must NOT overwrite the service.
+        f.Casting.RaiseStateChanged(CastingState.Streaming);
+
+        f.WebControl.SetCurrentEpisodeCalls.Should().BeEmpty(
+            "re-asserting the stale desktop episode reverts panel-driven navigation");
+    }
+
+    [Fact]
+    public async Task OpenEpisode_NotifiesWebService_Once()
+    {
+        var f = new Fixture(withWebControl: true);
+
+        await f.ViewModel.OpenAsync(EpisodeId);
+
+        f.WebControl!.SetCurrentEpisodeCalls.Should().ContainSingle().Which.Should().Be(EpisodeId);
+    }
+
+    [Fact]
+    public async Task WebPanelNavigation_WhileCasting_SyncsDesktopEpisode()
+    {
+        var f = new Fixture(withWebControl: true);
+        f.Episodes.Add(SideEpisode(EpisodeId + 1, episodeNumber: 2));
+        await f.ViewModel.OpenAsync(EpisodeId);
+        f.Casting.RaiseStateChanged(CastingState.Streaming);
+
+        // The panel advances to the next episode; the service state carries it.
+        f.WebControl!.RaiseStateChanged(PanelState(EpisodeId + 1));
+
+        f.ViewModel.Episode.Should().NotBeNull();
+        f.ViewModel.Episode!.Id.Should().Be(EpisodeId + 1,
+            "desktop auto-advance/cast-resume must track the panel's episode");
+        f.ViewModel.HasNextEpisode.Should().BeFalse("episode 2 is the last stored episode");
+    }
+
+    [Fact]
+    public async Task WebPanelNavigation_WithoutActiveCast_KeepsLocalEpisode()
+    {
+        var f = new Fixture(withWebControl: true);
+        f.Episodes.Add(SideEpisode(EpisodeId + 1, episodeNumber: 2));
+        await f.ViewModel.OpenAsync(EpisodeId);
+        // Casting stays Idle: the desktop owns its local playback session.
+
+        f.WebControl!.RaiseStateChanged(PanelState(EpisodeId + 1));
+
+        f.ViewModel.Episode!.Id.Should().Be(EpisodeId);
     }
 }

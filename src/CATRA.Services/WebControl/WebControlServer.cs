@@ -154,6 +154,8 @@ public sealed class WebControlServer : IWebControlServer, IAsyncDisposable
             return HandleApiItemsAsync(ctx, catId);
         if (TryExtractId(path, "/api/library/items/", "/episodes", out var itemId))
             return HandleApiEpisodesAsync(ctx, itemId);
+        if (TryExtractSimpleId(path, "/api/library/items/", out var singleItemId))
+            return HandleApiItemAsync(ctx, singleItemId);
         if (TryExtractId(path, "/api/library/episodes/", "/profiles", out var epId))
             return HandleApiProfilesAsync(ctx, epId);
 
@@ -164,12 +166,16 @@ public sealed class WebControlServer : IWebControlServer, IAsyncDisposable
             return HandleApiContinueWatchingAsync(ctx);
         if (path == "/api/library/search")
             return HandleApiSearchAsync(ctx);
+        if (path == "/api/cast/devices")
+            return HandleApiCastDevicesAsync(ctx);
 
         // ── Existing routes ──
         return path switch
         {
             "/" => HandleIndexAsync(ctx),
             "/css/style.css" => HandleCssAsync(ctx),
+            "/css/fontawesome.css" => HandleFontAwesomeCssAsync(ctx),
+            "/webfonts/fa_solid_900.woff2" => HandleFontAwesomeFontAsync(ctx),
             "/js/app.js" => HandleJsAsync(ctx),
             "/api/state" => HandleApiStateAsync(ctx),
             "/ws" => HandleWebSocketAsync(ctx),
@@ -193,6 +199,14 @@ public sealed class WebControlServer : IWebControlServer, IAsyncDisposable
 
     private static async Task HandleCssAsync(HttpContext ctx)
         => await ServeEmbeddedResourceAsync(ctx, ResourcePrefix + "css.style.css", "text/css")
+            .ConfigureAwait(false);
+
+    private static async Task HandleFontAwesomeCssAsync(HttpContext ctx)
+        => await ServeEmbeddedResourceAsync(ctx, ResourcePrefix + "css.fontawesome.css", "text/css")
+            .ConfigureAwait(false);
+
+    private static async Task HandleFontAwesomeFontAsync(HttpContext ctx)
+        => await ServeEmbeddedResourceAsync(ctx, ResourcePrefix + "webfonts.fa_solid_900.woff2", "font/woff2")
             .ConfigureAwait(false);
 
     private static async Task HandleJsAsync(HttpContext ctx)
@@ -267,6 +281,36 @@ public sealed class WebControlServer : IWebControlServer, IAsyncDisposable
 
         var items = await _libraryApiService.GetItemsByCategoryAsync(categoryId).ConfigureAwait(false);
         await WriteJsonAsync(ctx, items).ConfigureAwait(false);
+    }
+
+    private async Task HandleApiItemAsync(HttpContext ctx, int mediaItemId)
+    {
+        if (_libraryApiService is null)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            return;
+        }
+
+        var item = await _libraryApiService.GetItemAsync(mediaItemId).ConfigureAwait(false);
+        if (item is null)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status404NotFound;
+            return;
+        }
+
+        await WriteJsonAsync(ctx, item).ConfigureAwait(false);
+    }
+
+    private async Task HandleApiCastDevicesAsync(HttpContext ctx)
+    {
+        if (_webControlService is null)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            return;
+        }
+
+        var devices = await _webControlService.DiscoverDevicesAsync().ConfigureAwait(false);
+        await WriteJsonAsync(ctx, devices).ConfigureAwait(false);
     }
 
     private async Task HandleApiEpisodesAsync(HttpContext ctx, int mediaItemId)

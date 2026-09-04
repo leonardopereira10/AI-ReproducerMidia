@@ -24,6 +24,8 @@ namespace CATRA.Core.Models;
 /// <param name="AvailableProfiles">Playback profiles available to choose from, or <c>null</c>.</param>
 /// <param name="AvailableDevices">DLNA devices discovered, or <c>null</c>.</param>
 /// <param name="IsPlayerClient">Whether this client is the player client.</param>
+/// <param name="EpisodeId">Database id of the episode the service currently owns (0 = none).
+/// Internal bookkeeping for desktop sync — web clients may ignore it.</param>
 public sealed record WebControlState(
     bool IsPlaying,
     bool IsPaused,
@@ -44,7 +46,8 @@ public sealed record WebControlState(
     string? SeriesTitle = null,
     List<ProfileInfo>? AvailableProfiles = null,
     List<DlnaDeviceInfo>? AvailableDevices = null,
-    bool IsPlayerClient = false);
+    bool IsPlayerClient = false,
+    int EpisodeId = 0);
 
 /// <summary>
 /// Single item in the web control playback queue (ST-10).

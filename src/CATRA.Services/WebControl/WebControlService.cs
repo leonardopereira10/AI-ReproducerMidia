@@ -216,6 +216,10 @@ public sealed class WebControlService : IWebControlService, IDisposable
         }
     }
 
+    /// <inheritdoc />
+    public Task<List<DlnaDeviceInfo>> DiscoverDevicesAsync()
+        => _casting.DiscoverDevicesAsync();
+
     // ════════════════════════════════════════════════════════════
     //  SetCurrentEpisode — called by PlayerViewModel
     // ════════════════════════════════════════════════════════════
@@ -389,6 +393,47 @@ public sealed class WebControlService : IWebControlService, IDisposable
             _isPaused = false;
         }
 
+        // Browser mode: swap the stream to the new episode so the panel player
+        // actually loads it. Without this the state keeps carrying the old
+        // streamUrl, the <video> retains the previous episode's frame while the
+        // metadata (title/thumbnail) already points at the new episode — the
+        // panel appears to stack the new episode over the old one's frame.
+        if (_streamService is not null)
+        {
+            string mode;
+            string? oldToken;
+            string preferredProfile;
+            lock (_lock)
+            {
+                mode = _mode;
+                oldToken = _currentStreamToken;
+                preferredProfile = _activeProfile ?? "original";
+            }
+
+            if (mode == "browser")
+            {
+                var resolution = _streamService.ResolveEpisode(targetEpisode.Id, preferredProfile)
+                    ?? _streamService.ResolveEpisode(targetEpisode.Id, "original");
+
+                if (resolution is not null)
+                {
+                    if (oldToken is not null)
+                    {
+                        _streamService.Unregister(oldToken);
+                    }
+
+                    lock (_lock)
+                    {
+                        _currentStreamUrl = resolution.StreamUrl;
+                        _activeProfile = resolution.Profile;
+                        _currentStreamToken = resolution.Token;
+                        _isPlaying = true;
+                        _isPaused = false;
+                    }
+                }
+            }
+        }
+
         RaiseStateChanged();
 
         // Resume casting if a device was active.
@@ -437,11 +482,53 @@ public sealed class WebControlService : IWebControlService, IDisposable
     /// <summary>
     /// Handles <c>playEpisode</c>: resolves the stream for the requested episode
     /// and profile, switches to browser mode, and raises state changed.
-    /// If currently in DLNA mode, stops casting first.
+    /// <para>
+    /// When a DLNA transmission is active the backend owns the session: the
+    /// command does NOT stop it. Same episode ⇒ no-op (page refresh while
+    /// casting keeps the TV playing); different episode ⇒ the casting session
+    /// moves to the new episode on the same renderer.
+    /// </para>
     /// </summary>
     private async Task HandlePlayEpisodeAsync(WebControlCommand command)
     {
-        if (_streamService is null || command.EpisodeId is null)
+        if (command.EpisodeId is null)
+        {
+            return;
+        }
+
+        // ── Backend-owned transmission guard ─────────────────────
+        string prevMode;
+        lock (_lock)
+        {
+            prevMode = _mode;
+        }
+
+        if (prevMode == "dlna")
+        {
+            var device = _casting.CurrentDevice;
+            if (device is not null)
+            {
+                int currentEp;
+                lock (_lock)
+                {
+                    currentEp = _currentEpisodeId;
+                }
+
+                if (currentEp == command.EpisodeId.Value)
+                {
+                    // Page refresh / reconnect while casting: keep the
+                    // transmission running and just re-sync the panel.
+                    RaiseStateChanged();
+                    return;
+                }
+
+                await SwitchCastingToEpisodeAsync(command.EpisodeId.Value, device)
+                    .ConfigureAwait(false);
+                return;
+            }
+        }
+
+        if (_streamService is null)
         {
             return;
         }
@@ -451,18 +538,6 @@ public sealed class WebControlService : IWebControlService, IDisposable
         if (resolution is null)
         {
             return; // profile not available
-        }
-
-        // Stop DLNA casting if active.
-        string prevMode;
-        lock (_lock)
-        {
-            prevMode = _mode;
-        }
-
-        if (prevMode == "dlna")
-        {
-            await _casting.StopCastingAsync().ConfigureAwait(false);
         }
 
         // Unregister previous stream token if any.
@@ -487,11 +562,13 @@ public sealed class WebControlService : IWebControlService, IDisposable
 
         lock (_lock)
         {
-            _playerClientId = null; // will be set by WebSocket handler via SetPlayerClient
+            // _playerClientId is set by the WebSocket handler via SetPlayerClient
+            // BEFORE this method runs; do not clear it here or transport command
+            // relay (play/pause/seek/volume) to the browser player silently breaks.
             _mode = "browser";
             _currentStreamUrl = resolution.StreamUrl;
             _activeProfile = resolution.Profile;
-            _currentStreamToken = resolution.StreamUrl; // token is the URL itself
+            _currentStreamToken = resolution.Token;
             _currentEpisodeId = command.EpisodeId.Value;
             _currentEpisode = episode;
             _currentMediaItem = mediaItem;
@@ -589,7 +666,7 @@ public sealed class WebControlService : IWebControlService, IDisposable
     /// <summary>
     /// Handles <c>ended</c>: marks playback as stopped, persists WatchState at 100%.
     /// </summary>
-    private Task HandleEndedAsync()
+    private async Task HandleEndedAsync()
     {
         int episodeId;
         double duration;
@@ -605,7 +682,21 @@ public sealed class WebControlService : IWebControlService, IDisposable
         PersistWatchState(episodeId, duration, duration, ended: true);
 
         RaiseStateChanged();
-        return Task.CompletedTask;
+
+        // Browser mode: auto-advance to the next episode, matching the desktop
+        // player behaviour (OnEngineMediaEnded navigates automatically).
+        bool autoAdvance;
+        lock (_lock)
+        {
+            autoAdvance = _mode == "browser"
+                && _currentEpisodeId != 0
+                && _episodes.GetNextEpisode(_currentEpisodeId) is not null;
+        }
+
+        if (autoAdvance)
+        {
+            await HandleEpisodeNavigationAsync(forward: true).ConfigureAwait(false);
+        }
     }
 
     /// <summary>
@@ -704,6 +795,40 @@ public sealed class WebControlService : IWebControlService, IDisposable
             await StartCastingForCurrentEpisodeAsync(device).ConfigureAwait(false);
         }
 
+        RaiseStateChanged();
+    }
+
+    /// <summary>
+    /// Moves an active DLNA casting session to <paramref name="episodeId"/> on
+    /// the same <paramref name="device"/>. Used when a <c>playEpisode</c>
+    /// arrives while a transmission is already running — the backend keeps
+    /// ownership of the session instead of handing it to the browser.
+    /// </summary>
+    private async Task SwitchCastingToEpisodeAsync(int episodeId, DlnaDeviceInfo device)
+    {
+        var episode = _episodes.GetById(episodeId);
+        if (episode is null)
+        {
+            RaiseStateChanged();
+            return;
+        }
+
+        var mediaItem = _mediaItems.GetById(episode.MediaItemId);
+
+        await _casting.StopCastingAsync().ConfigureAwait(false);
+
+        lock (_lock)
+        {
+            _currentEpisodeId = episode.Id;
+            _currentEpisode = episode;
+            _currentMediaItem = mediaItem;
+            _positionSec = 0;
+            _durationSec = episode.DurationSec ?? 0;
+            _isPlaying = false;
+            _isPaused = false;
+        }
+
+        await StartCastingForCurrentEpisodeAsync(device).ConfigureAwait(false);
         RaiseStateChanged();
     }
 
@@ -819,7 +944,8 @@ public sealed class WebControlService : IWebControlService, IDisposable
             SeriesTitle: seriesTitle,
             AvailableProfiles: availableProfiles,
             AvailableDevices: null, // populated on demand via discover command
-            IsPlayerClient: false); // set by WebSocketHandler per-connection
+            IsPlayerClient: false, // set by WebSocketHandler per-connection
+            EpisodeId: _currentEpisodeId); // internal: lets PlayerViewModel follow panel-driven navigation
     }
 
     /// <summary>

@@ -35,7 +35,7 @@ public sealed class LibraryApiService : ILibraryApiService
         var all = _categories.GetAll();
         var dtos = all
             .OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
-            .Select(c => new CategoryDto(c.Id, c.Name, c.FolderPath))
+            .Select(c => new CategoryDto(c.Id, c.Name, c.FolderPath, _mediaItems.GetByCategory(c.Id).Count))
             .ToList();
 
         return Task.FromResult(dtos);
@@ -50,6 +50,13 @@ public sealed class LibraryApiService : ILibraryApiService
             .ToList();
 
         return Task.FromResult(dtos);
+    }
+
+    /// <inheritdoc />
+    public Task<MediaItemDto?> GetItemAsync(int mediaItemId)
+    {
+        var item = _mediaItems.GetById(mediaItemId);
+        return Task.FromResult(item is null ? null : MapMediaItem(item));
     }
 
     /// <inheritdoc />
@@ -156,8 +163,26 @@ public sealed class LibraryApiService : ILibraryApiService
 
     #region Mapping helpers
 
-    private static MediaItemDto MapMediaItem(MediaItem m) =>
-        new(m.Id, m.CategoryId, m.Title, m.MediaType, m.CoverPath, m.Synopsis, m.Year, m.Genre, m.PosterUrl);
+    private MediaItemDto MapMediaItem(MediaItem m)
+    {
+        var posterUrl = m.PosterUrl;
+
+        // Capa fallback: sem capa configurada, usa o thumbnail de um episódio
+        // aleatório do item (servido via /api/thumbnail/{episodeId}).
+        if (string.IsNullOrWhiteSpace(posterUrl) && string.IsNullOrWhiteSpace(m.CoverPath))
+        {
+            var candidates = _episodes.GetByMediaItem(m.Id)
+                .Where(e => !string.IsNullOrWhiteSpace(e.ThumbnailPath))
+                .ToList();
+
+            if (candidates.Count > 0)
+            {
+                posterUrl = $"/api/thumbnail/{candidates[Random.Shared.Next(candidates.Count)].Id}";
+            }
+        }
+
+        return new MediaItemDto(m.Id, m.CategoryId, m.Title, m.MediaType, m.CoverPath, m.Synopsis, m.Year, m.Genre, posterUrl);
+    }
 
     private static EpisodeDto MapEpisode(Episode e) =>
         new(e.Id, e.MediaItemId, e.FilePath, e.SeasonNumber, e.EpisodeNumber, e.DisplayTitle, e.DurationSec, e.ThumbnailPath);
