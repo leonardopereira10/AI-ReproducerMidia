@@ -433,6 +433,35 @@ else()
         "catra-ffx-load-test builds but cannot run (runtime DLLs missing).")
 endif()
 
+# --- B1 evidence test (Story 01 RETRY, NOT installed/shipped) ----------------
+# Proves the B1 fix (pre-loading FFX providers by absolute path) works WITHOUT
+# manual DLL pre-loading. Unlike catra-ffx-load-test (which explicitly loads
+# all 8 DLLs first), this test calls FfxRuntime::IsAvailable() directly,
+# exercising the exact code path the real app uses. POST_BUILD copies the 8
+# FFX DLLs next to the exe (same pattern).
+add_executable(catra-b1-evidence-test
+    tools/b1_evidence_test.cpp
+    ffx_runtime.cpp)
+target_include_directories(catra-b1-evidence-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    "${CATRA_FFX_SDK_HEADERS}/api/include"
+    "${CATRA_FFX_SDK_HEADERS}/upscalers/include"
+    "${CATRA_FFX_SDK_HEADERS}/framegeneration/include")
+if(MSVC)
+    target_compile_options(catra-b1-evidence-test PRIVATE /W3 /utf-8 /EHsc)
+    target_compile_definitions(catra-b1-evidence-test PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+target_link_libraries(catra-b1-evidence-test PRIVATE d3d12 dxgi dxguid)
+
+if(EXISTS "${CATRA_FFX_DLL_DIR}")
+    foreach(_dll IN LISTS CATRA_FFX_DLLS)
+        add_custom_command(TARGET catra-b1-evidence-test POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${CATRA_FFX_DLL_DIR}/${_dll}" "$<TARGET_FILE_DIR:catra-b1-evidence-test>/${_dll}"
+            COMMAND_EXPAND_LISTS)
+    endforeach()
+endif()
+
 # --- FG playback smoke test (SPRINT_04 subtask 04, NOT installed/shipped) --
 # E2E native test of the catra_fg_* ABI: creates a real HWND + D3D11 device,
 # catra_init, catra_fg_create on the HWND, 90 presents at 30 fps with the
@@ -482,6 +511,39 @@ if(EXISTS "${CATRA_FFX_DLL_DIR}")
         add_custom_command(TARGET catra-fg-smoke-test POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     "${CATRA_FFX_DLL_DIR}/${_dll}" "$<TARGET_FILE_DIR:catra-fg-smoke-test>/${_dll}"
+            COMMAND_EXPAND_LISTS)
+    endforeach()
+endif()
+
+# --- FG OFFLINE spike test (subtask 03 Story 03, NOT installed/shipped) ----
+# Feasibility POC for FSR 3 Frame Generation WITHOUT a playback swapchain:
+# U1 Configure(swapChain=nullptr) probe (+ hidden dummy-swapchain fallback),
+# U2 offscreen dispatch with internal optical flow (no Prepare), U3 output
+# resource-state scheme probe, U5 frameID-gap probe, U6 1080p timing.
+# Compiles ONLY ffx_runtime.cpp (no bridge ABI / no catra_init); the tool
+# owns its own D3D12 device + queue. POST_BUILD copies the 8 FFX runtime
+# DLLs next to the exe. Graceful SKIP (exit 0) without the runtime/GPU.
+add_executable(catra-fg-offline-test
+    tools/fg_offline_smoke_test.cpp
+    ffx_runtime.cpp)
+target_include_directories(catra-fg-offline-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    "${CATRA_FFX_SDK_HEADERS}/api/include"
+    "${CATRA_FFX_SDK_HEADERS}/upscalers/include"
+    "${CATRA_FFX_SDK_HEADERS}/framegeneration/include")
+if(MSVC)
+    target_compile_options(catra-fg-offline-test PRIVATE /W3 /utf-8 /EHsc)
+    target_compile_definitions(catra-fg-offline-test PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+target_link_libraries(catra-fg-offline-test PRIVATE d3d12 dxgi dxguid user32)
+if(TARGET Microsoft::DirectX-Headers)
+    target_link_libraries(catra-fg-offline-test PRIVATE Microsoft::DirectX-Headers)
+endif()
+if(EXISTS "${CATRA_FFX_DLL_DIR}")
+    foreach(_dll IN LISTS CATRA_FFX_DLLS)
+        add_custom_command(TARGET catra-fg-offline-test POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${CATRA_FFX_DLL_DIR}/${_dll}" "$<TARGET_FILE_DIR:catra-fg-offline-test>/${_dll}"
             COMMAND_EXPAND_LISTS)
     endforeach()
 endif()
