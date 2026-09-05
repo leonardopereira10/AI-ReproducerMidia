@@ -20,6 +20,7 @@ internal sealed class FakeNativeLibrary : INativeLibrary
     public int InitResult { get; set; }
     public int UpscaleModeResult { get; set; }
     public int Fsr4Result { get; set; }
+    public int FfxAvailableResult { get; set; }
     public int InterpMethodResult { get; set; }
 
     public int InterpCreateResult { get; set; }
@@ -101,6 +102,8 @@ internal sealed class FakeNativeLibrary : INativeLibrary
     public int GetUpscaleMode() => UpscaleModeResult;
 
     public int IsFsr4Available() => Fsr4Result;
+
+    public int IsFfxAvailable() => FfxAvailableResult;
 
     public int GetInterpMethod() => InterpMethodResult;
 
@@ -311,6 +314,13 @@ public class NativeBridgeTests
     }
 
     [Fact]
+    public void Unavailable_IsFfxAvailable_ReturnsFalse()
+    {
+        var bridge = new NativeBridge(new FakeNativeLibrary { IsAvailable = false });
+        bridge.IsFfxAvailable().Should().BeFalse();
+    }
+
+    [Fact]
     public void Unavailable_GetUpscaleMode_ReturnsZero()
     {
         var bridge = new NativeBridge(new FakeNativeLibrary { IsAvailable = false });
@@ -453,6 +463,20 @@ public class NativeBridgeTests
     {
         var lib = new FakeNativeLibrary { IsAvailable = true, Fsr4Result = 1 };
         new NativeBridge(lib).IsFsr4Available().Should().BeTrue();
+    }
+
+    [Fact]
+    public void Available_IsFfxAvailable_NativeNonZero_ReturnsTrue()
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = true, FfxAvailableResult = 1 };
+        new NativeBridge(lib).IsFfxAvailable().Should().BeTrue();
+    }
+
+    [Fact]
+    public void Available_IsFfxAvailable_NativeZero_ReturnsFalse()
+    {
+        var lib = new FakeNativeLibrary { IsAvailable = true, FfxAvailableResult = 0 };
+        new NativeBridge(lib).IsFfxAvailable().Should().BeFalse();
     }
 
     [Fact]
@@ -1271,6 +1295,7 @@ public class NativeBridgePInvokeSignatureTests
             "catra_shutdown",
             "catra_get_upscale_mode",
             "catra_is_fsr4_available",
+            "catra_is_ffx_available",
             "catra_get_interp_method",
             "catra_set_log_callback",
             "catra_interp_create",
@@ -1317,7 +1342,7 @@ public class NativeBridgePInvokeSignatureTests
             .Where(m => m.GetCustomAttribute<DllImportAttribute>() is not null)
             .ToList();
 
-        imports.Should().HaveCount(25, "the full catra_gpu.h C ABI must be declared");
+        imports.Should().HaveCount(26, "the full catra_gpu.h C ABI must be declared");
         imports.Should().OnlyContain(m => m.IsPrivate);
     }
 
@@ -1349,6 +1374,7 @@ public class NativeLibraryLoaderAvailabilityTests
             // DLL absent (typical dev/CI): queries degrade, init throws the
             // graceful NativeBridgeException rather than DllNotFoundException.
             bridge.IsFsr4Available().Should().BeFalse();
+            bridge.IsFfxAvailable().Should().BeFalse();
             bridge.GetUpscaleMode().Should().Be(0);
             bridge.GetInterpMethod().Should().Be(0);
 
@@ -1361,6 +1387,7 @@ public class NativeLibraryLoaderAvailabilityTests
             var act = () =>
             {
                 _ = bridge.IsFsr4Available();
+                _ = bridge.IsFfxAvailable();
                 _ = bridge.GetUpscaleMode();
                 _ = bridge.GetInterpMethod();
             };

@@ -108,6 +108,17 @@
           DestinationFolder="$(CatraOutputNativeDir)"
           SkipUnchangedFiles="true"
           Condition="'$(NativeBuildEnabled)' == 'true' And Exists('$(CatraNativeDir)\amd_fidelityfx_loader_dx12.dll')" />
+
+    <!-- B2 fix: delete any stale catra-gpu.dll from the output root. A stale
+         copy (e.g. from a manual copy or old build artifact) in the bin root
+         shadows the correct one in runtimes/win-x64/native/ (the P/Invoke
+         default resolver searches the app base directory first). The
+         DllImportResolver in NativeBridge.cs also mitigates this, but removing
+         the stale file eliminates the root cause. -->
+    <Delete Files="$(OutDir)catra-gpu.dll"
+            Condition="Exists('$(OutDir)catra-gpu.dll')" />
+    <Delete Files="$(OutDir)catra-gpu.pdb"
+            Condition="Exists('$(OutDir)catra-gpu.pdb')" />
   </Target>
 
 </Project>

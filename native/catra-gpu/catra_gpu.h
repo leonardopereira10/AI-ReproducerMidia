@@ -141,6 +141,13 @@ CATRA_API int  catra_get_upscale_mode(void);
 // when any check fails.
 CATRA_API int  catra_is_fsr4_available(void);
 
+// Pre-init FFX availability probe (Story 01 fix): returns non-zero when the
+// FFX runtime is loadable and usable (loader DLL, 8 dependency DLLs, DX12
+// adapter, upscale provider). Unlike catra_is_fsr4_available, this does NOT
+// require catra_init — it creates a transient DX12 device internally. Safe to
+// call before any video plays (e.g. from the Settings UI on first open).
+CATRA_API int  catra_is_ffx_available(void);
+
 // Active interpolation method (CATRA_INTERP_*). Returns CATRA_INTERP_RIFE
 // when the bridge was compiled with ONNX Runtime, CATRA_INTERP_NONE otherwise
 // (no ONNX Runtime, or source fps already meets the target at create time).

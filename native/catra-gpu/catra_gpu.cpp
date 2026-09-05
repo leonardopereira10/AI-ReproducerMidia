@@ -627,7 +627,29 @@ int catra_is_fsr4_available(void)
     // adapter (the FFX runtime picks FSR 4 ML on RDNA 4, FSR 3.1 elsewhere).
     // Returns 0 before catra_init (no active adapter) and on any probe failure.
     return GuardCabi([&]() -> int {
-        return catra::Fsr4IsAvailable(g_device.Get()) ? 1 : 0;
+        const bool available = catra::Fsr4IsAvailable(g_device.Get());
+        log_msg(CATRA_LOG_INFO,
+                "catra_is_fsr4_available: result=%s (g_device=%p)",
+                available ? "true" : "false",
+                static_cast<void*>(g_device.Get()));
+        return available ? 1 : 0;
+    });
+}
+
+int catra_is_ffx_available(void)
+{
+    // Pre-init FFX availability probe (Story 01 fix): delegates to
+    // FfxRuntime::IsAvailable() which does NOT require g_device — it creates
+    // its own transient DX12 device. Safe to call before catra_init() so the
+    // Settings UI can show real FSR 4 availability on first open.
+    // Checks: FFX loader DLL loadable, 8 dependency DLLs present, DX12 adapter
+    // exists, FFX upscale provider reports >= 1 version.
+    return GuardCabi([&]() -> int {
+        const bool available = catra::ffx::FfxRuntime::IsAvailable();
+        log_msg(CATRA_LOG_INFO,
+                "catra_is_ffx_available: result=%s (pre-init probe)",
+                available ? "true" : "false");
+        return available ? 1 : 0;
     });
 }
 

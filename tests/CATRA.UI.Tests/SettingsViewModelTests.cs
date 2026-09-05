@@ -23,13 +23,14 @@ public sealed class SettingsViewModelTests
         public FakeFolderPicker FolderPicker { get; } = new();
         public FakeNavigator Navigator { get; } = new();
         public FakeDialogService Dialogs { get; } = new();
+        public FakeNativeBridge NativeBridge { get; } = new();
         public SettingsViewModel ViewModel { get; }
 
         public Fixture(IDictionary<string, string>? seed = null)
         {
             Settings = new FakeAppSettingsRepository(seed ?? new Dictionary<string, string>());
             ViewModel = new SettingsViewModel(
-                Settings, Theme, Scanner, FolderPicker, Navigator, Dialogs);
+                Settings, Theme, Scanner, FolderPicker, Navigator, Dialogs, NativeBridge);
         }
     }
 

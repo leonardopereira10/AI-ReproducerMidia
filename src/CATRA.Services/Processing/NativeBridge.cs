@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Runtime.InteropServices;
 using CATRA.Core.Interfaces;
 
@@ -49,6 +50,7 @@ internal interface INativeLibrary
     void Shutdown();
     int GetUpscaleMode();
     int IsFsr4Available();
+    int IsFfxAvailable();
     int GetInterpMethod();
     void SetLogCallback(NativeLogCallback? callback);
 
@@ -96,7 +98,98 @@ internal sealed class NativeLibraryLoader : INativeLibrary
 
     private static readonly Lazy<bool> s_available = new(DetectAvailability);
 
+    // B2 fix: cache the resolved absolute path so NativeLibrary.SetDllImportResolver
+    // always loads from runtimes/win-x64/native/ (the correct, fully-built DLL),
+    // never from a stale copy in the bin root. The resolver runs once per process.
+    private static readonly Lazy<string?> s_resolvedPath = new(ResolveNativeDllPath);
+
+    // B2 fix: register the DLL import resolver once (process-global).
+    // NativeLibrary.SetDllImportResolver is idempotent — calling multiple times
+    // overwrites, which is harmless (we always register the same resolver).
+    private static bool s_resolverRegistered;
+    private static readonly object s_resolverLock = new();
+
     public bool IsAvailable => s_available.Value;
+
+    /// <summary>
+    /// Resolves the absolute path to catra-gpu.dll, preferring
+    /// <c>runtimes/win-x64/native/</c> (the fully-built DLL with all exports)
+    /// over any stale copy in the bin root. Returns null when not found.
+    /// </summary>
+    private static string? ResolveNativeDllPath()
+    {
+        string baseDir = AppContext.BaseDirectory;
+
+        // PREFERRED: runtimes/win-x64/native/ — this is where the csproj
+        // BuildNativeBridge target copies the fully-built DLL (1.38MB with
+        // all exports). A stale DLL in the bin root (189KB, leftover from
+        // manual copies or old build artifacts) shadows this and causes
+        // EntryPointNotFoundException or missing FFX providers.
+        string preferred = Path.Combine(baseDir, "runtimes", "win-x64", "native", LibraryName);
+        if (File.Exists(preferred))
+        {
+            System.Diagnostics.Trace.WriteLine($"[NativeBridge] resolved {LibraryName} -> {preferred}");
+            return preferred;
+        }
+
+        // FALLBACK: bin root (may be stale, but better than nothing on CI/dev
+        // machines where the native build hasn't run).
+        string root = Path.Combine(baseDir, LibraryName);
+        if (File.Exists(root))
+        {
+            System.Diagnostics.Trace.WriteLine($"[NativeBridge] resolved {LibraryName} -> {root} (root fallback)");
+            return root;
+        }
+
+        System.Diagnostics.Trace.WriteLine($"[NativeBridge] {LibraryName} not found in {baseDir}");
+        return null;
+    }
+
+    /// <summary>
+    /// Registers a process-global DLL import resolver that loads catra-gpu.dll
+    /// by absolute path from runtimes/win-x64/native/. This prevents a stale
+    /// copy in the bin root from being loaded by the default P/Invoke resolver.
+    /// </summary>
+    internal static void EnsureDllImportResolver()
+    {
+        if (s_resolverRegistered)
+        {
+            return;
+        }
+
+        lock (s_resolverLock)
+        {
+            if (s_resolverRegistered)
+            {
+                return;
+            }
+
+            NativeLibrary.SetDllImportResolver(
+                typeof(NativeLibraryLoader).Assembly,
+                (libraryName, assembly, searchPath) =>
+                {
+                    if (!string.Equals(libraryName, LibraryName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return IntPtr.Zero; // let the default resolver handle it
+                    }
+
+                    string? path = s_resolvedPath.Value;
+                    if (path == null)
+                    {
+                        return IntPtr.Zero; // not found, let default resolver fail gracefully
+                    }
+
+                    if (NativeLibrary.TryLoad(path, out IntPtr handle))
+                    {
+                        return handle;
+                    }
+
+                    return IntPtr.Zero;
+                });
+
+            s_resolverRegistered = true;
+        }
+    }
 
     /// <summary>
     /// Probes the same locations the runtime native loader uses: the app base
@@ -105,22 +198,10 @@ internal sealed class NativeLibraryLoader : INativeLibrary
     /// </summary>
     private static bool DetectAvailability()
     {
-        string baseDir = AppContext.BaseDirectory;
-        string[] candidates =
-        {
-            Path.Combine(baseDir, LibraryName),
-            Path.Combine(baseDir, "runtimes", "win-x64", "native", LibraryName),
-        };
-
-        foreach (string candidate in candidates)
-        {
-            if (File.Exists(candidate))
-            {
-                return true;
-            }
-        }
-
-        return false;
+        // B2 fix: register the DLL import resolver as early as possible so
+        // subsequent P/Invoke calls use the correct DLL.
+        EnsureDllImportResolver();
+        return s_resolvedPath.Value != null;
     }
 
     public int Init(IntPtr d3d11Device) => catra_init(d3d11Device);
@@ -130,6 +211,11 @@ internal sealed class NativeLibraryLoader : INativeLibrary
     public int GetUpscaleMode() => catra_get_upscale_mode();
 
     public int IsFsr4Available() => catra_is_fsr4_available();
+
+    public int IsFfxAvailable() => catra_is_ffx_available();
+
+    // N4: static accessor for the process-level cache lambda.
+    internal static int StaticIsFfxAvailable() => catra_is_ffx_available();
 
     public int GetInterpMethod() => catra_get_interp_method();
 
@@ -203,6 +289,9 @@ internal sealed class NativeLibraryLoader : INativeLibrary
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     private static extern int catra_is_fsr4_available();
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int catra_is_ffx_available();
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     private static extern int catra_get_interp_method();
@@ -385,6 +474,66 @@ public sealed class NativeBridge : INativeBridge
         }
 
         return _library.IsFsr4Available() > 0;
+    }
+
+    /// <inheritdoc />
+    public bool IsFfxAvailable()
+    {
+        if (!_library.IsAvailable)
+        {
+            return false;
+        }
+
+        // N4 fix: when using the real NativeLibraryLoader (production), cache
+        // the probe result at process level. The FFX probe creates a transient
+        // D3D12 device + calls ffxQuery (measured 82-164ms on RDNA4). Caching
+        // ensures repeated Settings navigation doesn't block the UI thread.
+        //
+        // Tests use FakeNativeLibrary (not NativeLibraryLoader), so the cache
+        // is bypassed — each test controls the fake's return value directly.
+        if (_library is NativeLibraryLoader)
+        {
+            return s_ffxProbeCache.Value;
+        }
+
+        return _library.IsFfxAvailable() > 0;
+    }
+
+    // N4: process-level cache for the FFX availability probe. Only populated
+    // when NativeBridge wraps the real NativeLibraryLoader (production path).
+    // Static Lazy ensures the probe runs at most once per process lifetime.
+    private static Lazy<bool> s_ffxProbeCache = new(ProbeFfxAvailableNative);
+
+    private static bool ProbeFfxAvailableNative()
+    {
+        try
+        {
+            return NativeLibraryLoader.StaticIsFfxAvailable() > 0;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            // N3: stale DLL or old build without catra_is_ffx_available export.
+            System.Diagnostics.Trace.WriteLine(
+                "[NativeBridge] catra_is_ffx_available entry point not found (stale DLL?)");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"[NativeBridge] FFX probe failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Resets the process-level FFX probe cache. Call between tests that
+    /// exercise the real <see cref="NativeLibraryLoader"/> path with different
+    /// expected outcomes (e.g. after deploying a correct DLL to replace a stale one).
+    /// No-op for tests using <c>FakeNativeLibrary</c> (they bypass the cache).
+    /// </summary>
+    internal static void ResetFfxProbeCache()
+    {
+        s_ffxProbeCache = new Lazy<bool>(ProbeFfxAvailableNative);
     }
 
     /// <inheritdoc />

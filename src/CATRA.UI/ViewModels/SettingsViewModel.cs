@@ -27,6 +27,7 @@ public sealed partial class SettingsViewModel : ObservableObject
     private readonly IFolderPicker _folderPicker;
     private readonly IAppNavigator _navigator;
     private readonly IDialogService _dialogs;
+    private readonly INativeBridge _nativeBridge;
 
     // Suppresses auto-save / side effects while the ctor hydrates the bindables.
     private bool _loading = true;
@@ -38,7 +39,8 @@ public sealed partial class SettingsViewModel : ObservableObject
         ILibraryScanner scanner,
         IFolderPicker folderPicker,
         IAppNavigator navigator,
-        IDialogService dialogs)
+        IDialogService dialogs,
+        INativeBridge nativeBridge)
     {
         _settings = settings ?? throw new ArgumentNullException(nameof(settings));
         _theme = theme ?? throw new ArgumentNullException(nameof(theme));
@@ -46,6 +48,7 @@ public sealed partial class SettingsViewModel : ObservableObject
         _folderPicker = folderPicker ?? throw new ArgumentNullException(nameof(folderPicker));
         _navigator = navigator ?? throw new ArgumentNullException(nameof(navigator));
         _dialogs = dialogs ?? throw new ArgumentNullException(nameof(dialogs));
+        _nativeBridge = nativeBridge ?? throw new ArgumentNullException(nameof(nativeBridge));
 
         var model = AppSettingsModel.Load(settings);
 
@@ -88,6 +91,24 @@ public sealed partial class SettingsViewModel : ObservableObject
         _dlnaFpsText = model.DlnaTargetFps.ToString(CultureInfo.InvariantCulture);
 
         _loading = false;
+
+        // Story 01 fix: probe real FFX availability via the native bridge.
+        // N2 fix: use IsFsr4Available() when bridge is initialized (definitive,
+        // uses the decoder's adapter), else fall back to IsFfxAvailable() (pre-init
+        // probe, uses a transient DX12 device on the default adapter).
+        // This replaces the hardcoded default with the actual system state.
+        try
+        {
+            _fsr4Available = _nativeBridge.IsInitialized
+                ? _nativeBridge.IsFsr4Available()
+                : _nativeBridge.IsFfxAvailable();
+        }
+        catch
+        {
+            // N3: if the native bridge throws during probe (e.g. EntryPointNotFoundException
+            // on a stale DLL), degrade to unavailable without crashing.
+            _fsr4Available = false;
+        }
 
         OnPropertyChanged(nameof(SkipIntroDisplay));
         OnPropertyChanged(nameof(LocalSizeEstimate));
@@ -298,11 +319,14 @@ public sealed partial class SettingsViewModel : ObservableObject
         string.Empty;
 
     /// <summary>
-    /// Whether FSR 4 is available on this machine (headless default: true;
-    /// injectable/overridable for machines without FSR 4 support).
+    /// Whether FSR 4 is available on this machine. Default: <c>false</c>
+    /// (fail-safe — N5 fix). The constructor probes the native bridge and
+    /// updates this value. When the probe fails or the bridge is unavailable,
+    /// FSR 4 stays marked as unavailable and the UI shows a suggestion to
+    /// use FSR 1 instead.
     /// </summary>
     [ObservableProperty]
-    private bool _fsr4Available = true;
+    private bool _fsr4Available = false;
 
     /// <summary>
     /// Warning shown when FSR 4 is selected but unavailable (empty when OK).

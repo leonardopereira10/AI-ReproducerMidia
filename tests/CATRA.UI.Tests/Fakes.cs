@@ -800,3 +800,57 @@ internal sealed class FakeWebControlService : IWebControlService
     public void RaisePositionChanged(double position, double duration)
         => PositionChanged?.Invoke(this, (position, duration));
 }
+
+/// <summary>
+/// Minimal <see cref="INativeBridge"/> fake for UI view-model tests that need
+/// to control capability queries (IsFsr4Available, IsFfxAvailable) without
+/// touching the real native DLL. Operations that need the GPU throw
+/// <see cref="NotImplementedException"/> — tests that exercise those paths
+/// should use the full <c>FakeNativeBridge</c> in Services.Tests instead.
+/// </summary>
+internal sealed class FakeNativeBridge : INativeBridge
+{
+    public bool IsAvailable { get; set; } = true;
+    public bool IsInitialized { get; set; }
+    public bool Fsr4AvailableResult { get; set; }
+    public bool FfxAvailableResult { get; set; } = true;
+    public int UpscaleModeResult { get; set; }
+    public int InterpMethodResult { get; set; }
+
+    // N3 fix: when set, IsFfxAvailable() throws this exception, simulating
+    // EntryPointNotFoundException on a stale catra-gpu.dll (missing export).
+    public Exception? FfxProbeException { get; set; }
+
+    public void Initialize(IntPtr d3d11Device) { IsInitialized = true; }
+    public void Shutdown() { IsInitialized = false; }
+    public bool IsFsr4Available() => IsAvailable && Fsr4AvailableResult;
+    public bool IsFfxAvailable()
+    {
+        if (FfxProbeException is not null)
+        {
+            throw FfxProbeException;
+        }
+
+        // Mirror NativeBridge behavior: return false when library is unavailable.
+        return IsAvailable && FfxAvailableResult;
+    }
+    public int GetUpscaleMode() => IsAvailable ? UpscaleModeResult : 0;
+    public int GetInterpMethod() => IsAvailable ? InterpMethodResult : 0;
+
+    public IntPtr CreateInterpolation(int sw, int sh, double sfps, double tfps, int method) => throw new NotImplementedException();
+    public int ProcessInterpolation(IntPtr ctx, IntPtr a, IntPtr b, out IntPtr buf) { buf = IntPtr.Zero; throw new NotImplementedException(); }
+    public void DestroyInterpolation(IntPtr ctx) { }
+    public IntPtr CreateUpscaler(int sw, int sh, int dw, int dh, int method) => throw new NotImplementedException();
+    public IntPtr ProcessUpscale(IntPtr ctx, IntPtr src) => throw new NotImplementedException();
+    public void DestroyUpscaler(IntPtr ctx) { }
+    public int SubmitUpscaleAsync(IntPtr ctx, IntPtr src) => throw new NotImplementedException();
+    public IntPtr PollUpscaleResult(IntPtr ctx, int ticket) => throw new NotImplementedException();
+    public int GetUpscalePendingCount(IntPtr ctx) => 0;
+    public IntPtr CreateEncoder(int w, int h, int bitrate, double fps) => throw new NotImplementedException();
+    public void EncodeFrame(IntPtr ctx, IntPtr tex, out IntPtr buf, out int size) { buf = IntPtr.Zero; size = 0; throw new NotImplementedException(); }
+    public void FlushEncoder(IntPtr ctx, out IntPtr buf, out int size) { buf = IntPtr.Zero; size = 0; throw new NotImplementedException(); }
+    public void DestroyEncoder(IntPtr ctx) { }
+    public void ReleaseTexture(IntPtr texture) { }
+    public void FreeNativeArray(IntPtr ptr) { }
+    public void Dispose() { }
+}

@@ -211,6 +211,8 @@ bool Fsr4IsAvailable(ID3D11Device* d3d11Device)
 {
     if (d3d11Device == nullptr)
     {
+        BackendLog(CATRA_LOG_INFO,
+                   "upscale_fsr4: d3d11Device is null (bridge not initialized) -> FSR 4 off");
         return false;
     }
 

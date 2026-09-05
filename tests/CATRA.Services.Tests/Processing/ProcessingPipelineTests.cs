@@ -198,6 +198,8 @@ internal sealed class FakeNativeBridge : INativeBridge
 
     public bool IsFsr4Available() => true;
 
+    public bool IsFfxAvailable() => true;
+
     public int GetUpscaleMode() => 2;
 
     public int GetInterpMethod() => 1;

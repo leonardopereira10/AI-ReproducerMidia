@@ -48,6 +48,15 @@ public interface INativeBridge : IDisposable
     /// <summary>Whether FSR 4 is usable on the active adapter. Returns <c>false</c> when unavailable.</summary>
     bool IsFsr4Available();
 
+    /// <summary>
+    /// Pre-init FFX availability probe: returns <c>true</c> when the FFX runtime
+    /// is loadable and usable (loader DLL, 8 dependency DLLs, DX12 adapter and
+    /// upscale provider all present). Unlike <see cref="IsFsr4Available"/>, this
+    /// does NOT require <see cref="Initialize"/> — it creates a transient DX12
+    /// device internally. Safe to call from the Settings UI on first open.
+    /// </summary>
+    bool IsFfxAvailable();
+
     /// <summary>Current upscale mode: 0 = off, 1 = FSR 1, 2 = FSR 4. Returns 0 when unavailable.</summary>
     int GetUpscaleMode();
 

@@ -16,6 +16,7 @@ public sealed class SettingsProcessingTests
     private sealed class Fixture
     {
         public FakeAppSettingsRepository Settings { get; }
+        public FakeNativeBridge NativeBridge { get; } = new();
         public SettingsViewModel ViewModel { get; }
 
         public Fixture(IDictionary<string, string>? seed = null)
@@ -27,7 +28,8 @@ public sealed class SettingsProcessingTests
                 new FakeLibraryScanner(),
                 new FakeFolderPicker(),
                 new FakeNavigator(),
-                new FakeDialogService());
+                new FakeDialogService(),
+                NativeBridge);
         }
     }
 
@@ -376,5 +378,164 @@ public sealed class SettingsProcessingTests
         fixture.ViewModel.UpscaleMethod = "fsr4";
 
         fixture.ViewModel.UpscaleWarning.Should().NotBeEmpty();
+    }
+
+    // ------------------------------------------------------------------
+    // Story 01 fix: Fsr4Available reflects real native probe
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public void Ctor_probes_native_FfxAvailability_and_sets_Fsr4Available_true()
+    {
+        var fixture = new Fixture();
+        fixture.NativeBridge.FfxAvailableResult = true;
+
+        // Re-construct with the bridge configured
+        var vm = new SettingsViewModel(
+            fixture.Settings,
+            new FakeThemeService(),
+            new FakeLibraryScanner(),
+            new FakeFolderPicker(),
+            new FakeNavigator(),
+            new FakeDialogService(),
+            fixture.NativeBridge);
+
+        vm.Fsr4Available.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Ctor_probes_native_FfxAvailability_and_sets_Fsr4Available_false()
+    {
+        var bridge = new FakeNativeBridge { FfxAvailableResult = false };
+        var vm = new SettingsViewModel(
+            new FakeAppSettingsRepository(),
+            new FakeThemeService(),
+            new FakeLibraryScanner(),
+            new FakeFolderPicker(),
+            new FakeNavigator(),
+            new FakeDialogService(),
+            bridge);
+
+        vm.Fsr4Available.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Ctor_shows_warning_when_FFX_unavailable_and_fsr4_selected()
+    {
+        var bridge = new FakeNativeBridge { FfxAvailableResult = false };
+        var settings = new FakeAppSettingsRepository(new Dictionary<string, string>
+        {
+            [AppSettingsModel.UpscaleMethodKey] = "fsr4",
+        });
+        var vm = new SettingsViewModel(
+            settings,
+            new FakeThemeService(),
+            new FakeLibraryScanner(),
+            new FakeFolderPicker(),
+            new FakeNavigator(),
+            new FakeDialogService(),
+            bridge);
+
+        vm.Fsr4Available.Should().BeFalse();
+        vm.UpscaleWarning.Should().Contain("FSR 4").And.Contain("FSR 1");
+    }
+
+    [Fact]
+    public void Ctor_no_warning_when_FFX_available_and_fsr4_selected()
+    {
+        var bridge = new FakeNativeBridge { FfxAvailableResult = true };
+        var settings = new FakeAppSettingsRepository(new Dictionary<string, string>
+        {
+            [AppSettingsModel.UpscaleMethodKey] = "fsr4",
+        });
+        var vm = new SettingsViewModel(
+            settings,
+            new FakeThemeService(),
+            new FakeLibraryScanner(),
+            new FakeFolderPicker(),
+            new FakeNavigator(),
+            new FakeDialogService(),
+            bridge);
+
+        vm.Fsr4Available.Should().BeTrue();
+        vm.UpscaleWarning.Should().BeEmpty();
+    }
+
+    // ------------------------------------------------------------------
+    // N3 fix: EntryPointNotFoundException degradation (stale DLL)
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public void Ctor_degrades_gracefully_when_FfxProbe_throws_EntryPointNotFoundException()
+    {
+        // Simulates a stale catra-gpu.dll (189KB, old build) that lacks the
+        // catra_is_ffx_available export. The P/Invoke throws EntryPointNotFoundException;
+        // the SettingsViewModel catches it and degrades to Fsr4Available=false.
+        var bridge = new FakeNativeBridge
+        {
+            FfxProbeException = new EntryPointNotFoundException("catra_is_ffx_available"),
+        };
+        var settings = new FakeAppSettingsRepository(new Dictionary<string, string>
+        {
+            [AppSettingsModel.UpscaleMethodKey] = "fsr4",
+        });
+
+        var act = () => new SettingsViewModel(
+            settings,
+            new FakeThemeService(),
+            new FakeLibraryScanner(),
+            new FakeFolderPicker(),
+            new FakeNavigator(),
+            new FakeDialogService(),
+            bridge);
+
+        // Must not crash.
+        var vm = act.Should().NotThrow().Subject;
+        vm.Fsr4Available.Should().BeFalse();
+        vm.UpscaleWarning.Should().Contain("FSR 4").And.Contain("FSR 1");
+    }
+
+    [Fact]
+    public void Ctor_uses_IsFsr4Available_when_bridge_already_initialized()
+    {
+        // N2 fix: when bridge.IsInitialized is true (e.g. Settings opened during
+        // playback), the VM uses IsFsr4Available (definitive, adapter-specific)
+        // instead of IsFfxAvailable (transient, default adapter).
+        var bridge = new FakeNativeBridge
+        {
+            IsInitialized = true,
+            Fsr4AvailableResult = true,
+            FfxAvailableResult = false, // would contradict if used
+        };
+
+        var vm = new SettingsViewModel(
+            new FakeAppSettingsRepository(),
+            new FakeThemeService(),
+            new FakeLibraryScanner(),
+            new FakeFolderPicker(),
+            new FakeNavigator(),
+            new FakeDialogService(),
+            bridge);
+
+        vm.Fsr4Available.Should().BeTrue("IsFsr4Available (definitive) takes precedence when bridge is initialized");
+    }
+
+    [Fact]
+    public void Ctor_default_fsr4Available_is_false_fail_safe()
+    {
+        // N5 fix: default _fsr4Available is false (fail-safe), not true.
+        // When the bridge is unavailable or throws, Fsr4Available stays false.
+        var bridge = new FakeNativeBridge { IsAvailable = false };
+
+        var vm = new SettingsViewModel(
+            new FakeAppSettingsRepository(),
+            new FakeThemeService(),
+            new FakeLibraryScanner(),
+            new FakeFolderPicker(),
+            new FakeNavigator(),
+            new FakeDialogService(),
+            bridge);
+
+        vm.Fsr4Available.Should().BeFalse("fail-safe default when bridge is unavailable");
     }
 }

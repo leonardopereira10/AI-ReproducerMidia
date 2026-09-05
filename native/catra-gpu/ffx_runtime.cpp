@@ -43,6 +43,26 @@ constexpr const char* kDependencyDlls[] = {
     "dxil.dll",
 };
 
+// B1 fix (reviewer): FFX provider DLLs that the loader internally loads BY
+// NAME via the process default DLL search order. The loader calls
+// LoadLibrary("amd_fidelityfx_upscaler_dx12.dll") etc. — the OS searches exe
+// dir, system dirs, CWD and PATH, but NOT runtimes/win-x64/native/ where the
+// DLLs actually live. Pre-loading them here by absolute path ensures the OS
+// reuses the already-loaded module (LoadLibrary returns the existing HMODULE)
+// when the loader later resolves them by name.
+//
+// N8 note: LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR fails with err=126 outside the
+// .NET host process (e.g. standalone C++ harness). The fallback (flags=0)
+// still works because the path is absolute. We do NOT use
+// SetDefaultDllDirectories (conflicts with SetDllDirectory(lib/ffmpeg) in
+// App.xaml.cs).
+constexpr const char* kProviderDlls[] = {
+    "amd_fidelityfx_upscaler_dx12.dll",
+    "amd_fidelityfx_framegeneration_dx12.dll",
+    "amd_ags_x64.dll",
+    "amd_acs_x64.dll",
+};
+
 // Loader state, guarded by g_mutex (same pattern as g_logMutex in
 // catra_gpu.cpp). Load/Unload are idempotent.
 std::mutex g_mutex;
@@ -135,7 +155,10 @@ bool FfxRuntime::Load()
     // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR requires an absolute path and resolves
     // the loader's own dependencies from the loader's directory — mandatory
     // because the FFX dir is outside the process default DLL search order.
-    const std::wstring fullPath = ModuleDirWide() + L"\\" + AsciiToWide(kLoaderDllName);
+    const std::wstring moduleDir = ModuleDirWide();
+    const std::wstring fullPath = moduleDir + L"\\" + AsciiToWide(kLoaderDllName);
+    catra::BackendLog(CATRA_LOG_INFO,
+                      "[FFX] Load: moduleDir=%ls", moduleDir.c_str());
     HMODULE mod = LoadLibraryExW(fullPath.c_str(), nullptr,
                                  LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR);
     if (mod == nullptr)
@@ -173,11 +196,58 @@ bool FfxRuntime::Load()
         return false;
     }
 
+    // B1 fix: pre-load FFX provider DLLs by absolute path BEFORE the first
+    // ffxQuery. The FFX loader (amd_fidelityfx_loader_dx12.dll) internally
+    // loads providers BY NAME (e.g. LoadLibrary("amd_fidelityfx_upscaler_dx12.dll")),
+    // which uses the process default DLL search order — this does NOT include
+    // runtimes/win-x64/native/ where the DLLs actually live. By pre-loading
+    // them here, the OS finds the already-loaded module and returns the same
+    // HMODULE (LoadLibrary deduplicates by canonical path).
+    //
+    // Evidence: without this pre-load, ffxQuery(GetVersions) returns ret=4
+    // (FFX_API_RETURN_NO_PROVIDER) even with all 8 DLLs present next to the
+    // loader module. With SetDllDirectory(runtimes dir) → ret=1 (success);
+    // without → ret=4. This proves the loader finds providers via search path,
+    // not relative to its own module.
+    for (const char* provName : kProviderDlls)
+    {
+        const std::wstring provPath = moduleDir + L"\\" + AsciiToWide(provName);
+        HMODULE provMod = LoadLibraryExW(provPath.c_str(), nullptr,
+                                         LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR);
+        if (provMod == nullptr)
+        {
+            // N8 fallback: LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR fails with err=126
+            // outside the .NET host (standalone C++ harness). Retry with flags=0
+            // (default search order); the absolute path still resolves.
+            const DWORD err = GetLastError();
+            provMod = LoadLibraryExW(provPath.c_str(), nullptr, 0);
+            if (provMod != nullptr)
+            {
+                catra::BackendLog(CATRA_LOG_WARN,
+                                  "[FFX] provider %s pre-loaded via fallback (flags=0), "
+                                  "LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR err=%lu",
+                                  provName, err);
+            }
+        }
+        if (provMod == nullptr)
+        {
+            catra::BackendLog(CATRA_LOG_WARN,
+                              "[FFX] provider pre-load FAILED: %s err=%lu "
+                              "(ffxQuery will likely return NO_PROVIDER)",
+                              provName, GetLastError());
+        }
+        else
+        {
+            catra::BackendLog(CATRA_LOG_INFO,
+                              "[FFX] provider pre-loaded: %s", provName);
+        }
+    }
+
     g_loaderModule = mod;
     g_functions = funcs;
     g_loaded = true;
     catra::BackendLog(CATRA_LOG_INFO,
-                      "[FFX] %s loaded, 5/5 ffx exports resolved",
+                      "[FFX] %s loaded, 5/5 ffx exports resolved + providers pre-loaded",
                       kLoaderDllName);
     return true;
 }
@@ -212,6 +282,8 @@ const ffxFunctions& FfxRuntime::Functions()
 bool FfxRuntime::ProbeDependencyDlls()
 {
     const std::wstring dir = ModuleDirWide();
+    catra::BackendLog(CATRA_LOG_INFO,
+                      "[FFX] ProbeDependencyDlls: scanning dir=%ls", dir.c_str());
     for (const char* name : kDependencyDlls)
     {
         const std::wstring path = dir + L"\\" + AsciiToWide(name);
@@ -220,11 +292,13 @@ bool FfxRuntime::ProbeDependencyDlls()
             (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0)
         {
             catra::BackendLog(CATRA_LOG_WARN,
-                              "[FFX] dependency DLL missing next to module: %s",
-                              name);
+                              "[FFX] dependency DLL MISSING next to module: %s "
+                              "(path=%ls)", name, path.c_str());
             return false;
         }
     }
+    catra::BackendLog(CATRA_LOG_INFO,
+                      "[FFX] ProbeDependencyDlls: all 8 DLLs present");
     return true;
 }
 
