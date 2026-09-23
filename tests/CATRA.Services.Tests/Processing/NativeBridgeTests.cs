@@ -285,6 +285,25 @@ internal sealed class FakeNativeLibrary : INativeLibrary
         outBgraTex = Nv12StagingConvertOutTex;
         return Nv12StagingConvertResult;
     }
+
+    // Texture readback (subtask 02) — B2: now exercised by NativeBridgeReadbackTests
+    public int TextureReadbackBgraResult { get; set; }
+    public int TextureReadbackBgraCallCount { get; private set; }
+    public IntPtr TextureReadbackBgraData { get; set; }
+    public int TextureReadbackBgraSize { get; set; }
+    public uint TextureReadbackBgraFormat { get; set; }
+    public uint TextureReadbackBgraPitch { get; set; }
+
+    public int TextureReadbackBgra(IntPtr texture, out IntPtr outData, out int outSize,
+        out uint outFormat, out uint outPitch)
+    {
+        TextureReadbackBgraCallCount++;
+        outData = TextureReadbackBgraData;
+        outSize = TextureReadbackBgraSize;
+        outFormat = TextureReadbackBgraFormat;
+        outPitch = TextureReadbackBgraPitch;
+        return TextureReadbackBgraResult;
+    }
 }
 
 /// <summary>
@@ -1279,6 +1298,83 @@ public class NativeBridgeReleaseTests
 }
 
 /// <summary>
+/// B2 fix: tests for <see cref="NativeBridge.ReadbackTextureToCpu"/> using
+/// <see cref="FakeNativeLibrary.TextureReadbackBgra*"/> — previously declared
+/// but never exercised.
+/// </summary>
+public class NativeBridgeReadbackTests
+{
+    [Fact]
+    public void ReadbackTextureToCpu_Success_CopiesPixelsAndFreesNativeBuffer()
+    {
+        var lib = new FakeNativeLibrary
+        {
+            IsAvailable = true,
+            TextureReadbackBgraResult = 0, // CATRA_OK
+        };
+        // Simulate native returning 4 bytes of pixel data.
+        IntPtr nativeBuf = Marshal.AllocHGlobal(4);
+        Marshal.WriteByte(nativeBuf, 0, 0xAA);
+        Marshal.WriteByte(nativeBuf, 1, 0xBB);
+        Marshal.WriteByte(nativeBuf, 2, 0xCC);
+        Marshal.WriteByte(nativeBuf, 3, 0xDD);
+        lib.TextureReadbackBgraData = nativeBuf;
+        lib.TextureReadbackBgraSize = 4;
+        lib.TextureReadbackBgraFormat = 87; // DXGI_FORMAT_B8G8R8A8_UNORM
+        lib.TextureReadbackBgraPitch = 4;
+
+        var bridge = new NativeBridge(lib);
+
+        bridge.ReadbackTextureToCpu(new IntPtr(0x1234),
+            out byte[] pixels, out uint format, out uint pitch);
+
+        pixels.Should().HaveCount(4);
+        pixels[0].Should().Be(0xAA);
+        pixels[3].Should().Be(0xDD);
+        format.Should().Be(87u);
+        pitch.Should().Be(4u);
+        lib.TextureReadbackBgraCallCount.Should().Be(1);
+        lib.FreeArrayCallCount.Should().Be(1, "native buffer must be freed after copy");
+        lib.LastFreeArrayPtr.Should().Be(nativeBuf);
+    }
+
+    [Fact]
+    public void ReadbackTextureToCpu_Error_ThrowsNativeBridgeException()
+    {
+        var lib = new FakeNativeLibrary
+        {
+            IsAvailable = true,
+            TextureReadbackBgraResult = -3, // CATRA_ERR_DEVICE
+        };
+        var bridge = new NativeBridge(lib);
+
+        var act = () => bridge.ReadbackTextureToCpu(
+            new IntPtr(1), out _, out _, out _);
+
+        act.Should().Throw<NativeBridgeException>()
+            .Which.ErrorCode.Should().Be(-3);
+    }
+
+    [Fact]
+    public void ReadbackTextureToCpu_ZeroSize_ReturnsEmptyArray()
+    {
+        var lib = new FakeNativeLibrary
+        {
+            IsAvailable = true,
+            TextureReadbackBgraResult = 0,
+            TextureReadbackBgraData = IntPtr.Zero,
+            TextureReadbackBgraSize = 0,
+        };
+        var bridge = new NativeBridge(lib);
+
+        bridge.ReadbackTextureToCpu(new IntPtr(1),
+            out byte[] pixels, out _, out _);
+
+        pixels.Should().BeEmpty();
+    }
+}
+
+/// <summary>
 /// Verifies the P/Invoke surface by reflection (no native calls): every entry
 /// point exists, targets <c>catra-gpu.dll</c>, uses <c>Cdecl</c>, and is private
 /// (so it stays invisible to analyzers/consumers).
@@ -1342,7 +1438,7 @@ public class NativeBridgePInvokeSignatureTests
             .Where(m => m.GetCustomAttribute<DllImportAttribute>() is not null)
             .ToList();
 
-        imports.Should().HaveCount(26, "the full catra_gpu.h C ABI must be declared");
+        imports.Should().HaveCount(27, "the full catra_gpu.h C ABI must be declared (subtask 02: +readback)");
         imports.Should().OnlyContain(m => m.IsPrivate);
     }
 

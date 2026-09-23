@@ -53,6 +53,7 @@ public sealed class ProcessingPipeline : IProcessingPipeline
     private readonly Func<INativeBridge> _bridgeFactory;
     private readonly Func<IFrameDecoder> _decoderFactory;
     private readonly IAudioMuxer _audioMuxer;
+    private readonly IVideoEncoderFactory? _encoderFactory;
     private readonly TimeSpan _frameTimeout;
     private readonly int _progressFrameInterval;
 
@@ -72,14 +73,23 @@ public sealed class ProcessingPipeline : IProcessingPipeline
         Func<IFrameDecoder> decoderFactory,
         IAudioMuxer audioMuxer,
         TimeSpan? frameTimeout = null,
-        int progressFrameInterval = DefaultProgressFrameInterval)
+        int progressFrameInterval = DefaultProgressFrameInterval,
+        IVideoEncoderFactory? encoderFactory = null)
     {
         _bridgeFactory = bridgeFactory ?? throw new ArgumentNullException(nameof(bridgeFactory));
         _decoderFactory = decoderFactory ?? throw new ArgumentNullException(nameof(decoderFactory));
         _audioMuxer = audioMuxer ?? throw new ArgumentNullException(nameof(audioMuxer));
+        _encoderFactory = encoderFactory;
         _frameTimeout = frameTimeout ?? DefaultFrameTimeout;
         _progressFrameInterval = progressFrameInterval < 1 ? DefaultProgressFrameInterval : progressFrameInterval;
     }
+
+    /// <summary>
+    /// Raised when the encoder cascade falls back from one encoder to another
+    /// (subtask 02). The UI (Story 04) subscribes to display deduplicated
+    /// notifications. Each event carries (From, To, Reason).
+    /// </summary>
+    public event EventHandler<EncoderFallbackEventArgs>? EncoderFallback;
 
     /// <inheritdoc />
     public Task<ProcessResult> ProcessAsync(
@@ -161,12 +171,11 @@ public sealed class ProcessingPipeline : IProcessingPipeline
         // converter state — no cross-device conflicts.
         INativeBridge? bridge = null;
         IFrameDecoder? decoder = null;
+        IVideoEncoder? videoEncoder = null;
         IntPtr interpContext = IntPtr.Zero;
         IntPtr upscaleContext = IntPtr.Zero;
-        IntPtr encodeContext = IntPtr.Zero;
         bool haveInterp = false;
         bool haveUpscale = false;
-        bool haveEncode = false;
         bool succeeded = false;
 
         try
@@ -264,10 +273,12 @@ public sealed class ProcessingPipeline : IProcessingPipeline
                 effectiveFps = config.TargetFps; // unknown source fps: best available guess
             }
 
-            encodeContext = bridge.CreateEncoder(
-                config.TargetWidth, config.TargetHeight, config.EncodeBitrateKbps, effectiveFps);
-            haveEncode = true;
-            System.Diagnostics.Trace.WriteLine($"[ProcessingPipeline] Encoder created: ctx={encodeContext}");
+            // Subtask 02: encoder cascade with fallback (AMF → FFmpeg hw → libx265).
+            // Only CATRA_ERR_DEVICE (-4) and CATRA_ERR_NOT_IMPL (-2) trigger fallback;
+            // other error codes propagate as a failed ProcessResult.
+            videoEncoder = CreateEncoderWithCascade(bridge, config, effectiveFps);
+            System.Diagnostics.Trace.WriteLine(
+                $"[ProcessingPipeline] Encoder selected: {videoEncoder.SelectedEncoder}");
 
             Directory.CreateDirectory(config.OutputFolder);
 
@@ -285,13 +296,13 @@ public sealed class ProcessingPipeline : IProcessingPipeline
 
                 await RunFrameLoopAsync(
                     bridge, decoder, writer, episodeIndex, episodeCount, meta.TotalFrames,
-                    needInterp, needUpscale, interpContext, upscaleContext, encodeContext,
+                    needInterp, needUpscale, interpContext, upscaleContext, videoEncoder,
                     weights, loopStep, timer, progress, cancellationToken).ConfigureAwait(false);
                 System.Diagnostics.Trace.WriteLine("[ProcessingPipeline] RunFrameLoopAsync completed");
 
-                // 5. Flush encoder → remaining NALs.
+                // 5. Flush encoder → remaining NALs (M-d: pass cancellation token).
                 System.Diagnostics.Trace.WriteLine("[ProcessingPipeline] Flushing encoder");
-                bridge.FlushEncoder(encodeContext, out IntPtr flushBuffer, out int flushSize);
+                videoEncoder.Flush(cancellationToken, out IntPtr flushBuffer, out int flushSize);
                 if (flushSize > 0 && flushBuffer != IntPtr.Zero)
                 {
                     writer.WriteFromNative(flushBuffer, flushSize);
@@ -315,7 +326,8 @@ public sealed class ProcessingPipeline : IProcessingPipeline
 
             long size = File.Exists(outputPath) ? new FileInfo(outputPath).Length : 0;
             succeeded = true;
-            return new ProcessResult(true, outputPath, size, timer.Elapsed, null);
+            return new ProcessResult(true, outputPath, size, timer.Elapsed, null,
+                videoEncoder?.SelectedEncoder);
         }
         catch (OperationCanceledException)
         {
@@ -341,10 +353,7 @@ public sealed class ProcessingPipeline : IProcessingPipeline
                 bridge?.DestroyUpscaler(upscaleContext);
             }
 
-            if (haveEncode)
-            {
-                bridge?.DestroyEncoder(encodeContext);
-            }
+            videoEncoder?.Dispose();
 
             decoder?.Dispose();
 
@@ -397,7 +406,7 @@ public sealed class ProcessingPipeline : IProcessingPipeline
         bool needUpscale,
         IntPtr interpContext,
         IntPtr upscaleContext,
-        IntPtr encodeContext,
+        IVideoEncoder videoEncoder,
         Weights weights,
         PipelineStep loopStep,
         Stopwatch timer,
@@ -645,7 +654,8 @@ public sealed class ProcessingPipeline : IProcessingPipeline
                     frameTimer.Restart();
 
                     // Encode the frame (texture is already upscaled or passthrough).
-                    bridge.EncodeFrame(encodeContext, frame.Texture, out IntPtr packetBuffer, out int packetSize);
+                    // IVideoEncoder handles both AMF (zero-copy) and FFmpeg (readback + pipe).
+                    videoEncoder.EncodeFrame(frame.Texture, out IntPtr packetBuffer, out int packetSize);
                     if (packetSize > 0 && packetBuffer != IntPtr.Zero)
                     {
                         output.WriteFromNative(packetBuffer, packetSize);
@@ -848,6 +858,24 @@ public sealed class ProcessingPipeline : IProcessingPipeline
         "fsr4" => UpscaleMethodFsr4,
         _ => UpscaleMethodFsr1, // "fsr1" (default — D-PO-3)
     };
+
+    /// <summary>
+    /// Creates the encoder via the cascade factory (subtask 02). When an
+    /// <see cref="IVideoEncoderFactory"/> was injected via the constructor, it is
+    /// used; otherwise the default <see cref="ProductionEncoderFactory"/> runs the
+    /// AMF → FFmpeg hardware → libx265 cascade. Fallback events are forwarded to
+    /// the <see cref="EncoderFallback"/> event for the UI (Story 04).
+    /// </summary>
+    private IVideoEncoder CreateEncoderWithCascade(
+        INativeBridge bridge, PipelineConfig config, double effectiveFps)
+    {
+        var factory = _encoderFactory ?? new ProductionEncoderFactory();
+        return factory.Create(
+            bridge,
+            config.TargetWidth, config.TargetHeight,
+            config.EncodeBitrateKbps, effectiveFps,
+            args => EncoderFallback?.Invoke(this, args));
+    }
 
     /// <summary>
     /// Creates the upscaler with an FSR 4 → FSR 1 fallback (story 03, 2ª linha de defesa).

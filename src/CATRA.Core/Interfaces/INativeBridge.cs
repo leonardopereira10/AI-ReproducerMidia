@@ -207,6 +207,18 @@ public interface INativeBridge : IDisposable
     void ReleaseTexture(IntPtr texture);
 
     /// <summary>
+    /// Reads a GPU texture (D3D11 or D3D12) back to CPU bytes. Returns tightly-packed
+    /// BGRA pixels (4 bytes/pixel). Used by the FFmpeg CLI encoder fallback to pipe
+    /// raw frames to the encoder process.
+    /// </summary>
+    /// <remarks>
+    /// Probes the texture type via QI: D3D12Resource → readback buffer path;
+    /// D3D11Texture2D → staging copy path. Both produce identical BGRA output.
+    /// </remarks>
+    void ReadbackTextureToCpu(IntPtr texture, out byte[] pixels,
+        out uint dxgiFormat, out uint rowPitch);
+
+    /// <summary>
     /// Frees a caller-owned native frame array previously handed back by
     /// <see cref="ProcessInterpolation"/>.
     /// </summary>

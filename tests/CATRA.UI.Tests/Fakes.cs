@@ -850,6 +850,9 @@ internal sealed class FakeNativeBridge : INativeBridge
     public void EncodeFrame(IntPtr ctx, IntPtr tex, out IntPtr buf, out int size) { buf = IntPtr.Zero; size = 0; throw new NotImplementedException(); }
     public void FlushEncoder(IntPtr ctx, out IntPtr buf, out int size) { buf = IntPtr.Zero; size = 0; throw new NotImplementedException(); }
     public void DestroyEncoder(IntPtr ctx) { }
+    public void ReadbackTextureToCpu(IntPtr texture, out byte[] pixels,
+        out uint dxgiFormat, out uint rowPitch)
+    { pixels = []; dxgiFormat = 0; rowPitch = 0; }
     public void ReleaseTexture(IntPtr texture) { }
     public void FreeNativeArray(IntPtr ptr) { }
     public void Dispose() { }

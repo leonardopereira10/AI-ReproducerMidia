@@ -392,6 +392,31 @@ CATRA_API int  catra_encode_flush(int ctx,
 CATRA_API void catra_encode_destroy(int ctx);
 
 // ===========================================================================
+// Texture readback — D3D12/D3D11 → CPU bytes (encoder cascade fallback)
+// ===========================================================================
+//
+// Reads back a GPU texture (D3D11Texture2D* or D3D12Resource*) into a
+// tightly-packed CPU buffer. Used by the FFmpeg CLI encoder fallback
+// (subtask 02) which needs raw BGRA bytes to pipe into ffmpeg stdin.
+//
+// Probes the texture type via QI: ID3D12Resource -> D3D12 readback buffer
+// path; ID3D11Texture2D -> D3D11 staging copy path. Both produce tightly-
+// packed BGRA (4 bytes/pixel).
+//
+// On success: *out_data points to a buffer allocated with new uint8_t[];
+// caller frees with catra_free() (which calls delete[] on the same CRT
+// heap). *out_size is width*height*4, *out_format is the DXGI_FORMAT,
+// *out_pitch is the row pitch in bytes.
+// *out_data stays null on every failure path.
+// Only BGRA/RGBA UNORM formats are accepted (M3 whitelist); NV12 and
+// other formats return CATRA_ERR_INVALID_ARG.
+// Returns CATRA_OK, CATRA_ERR_INVALID_ARG, CATRA_ERR_DEVICE.
+CATRA_API int  catra_texture_readback_bgra(
+    void* texture,
+    uint8_t** out_data, int* out_size,
+    uint32_t* out_format, uint32_t* out_pitch);
+
+// ===========================================================================
 // Device health-check (ST-15 / SPRINT_05)
 // ===========================================================================
 //

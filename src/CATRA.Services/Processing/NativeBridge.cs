@@ -85,6 +85,11 @@ internal interface INativeLibrary
     // Requires bridge to be initialized (catra_init).
     int Nv12StagingConvert(IntPtr nv12Tex, uint arraySlice,
         uint width, uint height, out IntPtr outBgraTex);
+
+    // Texture readback: D3D12/D3D11 → CPU BGRA bytes (encoder cascade fallback).
+    // *out_data is allocated natively (catra_alloc / new[]); caller frees with catra_free.
+    int TextureReadbackBgra(IntPtr texture, out IntPtr outData, out int outSize,
+        out uint outFormat, out uint outPitch);
 }
 
 /// <summary>
@@ -276,6 +281,11 @@ internal sealed class NativeLibraryLoader : INativeLibrary
         uint width, uint height, out IntPtr outBgraTex)
         => catra_nv12_staging_convert(nv12Tex, arraySlice, width, height, out outBgraTex);
 
+    // Texture readback: D3D12/D3D11 → CPU BGRA bytes.
+    public int TextureReadbackBgra(IntPtr texture, out IntPtr outData, out int outSize,
+        out uint outFormat, out uint outPitch)
+        => catra_texture_readback_bgra(texture, out outData, out outSize, out outFormat, out outPitch);
+
     // --- P/Invoke surface (private so CA1401 "P/Invokes should not be visible" stays silent) ---
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
@@ -359,6 +369,11 @@ internal sealed class NativeLibraryLoader : INativeLibrary
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     private static extern int catra_nv12_staging_convert(IntPtr nv12Tex,
         uint arraySlice, uint width, uint height, out IntPtr outBgraTex);
+
+    // Texture readback: D3D12/D3D11 → CPU BGRA bytes (encoder cascade fallback).
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int catra_texture_readback_bgra(IntPtr texture,
+        out IntPtr outData, out int outSize, out uint outFormat, out uint outPitch);
 }
 
 /// <summary>
@@ -715,6 +730,28 @@ public sealed class NativeBridge : INativeBridge
         if (resultCode < 0)
         {
             OnNativeLog($"catra_release_texture failed with error code {resultCode}.", level: 3);
+        }
+    }
+
+    /// <inheritdoc />
+    public void ReadbackTextureToCpu(IntPtr texture, out byte[] pixels,
+        out uint dxgiFormat, out uint rowPitch)
+    {
+        EnsureAvailable();
+        int resultCode = _library.TextureReadbackBgra(texture,
+            out IntPtr nativeData, out int size, out dxgiFormat, out rowPitch);
+        ThrowIfError(resultCode, "catra_texture_readback_bgra");
+
+        pixels = new byte[size];
+        if (size > 0 && nativeData != IntPtr.Zero)
+        {
+            Marshal.Copy(nativeData, pixels, 0, size);
+        }
+
+        // Free the native buffer via the bridge's matched deallocator.
+        if (nativeData != IntPtr.Zero)
+        {
+            _library.FreeArray(nativeData);
         }
     }
 

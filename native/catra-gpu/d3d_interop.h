@@ -230,6 +230,16 @@ ComPtr<ID3D11Texture2D> Nv12ToBgraStaging(ID3D11Texture2D* src,
                                           const D3D11_TEXTURE2D_DESC& srcDesc,
                                           unsigned int targetSlice);
 
+// Reads back a GPU texture (D3D11Texture2D or D3D12Resource) to tightly-packed
+// CPU BGRA bytes. Probes the texture type via QI.
+// On success: *out_data is allocated with new uint8_t[] (caller frees with
+// catra_free / delete[]), *out_size = w*h*4, *out_format = DXGI_FORMAT,
+// *out_pitch = row pitch in bytes. *out_data stays null on failure.
+// Returns CATRA_OK, CATRA_ERR_INVALID_ARG, CATRA_ERR_DEVICE.
+int interop_readback_texture(void* texture,
+                             uint8_t** out_data, int* out_size,
+                             uint32_t* out_format, uint32_t* out_pitch);
+
 } // namespace catra
 
 #endif // CATRA_D3D_INTEROP_H

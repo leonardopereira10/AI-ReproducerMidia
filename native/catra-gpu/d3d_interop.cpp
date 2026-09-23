@@ -1772,6 +1772,280 @@ int interop_device_health(HRESULT* out_reason, int* out_quirk)
 }
 
 // ===========================================================================
+// Texture readback — D3D12/D3D11 → CPU BGRA bytes (encoder cascade fallback)
+// ===========================================================================
+
+int interop_readback_texture(void* texture,
+                             uint8_t** out_data, int* out_size,
+                             uint32_t* out_format, uint32_t* out_pitch)
+{
+    if (out_data != nullptr) *out_data = nullptr;
+    if (out_size != nullptr) *out_size = 0;
+    if (out_format != nullptr) *out_format = 0;
+    if (out_pitch != nullptr) *out_pitch = 0;
+
+    if (texture == nullptr || out_data == nullptr || out_size == nullptr)
+    {
+        return CATRA_ERR_INVALID_ARG;
+    }
+
+    // n-b: fail-fast on genuine device removal — do not attempt GPU operations
+    // on a removed device (would cause DXGI_ERROR_DEVICE_REMOVED cascades).
+    if (g_deviceRemoved.load())
+    {
+        BackendLog(CATRA_LOG_ERROR,
+                   "interop_readback_texture: device removed (reason=0x%08lX) — fail-fast",
+                   static_cast<unsigned long>(g_deviceRemovedReason));
+        return CATRA_ERR_DEVICE;
+    }
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    if (!g_d3d11Device || !g_d3d11Context)
+    {
+        BackendLog(CATRA_LOG_ERROR, "interop_readback_texture: bridge not initialized");
+        return CATRA_ERR_INIT;
+    }
+
+    // Probe texture type via QI. Try D3D12 first (upscale output is D3D12),
+    // then D3D11 (decoder passthrough / RIFE intermediates).
+    ID3D12Resource* d3d12res = nullptr;
+    ID3D11Texture2D* d3d11tex = nullptr;
+
+    HRESULT qhr = static_cast<IUnknown*>(texture)->QueryInterface(IID_PPV_ARGS(&d3d12res));
+    if (FAILED(qhr))
+    {
+        qhr = static_cast<IUnknown*>(texture)->QueryInterface(IID_PPV_ARGS(&d3d11tex));
+    }
+
+    if (d3d12res == nullptr && d3d11tex == nullptr)
+    {
+        BackendLog(CATRA_LOG_ERROR,
+                   "interop_readback_texture: texture is neither D3D12 nor D3D11");
+        return CATRA_ERR_INVALID_ARG;
+    }
+
+    // ── D3D12 path ─────────────────────────────────────────────────────
+    if (d3d12res != nullptr)
+    {
+        // QI ref is ours — release when done.
+        struct Cleanup12 {
+            ID3D12Resource* res = nullptr;
+            ~Cleanup12() { if (res) res->Release(); }
+        } cleanup{d3d12res};
+
+        if (!g_d3d12Device || !g_d3d12Queue || !g_cmdAllocator || !g_cmdList ||
+            !g_fence || g_fenceEvent == nullptr)
+        {
+            BackendLog(CATRA_LOG_ERROR, "interop_readback_texture: D3D12 interop not ready");
+            return CATRA_ERR_DEVICE;
+        }
+
+        D3D12_RESOURCE_DESC desc = d3d12res->GetDesc();
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+        {
+            BackendLog(CATRA_LOG_ERROR, "interop_readback_texture: not a 2D texture");
+            return CATRA_ERR_INVALID_ARG;
+        }
+
+        // M3: Whitelist BGRA formats only. NV12 would cause ~2.5x over-read
+        // (Y+UV planes vs. assumed 4bpp). Reject unsupported formats early.
+        if (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM &&
+            desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB &&
+            desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM &&
+            desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+        {
+            BackendLog(CATRA_LOG_ERROR,
+                       "interop_readback_texture: unsupported DXGI_FORMAT %u "
+                       "(only B8G8R8A8/R8G8B8A8 UNORM supported)",
+                       static_cast<unsigned>(desc.Format));
+            return CATRA_ERR_INVALID_ARG;
+        }
+
+        // Transition source to COPY_SOURCE if needed.
+        // m1: Check HRESULT of Reset() — a failed Reset leaves the allocator
+        // in an undefined state and subsequent operations silently fail.
+        HRESULT rhr = g_cmdAllocator->Reset();
+        if (FAILED(rhr))
+        {
+            BackendLog(CATRA_LOG_ERROR,
+                       "interop_readback_texture: cmdAllocator Reset hr=0x%08lX",
+                       static_cast<unsigned long>(rhr));
+            return CATRA_ERR_DEVICE;
+        }
+        g_cmdList->Reset(g_cmdAllocator.Get(), nullptr);
+
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = d3d12res;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        g_cmdList->ResourceBarrier(1, &barrier);
+
+        // Get footprint for the readback buffer.
+        UINT numRows = 0;
+        UINT64 rowSize = 0;
+        UINT64 totalBytes = 0;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+        g_d3d12Device->GetCopyableFootprints(&desc, 0, 1, 0,
+                                              &fp, &numRows, &rowSize, &totalBytes);
+
+        // Create readback buffer.
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC rbDesc = {};
+        rbDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rbDesc.Width = totalBytes;
+        rbDesc.Height = 1;
+        rbDesc.DepthOrArraySize = 1;
+        rbDesc.MipLevels = 1;
+        rbDesc.Format = DXGI_FORMAT_UNKNOWN;
+        rbDesc.SampleDesc.Count = 1;
+        rbDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        ComPtr<ID3D12Resource> readbackBuf;
+        HRESULT hr = g_d3d12Device->CreateCommittedResource(
+            &hp, D3D12_HEAP_FLAG_NONE, &rbDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(readbackBuf.GetAddressOf()));
+        if (FAILED(hr))
+        {
+            BackendLog(CATRA_LOG_ERROR,
+                       "interop_readback_texture: CreateCommittedResource hr=0x%08lX",
+                       static_cast<unsigned long>(hr));
+            return CATRA_ERR_DEVICE;
+        }
+
+        D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+        srcLoc.pResource = d3d12res;
+        srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        srcLoc.SubresourceIndex = 0;
+
+        D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+        dstLoc.pResource = readbackBuf.Get();
+        dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dstLoc.PlacedFootprint = fp;
+
+        g_cmdList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+
+        // Transition back to COMMON.
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        g_cmdList->ResourceBarrier(1, &barrier);
+
+        g_cmdList->Close();
+        ID3D12CommandList* lists[] = { g_cmdList.Get() };
+        g_d3d12Queue->ExecuteCommandLists(1, lists);
+
+        // Fence wait.
+        const UINT64 fv = ++g_fenceValue;
+        g_d3d12Queue->Signal(g_fence.Get(), fv);
+        if (g_fence->GetCompletedValue() < fv)
+        {
+            g_fence->SetEventOnCompletion(fv, g_fenceEvent);
+            // m2: Use the shared fence timeout constant + mark device fault
+            // on timeout (GPU hang detection, same as other interop paths).
+            DWORD waitResult = WaitForSingleObject(g_fenceEvent, kInteropFenceWaitMs);
+            if (waitResult != WAIT_OBJECT_0)
+            {
+                HRESULT reason = g_d3d12Device->GetDeviceRemovedReason();
+                MarkDeviceFaultIfReal(E_FAIL, reason, "readback_texture::fenceWait");
+                BackendLog(CATRA_LOG_ERROR,
+                           "interop_readback_texture: fence wait timed out (%u ms)",
+                           kInteropFenceWaitMs);
+                return CATRA_ERR_DEVICE;
+            }
+        }
+
+        // Map and copy.
+        void* mapped = nullptr;
+        hr = readbackBuf->Map(0, nullptr, &mapped);
+        if (FAILED(hr))
+        {
+            BackendLog(CATRA_LOG_ERROR,
+                       "interop_readback_texture: Map hr=0x%08lX",
+                       static_cast<unsigned long>(hr));
+            return CATRA_ERR_DEVICE;
+        }
+
+        const UINT w = static_cast<UINT>(desc.Width);
+        const UINT h = desc.Height;
+        const UINT bpp = 4; // BGRA
+        const UINT tightPitch = w * bpp;
+        const int totalSize = static_cast<int>(tightPitch) * h;
+
+        uint8_t* output = new (std::nothrow) uint8_t[totalSize];
+        if (output == nullptr)
+        {
+            readbackBuf->Unmap(0, nullptr);
+            return CATRA_ERR_DEVICE;
+        }
+
+        const uint8_t* srcRows = static_cast<const uint8_t*>(mapped);
+        const UINT srcRowPitch = static_cast<UINT>(fp.Footprint.RowPitch);
+        for (UINT y = 0; y < h; ++y)
+        {
+            memcpy(output + static_cast<size_t>(y) * tightPitch,
+                   srcRows + fp.Offset + static_cast<size_t>(y) * srcRowPitch,
+                   tightPitch);
+        }
+        readbackBuf->Unmap(0, nullptr);
+
+        *out_data = output;
+        *out_size = totalSize;
+        if (out_format) *out_format = static_cast<uint32_t>(desc.Format);
+        if (out_pitch) *out_pitch = tightPitch;
+        return CATRA_OK;
+    }
+
+    // ── D3D11 path ─────────────────────────────────────────────────────
+    // d3d11tex is non-null; release the QI ref when done.
+    struct Cleanup11 {
+        ID3D11Texture2D* res = nullptr;
+        ~Cleanup11() { if (res) res->Release(); }
+    } cleanup11{d3d11tex};
+
+    D3D11_TEXTURE2D_DESC desc11;
+    d3d11tex->GetDesc(&desc11);
+
+    // M3: Format whitelist for D3D11 path too (same as D3D12).
+    if (desc11.Format != DXGI_FORMAT_B8G8R8A8_UNORM &&
+        desc11.Format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB &&
+        desc11.Format != DXGI_FORMAT_R8G8B8A8_UNORM &&
+        desc11.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+    {
+        BackendLog(CATRA_LOG_ERROR,
+                   "interop_readback_texture: D3D11 unsupported DXGI_FORMAT %u",
+                   static_cast<unsigned>(desc11.Format));
+        return CATRA_ERR_INVALID_ARG;
+    }
+
+    std::vector<uint8_t> cpuData;
+    UINT srcPitch = 0;
+    if (!ReadBack11ToCpu(d3d11tex, desc11, cpuData, srcPitch))
+    {
+        BackendLog(CATRA_LOG_ERROR,
+                   "interop_readback_texture: D3D11 ReadBack11ToCpu failed");
+        return CATRA_ERR_DEVICE;
+    }
+
+    const int totalSize = static_cast<int>(cpuData.size());
+    uint8_t* output = new (std::nothrow) uint8_t[totalSize];
+    if (output == nullptr)
+    {
+        return CATRA_ERR_DEVICE;
+    }
+    memcpy(output, cpuData.data(), totalSize);
+
+    *out_data = output;
+    *out_size = totalSize;
+    if (out_format) *out_format = static_cast<uint32_t>(desc11.Format);
+    if (out_pitch) *out_pitch = desc11.Width * 4;
+    return CATRA_OK;
+}
+
+// ===========================================================================
 // Sharing
 // ===========================================================================
 

@@ -1435,6 +1435,31 @@ void catra_encode_destroy(int ctx)
 }
 
 // ===========================================================================
+// Texture readback — D3D12/D3D11 → CPU BGRA bytes (encoder cascade fallback)
+// ===========================================================================
+
+int catra_texture_readback_bgra(void* texture,
+                                uint8_t** out_data, int* out_size,
+                                uint32_t* out_format, uint32_t* out_pitch)
+{
+    return GuardCabi([&]() -> int {
+        // n-d: zero ALL out-params on early-return so callers never see
+        // garbage pointers/sizes from an uninitialised bridge.
+        if (!g_initialized.load())
+        {
+            log_msg(CATRA_LOG_ERROR, "catra_texture_readback_bgra: bridge not initialized");
+            if (out_data)   *out_data   = nullptr;
+            if (out_size)   *out_size   = 0;
+            if (out_format) *out_format = 0;
+            if (out_pitch)  *out_pitch  = 0;
+            return CATRA_ERR_INIT;
+        }
+        return catra::interop_readback_texture(texture, out_data, out_size,
+                                                out_format, out_pitch);
+    });
+}
+
+// ===========================================================================
 // FG playback — FSR 3 Frame Generation via FFX FG swapchain (SPRINT_04
 // subtask 04)
 // ===========================================================================

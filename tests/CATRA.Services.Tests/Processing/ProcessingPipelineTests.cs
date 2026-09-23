@@ -152,6 +152,12 @@ internal sealed class FakeNativeBridge : INativeBridge
     public Exception? ThrowOnInterpCreate { get; set; }
 
     /// <summary>
+    /// When set, <see cref="CreateEncoder"/> throws this exception instead of
+    /// returning a context. Used by subtask 02 encoder cascade fallback tests.
+    /// </summary>
+    public Exception? ThrowOnCreateEncoder { get; set; }
+
+    /// <summary>
     /// Thrown by <see cref="CreateUpscaler"/> ONLY when method == 2 (CATRA_UPSCALE_FSR4)
     /// — story 03 FSR 4 -> FSR 1 fallback tests.
     /// </summary>
@@ -321,6 +327,10 @@ internal sealed class FakeNativeBridge : INativeBridge
         LastEncodeBitrate = bitrateKbps;
         LastEncodeFps = fps;
         Calls.Add("encode_create");
+        if (ThrowOnCreateEncoder is not null)
+        {
+            throw ThrowOnCreateEncoder;
+        }
         return new IntPtr(_nextContext++);
     }
 
@@ -356,6 +366,18 @@ internal sealed class FakeNativeBridge : INativeBridge
     {
         EncodeDestroyCount++;
         Calls.Add("encode_destroy");
+    }
+
+    public void ReadbackTextureToCpu(IntPtr texture, out byte[] pixels,
+        out uint dxgiFormat, out uint rowPitch)
+    {
+        Calls.Add("readback_texture");
+        // Fake: produce dummy BGRA pixels (all 0xFF = white).
+        int size = 1920 * 1080 * 4; // max expected
+        pixels = new byte[size];
+        Array.Fill(pixels, (byte)0xFF);
+        dxgiFormat = 87; // DXGI_FORMAT_B8G8R8A8_UNORM
+        rowPitch = (uint)(1920 * 4);
     }
 
     public void ReleaseTexture(IntPtr texture)

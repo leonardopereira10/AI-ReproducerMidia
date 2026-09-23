@@ -12,9 +12,11 @@ namespace CATRA.Core.Processing;
 /// <param name="OutputSizeBytes">Size of the output (single) or summed successful outputs (batch).</param>
 /// <param name="Duration">Wall-clock time spent processing.</param>
 /// <param name="ErrorMessage">Failure description (<c>"Cancelled"</c> on cancellation), or <c>null</c> on success.</param>
+/// <param name="SelectedEncoder">Name of the encoder actually used (e.g. "AMF", "hevc_nvenc", "libx265"). Null for batch or when encoding was not reached.</param>
 public sealed record ProcessResult(
     bool Success,
     string? OutputPath,
     long OutputSizeBytes,
     TimeSpan Duration,
-    string? ErrorMessage);
+    string? ErrorMessage,
+    string? SelectedEncoder = null);
